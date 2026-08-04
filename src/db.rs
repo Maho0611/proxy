@@ -1049,9 +1049,11 @@ impl Database {
         limit: usize,
         stale_before: &str,
         max_incomplete_retries: u8,
+        quality_schema_version: u8,
     ) -> Result<Vec<(ProxyRow, Option<ProxyQuality>)>, postgres::Error> {
         let limit = limit.max(1) as i64;
         let max_incomplete_retries = max_incomplete_retries as i32;
+        let quality_schema_version = quality_schema_version as i32;
         self.with_conn(|conn| {
             let rows = conn.query(
                 "SELECT
@@ -1068,6 +1070,7 @@ impl Database {
                    AND (
                         q.proxy_id IS NULL
                         OR q.checked_at <= $1
+                        OR COALESCE((q.extra_json::jsonb ->> 'schema_version')::int, 0) < $3
                         OR (
                             (q.country IS NULL OR q.ip_type IS NULL OR q.ip_address IS NULL OR q.risk_level = 'Unknown')
                             AND COALESCE((q.extra_json::jsonb ->> 'incomplete_retry_count')::int, 0) < $2
@@ -1078,8 +1081,13 @@ impl Database {
                     q.checked_at ASC NULLS FIRST,
                     p.last_validated DESC NULLS LAST,
                     p.updated_at DESC
-                 LIMIT $3",
-                &[&stale_before, &max_incomplete_retries, &limit],
+                 LIMIT $4",
+                &[
+                    &stale_before,
+                    &max_incomplete_retries,
+                    &quality_schema_version,
+                    &limit,
+                ],
             )?;
             Ok(rows.iter().map(proxy_record_from_join_row).collect())
         })

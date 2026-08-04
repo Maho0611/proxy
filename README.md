@@ -500,18 +500,19 @@ https://proxy.mui.moe/sub/{subscription_password}/trojan/clash.yaml
 
 #### 质量检测（Quality Check）
 
-验活通过后会自动探测并保存出口 IP；通过 ip-api.com 和 ipinfo.io 进一步获取地理位置、风险评估。公共代理接口和 Clash 订阅会按出口 IP 自动去重，同一出口只返回状态最佳的一条节点，无需手动维护。
+验活通过后会自动探测并保存出口 IP。质量检测优先使用 IPPure 获取 IP、ASN、地理位置、欺诈分、住宅/机房及原生/广播属性；IPPure 省略字段或暂时不可用时，再由 ip-api.com 和 ipinfo.io 补齐。公共代理接口和 Clash 订阅会按出口 IP 自动去重，同一出口只返回状态最佳的一条节点，无需手动维护。
 
 **检测内容：**
 | 项目 | 来源 | 说明 |
 |------|------|------|
-| IP 地址 | ip-api.com / ipinfo.io | 代理出口 IP |
-| 国家 | ip-api.com / ipinfo.io | 国家代码 |
-| IP 类型 | ipinfo.io | ISP / Datacenter 等 |
-| 是否住宅 | ipinfo.io | company.type == "isp" |
-| ChatGPT 可访问 | chatgpt.com | 检测是否被封锁 |
+| IP 地址、ASN、地区 | IPPure（优先） | 代理出口及运营商信息 |
+| 风险、住宅/机房、原生/广播 | IPPure（优先） | `fraudScore` 转换为 0-1 风险系数 |
+| IP/国家/IP 类型补充 | ip-api.com / ipinfo.io | IPPure 缺少字段时回退 |
+| ChatGPT 可访问 | chatgpt.com / ios.chat.openai.com | 区分不可用和仅 Web 可用 |
 | Google 可访问 | google.com/generate_204 | 检测连通性 |
-| 风险评分 | ip-api.com | proxy + hosting 综合评分 |
+| 扩展解锁 | Sora / Gemini / Copilot / Claude / Netflix / YouTube Premium / Spotify / TikTok | 保存可用状态、地区和判定详情 |
+
+扩展结果保存在质量对象的 `details.ip` 和 `details.unlock` 字段中，用户及管理后台的代理质量表可以直接展开查看。解锁结果是未登录状态下的地区与网络可达性探测，不代表账号、付费套餐或特定内容一定可用。
 
 ### 服务端部署
 

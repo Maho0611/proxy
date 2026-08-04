@@ -48,16 +48,20 @@ pub struct ProxyQualityInfo {
     pub risk_score: f64,
     pub risk_level: String,
     pub checked_at: Option<String>,
+    /// Structured IPPure metadata and per-service unlock results.
+    pub details: Option<serde_json::Value>,
     #[serde(skip_serializing)]
     pub incomplete_retry_count: u8,
 }
 
 impl From<ProxyQuality> for ProxyQualityInfo {
     fn from(q: ProxyQuality) -> Self {
-        let incomplete_retry_count = q
+        let details = q
             .extra_json
             .as_deref()
-            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
+        let incomplete_retry_count = details
+            .as_ref()
             .and_then(|v| v.get("incomplete_retry_count").and_then(|n| n.as_u64()))
             .map(|n| n.min(u8::MAX as u64) as u8)
             .unwrap_or(0);
@@ -72,6 +76,7 @@ impl From<ProxyQuality> for ProxyQualityInfo {
             risk_score: q.risk_score,
             risk_level: q.risk_level,
             checked_at: Some(q.checked_at),
+            details,
             incomplete_retry_count,
         }
     }

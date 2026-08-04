@@ -74,6 +74,7 @@ fn client_proxy_to_json(p: &crate::pool::manager::PoolProxy) -> serde_json::Valu
             "is_residential": q.is_residential,
             "risk_score": q.risk_score,
             "risk_level": q.risk_level,
+            "details": q.details,
         })),
     })
 }

@@ -150,6 +150,7 @@ fn proxy_to_json(p: &crate::pool::manager::PoolProxy) -> serde_json::Value {
             "risk_score": q.risk_score,
             "risk_level": q.risk_level,
             "checked_at": q.checked_at,
+            "details": q.details,
         })),
     })
 }
@@ -179,6 +180,9 @@ pub fn proxy_list_item_to_json(
             "risk_score": q.risk_score,
             "risk_level": q.risk_level,
             "checked_at": q.checked_at,
+            "details": q.extra_json.as_deref().and_then(|raw| {
+                serde_json::from_str::<serde_json::Value>(raw).ok()
+            }),
             "stale": crate::quality::checker::quality_checked_at_is_stale(
                 Some(q.checked_at.as_str()),
                 &now,

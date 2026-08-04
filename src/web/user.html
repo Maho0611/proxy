@@ -305,9 +305,11 @@ tr:hover td { background:rgba(108,99,255,.03); }
           <th>IP</th>
           <th onclick="sortBy('country')">国家</th>
           <th>IP类型</th>
+          <th>ASN / 机构</th>
           <th onclick="sortBy('risk')">风险</th>
           <th>ChatGPT</th>
           <th>Google</th>
+          <th>更多解锁</th>
           <th>住宅</th>
           <th>质检状态</th>
           <th>固定出口</th>
@@ -857,6 +859,8 @@ function renderProxies() {
       const cls = q.risk_score < 0.25 ? 'badge-risk-low' : q.risk_score < 0.5 ? 'badge-risk-med' : 'badge-risk-high';
       riskBadge = `<span class="badge ${cls}">${esc(q.risk_level)} ${(q.risk_score * 100).toFixed(0)}%</span>`;
     }
+    const ipOwner = renderIpOwner(q);
+    const unlockDetails = renderUnlockDetails(q);
     return `<tr>
       <td>${esc(p.name)}</td>
       <td><span class="badge badge-type">${esc(p.type)}</span></td>
@@ -865,9 +869,11 @@ function renderProxies() {
       <td>${q && q.ip_address ? esc(q.ip_address) : '-'}</td>
       <td>${q && q.country ? esc(q.country) : '-'}</td>
       <td>${q && q.ip_type ? esc(q.ip_type) : '-'}</td>
+      <td>${ipOwner}</td>
       <td>${riskBadge}</td>
       <td>${q ? (q.chatgpt ? yes : no) : na}</td>
       <td>${q ? (q.google ? yes : no) : na}</td>
+      <td>${unlockDetails}</td>
       <td>${q ? (q.is_residential ? yes : no) : na}</td>
       <td>${q ? (q.stale ? '<span class="badge badge-invalid">已过期</span>' : '<span class="badge badge-valid">最新</span>') : na}</td>
       <td>${p.status==='valid' && q && q.ip_address && q.country ? `<button class="btn btn-outline btn-sm" onclick="pinFixedProxy('${p.id}')">固定此出口</button>` : '-'}</td>
@@ -875,6 +881,41 @@ function renderProxies() {
   }).join('');
 
   renderPagination(proxyFiltered, proxyTotalPages);
+}
+
+const unlockLabels = {
+  google:'Google', chatgpt:'ChatGPT', sora:'Sora', gemini:'Gemini',
+  copilot:'Copilot', claude:'Claude', netflix:'Netflix',
+  youtube_premium:'YouTube Premium', spotify:'Spotify', tiktok:'TikTok'
+};
+
+function renderIpOwner(q) {
+  const ip = q?.details?.ip;
+  if (!ip) return '-';
+  const asn = ip.asn ? `AS${ip.asn}` : '';
+  const org = ip.as_organization || '';
+  const flags = [];
+  if (ip.is_native === true) flags.push('原生');
+  else if (ip.is_broadcast === true) flags.push('广播');
+  if (ip.is_datacenter === true) flags.push('机房');
+  else if (ip.is_residential === true) flags.push('住宅');
+  const location = [ip.city, ip.region, ip.country].filter(Boolean).join(', ');
+  if (!asn && !org && !flags.length) return '-';
+  return `<div title="${esc(location)}">${esc([asn, org].filter(Boolean).join(' · '))}${flags.length?`<br><span style="color:var(--text-dim);font-size:11px">${esc(flags.join(' · '))}</span>`:''}</div>`;
+}
+
+function renderUnlockDetails(q) {
+  const checks = q?.details?.unlock;
+  if (!checks || typeof checks !== 'object') return '-';
+  const entries = Object.entries(checks);
+  const passed = entries.filter(([, item]) => item?.available === true).length;
+  const rows = entries.map(([key, item]) => {
+    const state = item?.available === true ? 'Yes' : item?.available === false ? 'No' : 'Error';
+    const color = item?.available === true ? 'var(--success)' : item?.available === false ? 'var(--danger)' : 'var(--text-dim)';
+    const region = item?.region ? ` (${item.region})` : '';
+    return `<div title="${esc(item?.detail || '')}" style="display:flex;justify-content:space-between;gap:12px"><span>${esc(unlockLabels[key] || key)}</span><span style="color:${color}">${esc(state + region)}</span></div>`;
+  }).join('');
+  return `<details><summary style="cursor:pointer;white-space:nowrap">${passed}/${entries.length} 通过</summary><div style="min-width:210px;display:grid;gap:3px;margin-top:6px">${rows}</div></details>`;
 }
 
 function renderPagination(total, totalPages) {

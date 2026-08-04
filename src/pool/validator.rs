@@ -288,6 +288,7 @@ async fn validate_batch(
                             risk_score: 1.0,
                             risk_level: "Unknown".to_string(),
                             checked_at: None,
+                            details: None,
                             incomplete_retry_count: 0,
                         });
                     for id in duplicate_ids {
