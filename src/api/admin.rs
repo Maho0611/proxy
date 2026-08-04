@@ -148,6 +148,12 @@ pub async fn delete_user(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    if let Some(account) = state.db.get_proxy_account_for_owner(&id)? {
+        state.db.delete_proxy_account(&account.id)?;
+        state.proxy_accounts.remove(&account.username);
+        state.proxy_account_last_used.remove(&account.id);
+        crate::proxy_rotation::remove_principal_sessions(&state, &account.id);
+    }
     state.db.delete_user(&id)?;
     Ok(Json(json!({ "message": "User deleted" })))
 }
@@ -156,6 +162,7 @@ pub async fn ban_user(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    set_owned_proxy_account_enabled(&state, &id, false)?;
     state.db.set_user_banned(&id, true)?;
     Ok(Json(json!({ "message": "User banned" })))
 }
@@ -165,5 +172,27 @@ pub async fn unban_user(
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     state.db.set_user_banned(&id, false)?;
+    set_owned_proxy_account_enabled(&state, &id, true)?;
     Ok(Json(json!({ "message": "User unbanned" })))
+}
+
+fn set_owned_proxy_account_enabled(
+    state: &AppState,
+    user_id: &str,
+    enabled: bool,
+) -> Result<(), AppError> {
+    let Some(existing) = state.db.get_proxy_account_for_owner(user_id)? else {
+        return Ok(());
+    };
+    let account = state
+        .db
+        .update_proxy_account(&existing.id, None, false, None, Some(enabled))?
+        .ok_or_else(|| AppError::NotFound("Proxy account not found".into()))?;
+    state
+        .proxy_accounts
+        .insert(account.username.clone(), account.clone());
+    if !enabled {
+        crate::proxy_rotation::remove_principal_sessions(state, &account.id);
+    }
+    Ok(())
 }

@@ -8,6 +8,7 @@ use tokio::time::Instant;
 
 /// Incomplete quality data can be retried at most this many times.
 pub(crate) const MAX_INCOMPLETE_RETRIES: u8 = 2;
+pub(crate) const QUALITY_SCHEMA_VERSION: u8 = 2;
 
 /// ip-api.com rate limiter: max 40 requests/minute (free tier limit is 45).
 struct RateLimiter {
@@ -71,7 +72,12 @@ pub async fn check_all(state: Arc<AppState>) -> Result<usize, String> {
         let stale_before = (now - chrono::Duration::hours(stale_hours as i64)).to_rfc3339();
         let due = state
             .db
-            .get_due_quality_proxy_records(max_checks, &stale_before, MAX_INCOMPLETE_RETRIES)
+            .get_due_quality_proxy_records(
+                max_checks,
+                &stale_before,
+                MAX_INCOMPLETE_RETRIES,
+                QUALITY_SCHEMA_VERSION,
+            )
             .map_err(|e| format!("Failed to load quality-check candidates: {e}"))?;
 
         if due.is_empty() {
@@ -118,6 +124,10 @@ pub async fn check_all(state: Arc<AppState>) -> Result<usize, String> {
     if total_checked > 0 {
         crate::api::fetch::invalidate_stats_cache(state.as_ref());
         crate::api::sub_export::invalidate_subscription_export_cache(state.as_ref());
+        let reconciled = crate::fixed_proxy::reconcile_all(&state).await;
+        if reconciled > 0 {
+            tracing::info!("Reconciled {reconciled} fixed exits after quality checks");
+        }
         tracing::info!("Quality check complete: {total_checked} proxies checked in this run");
     }
 
@@ -183,6 +193,7 @@ async fn check_batch(
                             serde_json::json!(incomplete_retry_count),
                         );
                     }
+                    quality.details = Some(extra.clone());
                     let db_quality = ProxyQuality {
                         proxy_id: proxy.id.clone(),
                         ip_address: quality.ip_address.clone(),
@@ -246,6 +257,17 @@ pub(crate) fn needs_quality_check(
                 return true;
             }
 
+            // Re-run otherwise-fresh legacy records once when the stored
+            // detail schema does not yet contain IPPure and unlock metadata.
+            if q.details
+                .as_ref()
+                .and_then(|details| details.get("schema_version"))
+                .and_then(serde_json::Value::as_u64)
+                != Some(QUALITY_SCHEMA_VERSION as u64)
+            {
+                return true;
+            }
+
             // Fresh but incomplete data gets a small immediate retry budget.
             if quality_is_incomplete(q) {
                 return q.incomplete_retry_count < MAX_INCOMPLETE_RETRIES;
@@ -288,36 +310,25 @@ struct IpApiResult {
     is_hosting: bool,
 }
 
-struct EndpointCheck {
-    accessible: bool,
-    status_code: Option<u16>,
-    detail: String,
-}
-
-impl EndpointCheck {
-    fn ok(status_code: Option<u16>, detail: impl Into<String>) -> Self {
-        Self {
-            accessible: true,
-            status_code,
-            detail: detail.into(),
-        }
-    }
-
-    fn fail(status_code: Option<u16>, detail: impl Into<String>) -> Self {
-        Self {
-            accessible: false,
-            status_code,
-            detail: detail.into(),
-        }
-    }
-
-    fn as_json(&self) -> serde_json::Value {
-        serde_json::json!({
-            "accessible": self.accessible,
-            "status_code": self.status_code,
-            "detail": self.detail,
-        })
-    }
+#[derive(Debug, Default)]
+struct IpPureResult {
+    ip: Option<String>,
+    asn: Option<u64>,
+    as_organization: Option<String>,
+    country_name: Option<String>,
+    country_code: Option<String>,
+    region: Option<String>,
+    region_code: Option<String>,
+    city: Option<String>,
+    timezone: Option<String>,
+    longitude: Option<String>,
+    latitude: Option<String>,
+    postal_code: Option<String>,
+    fraud_score: Option<f64>,
+    is_residential: Option<bool>,
+    is_broadcast: Option<bool>,
+    is_datacenter: Option<bool>,
+    is_native: Option<bool>,
 }
 
 struct QualityCheckResult {
@@ -338,20 +349,50 @@ async fn check_single(
     let client = reqwest::Client::builder()
         .no_proxy()
         .proxy(reqwest_proxy)
+        .user_agent(crate::quality::unlock::BROWSER_USER_AGENT)
         .timeout(std::time::Duration::from_secs(30))
         .danger_accept_invalid_certs(true)
         .redirect(reqwest::redirect::Policy::limited(5))
         .build()
         .map_err(|e| e.to_string())?;
 
-    // Rate-limit ip-api.com calls, run other checks in parallel
-    let (ipapi_result, ipinfo_result, google_result, chatgpt_result) = tokio::join!(
-        rate_limited_ip_api(&client, rate_limiter),
-        query_ipinfo(&client),
-        check_google(&client),
-        check_chatgpt(&client),
+    // IPPure is queried first. Legacy providers are contacted only for
+    // fields omitted by the public endpoint, avoiding unnecessary traffic
+    // and rate-limit noise when IPPure returns a complete record.
+    let ippure_result = query_ippure(&client).await;
+    let need_ip_api = ippure_result
+        .as_ref()
+        .map(|result| {
+            result.ip.is_none() || result.country_code.is_none() || result.fraud_score.is_none()
+        })
+        .unwrap_or(true);
+    let need_ipinfo = ippure_result
+        .as_ref()
+        .map(|result| {
+            result.ip.is_none()
+                || result.country_code.is_none()
+                || (result.is_residential.is_none() && result.is_datacenter.is_none())
+        })
+        .unwrap_or(true);
+    let (ipapi_result, ipinfo_result, unlock_report) = tokio::join!(
+        async {
+            if need_ip_api {
+                rate_limited_ip_api(&client, rate_limiter).await
+            } else {
+                None
+            }
+        },
+        async {
+            if need_ipinfo {
+                query_ipinfo(&client).await
+            } else {
+                None
+            }
+        },
+        crate::quality::unlock::check_all(&client),
     );
 
+    let ippure_ok = ippure_result.is_some();
     let ip_api_ok = ipapi_result.is_some();
     let ipinfo_ok = ipinfo_result.is_some();
 
@@ -360,33 +401,40 @@ async fn check_single(
         .quality
         .as_ref()
         .and_then(|quality| quality.ip_address.clone());
-    let (ip_address, country, ip_type, mut is_residential) = match ipinfo_result {
-        Some((ip, country, ip_type, residential)) => (
-            ip.or_else(|| ipapi_result.as_ref().and_then(|result| result.ip.clone()))
-                .or(validation_ip),
-            country.or_else(|| {
-                ipapi_result
-                    .as_ref()
-                    .and_then(|result| result.country.clone())
-            }),
-            ip_type,
-            residential,
-        ),
-        None => {
-            // Preserve the exit address captured during validation if both
-            // enrichment services are temporarily unavailable. Public fetch
-            // and Clash export require a measured IP for deduplication.
-            let ip = ipapi_result
+    let (ipinfo_ip, ipinfo_country, ipinfo_type, ipinfo_residential) =
+        ipinfo_result.unwrap_or((None, None, None, false));
+    let ip_address = ippure_result
+        .as_ref()
+        .and_then(|result| result.ip.clone())
+        .or(ipinfo_ip)
+        .or_else(|| ipapi_result.as_ref().and_then(|result| result.ip.clone()))
+        .or(validation_ip);
+    let country = ippure_result
+        .as_ref()
+        .and_then(|result| result.country_code.clone())
+        .or(ipinfo_country)
+        .or_else(|| {
+            ipapi_result
                 .as_ref()
-                .and_then(|r| r.ip.clone())
-                .or(validation_ip);
-            let country = ipapi_result.as_ref().and_then(|r| r.country.clone());
-            (ip, country, None, false)
-        }
+                .and_then(|result| result.country.clone())
+        });
+    let ippure_residential = ippure_result
+        .as_ref()
+        .and_then(|result| result.is_residential);
+    let ippure_datacenter = ippure_result
+        .as_ref()
+        .and_then(|result| result.is_datacenter);
+    let mut is_residential = ippure_residential.unwrap_or(ipinfo_residential);
+    let mut ip_type = match (ippure_residential, ippure_datacenter) {
+        (Some(true), _) => Some("Residential".to_string()),
+        (Some(false), _) | (_, Some(true)) => Some("Datacenter".to_string()),
+        (_, Some(false)) => Some("Native/ISP".to_string()),
+        _ => ipinfo_type,
     };
 
-    // Risk scoring from ip-api.com
-    let (risk_score, risk_level, is_hosting) = match &ipapi_result {
+    // Prefer IPPure's 0-100 fraud score. ip-api.com's coarse proxy/hosting
+    // matrix is retained only when IPPure omits fraudScore.
+    let (fallback_risk_score, fallback_risk_level, is_hosting) = match &ipapi_result {
         Some(r) => {
             let (score, level) = match (r.is_proxy, r.is_hosting) {
                 (true, true) => (0.9, "Very High"),
@@ -398,14 +446,34 @@ async fn check_single(
         }
         None => (0.5, "Unknown".to_string(), false),
     };
+    let (risk_score, risk_level) = ippure_result
+        .as_ref()
+        .and_then(|result| result.fraud_score)
+        .map(|score| {
+            let normalized = (score.clamp(0.0, 100.0)) / 100.0;
+            (normalized, risk_level(normalized).to_string())
+        })
+        .unwrap_or((fallback_risk_score, fallback_risk_level));
 
-    // ip-api.com hosting flag overrides residential detection
-    let ip_type = if is_hosting {
+    // A primary IPPure classification wins over the fallback hosting flag.
+    if ippure_residential.is_none() && ippure_datacenter.is_none() && is_hosting {
         is_residential = false;
-        Some("Datacenter".to_string())
-    } else {
-        ip_type
-    };
+        ip_type = Some("Datacenter".to_string());
+    }
+
+    let google_detail = unlock_report.google_detail.clone();
+    let chatgpt_detail = unlock_report.chatgpt_detail.clone();
+    let ip_details = ippure_metadata(
+        ippure_result.as_ref(),
+        ip_address.as_deref(),
+        country.as_deref(),
+        is_residential,
+        ip_type.as_deref(),
+        risk_score,
+        &risk_level,
+    );
+    let google_check = unlock_report.checks.get("google").cloned();
+    let chatgpt_check = unlock_report.checks.get("chatgpt").cloned();
 
     Ok(QualityCheckResult {
         quality: ProxyQualityInfo {
@@ -413,21 +481,26 @@ async fn check_single(
             country,
             ip_type,
             is_residential,
-            chatgpt_accessible: chatgpt_result.accessible,
-            google_accessible: google_result.accessible,
+            chatgpt_accessible: unlock_report.chatgpt_accessible,
+            google_accessible: unlock_report.google_accessible,
             risk_score,
             risk_level,
             checked_at: Some(chrono::Utc::now().to_rfc3339()),
+            details: None,
             incomplete_retry_count: 0,
         },
         extra_json: serde_json::json!({
+            "schema_version": QUALITY_SCHEMA_VERSION,
+            "ippure_ok": ippure_ok,
             "ip_api_ok": ip_api_ok,
             "ipinfo_ok": ipinfo_ok,
-            "google_check": google_result.as_json(),
-            "chatgpt_check": chatgpt_result.as_json(),
+            "ip": ip_details,
+            "unlock": unlock_report.checks,
+            "google_check": google_check,
+            "chatgpt_check": chatgpt_check,
         }),
-        google_detail: google_result.detail,
-        chatgpt_detail: chatgpt_result.detail,
+        google_detail,
+        chatgpt_detail,
     })
 }
 
@@ -438,6 +511,179 @@ async fn rate_limited_ip_api(
 ) -> Option<IpApiResult> {
     rate_limiter.wait().await;
     query_ip_api(client).await
+}
+
+/// Query IPPure through the candidate proxy. The public API occasionally
+/// omits risk/classification fields, so every field is optional and later
+/// merged with the legacy enrichment providers.
+async fn query_ippure(client: &reqwest::Client) -> Option<IpPureResult> {
+    for attempt in 0..3 {
+        if attempt > 0 {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+        let response = match client.get("https://my.ippure.com/v1/info").send().await {
+            Ok(response) if response.status().is_success() => response,
+            Ok(response) => {
+                tracing::warn!(
+                    "IPPure returned status {} (attempt {})",
+                    response.status(),
+                    attempt + 1
+                );
+                continue;
+            }
+            Err(error) => {
+                tracing::warn!("IPPure request failed (attempt {}): {error}", attempt + 1);
+                continue;
+            }
+        };
+        match response.json::<serde_json::Value>().await {
+            Ok(body) => match parse_ippure(&body) {
+                Some(result) => return Some(result),
+                None => tracing::warn!("IPPure response had no usable IP metadata"),
+            },
+            Err(error) => tracing::warn!(
+                "IPPure response parse failed (attempt {}): {error}",
+                attempt + 1
+            ),
+        }
+    }
+    None
+}
+
+fn parse_ippure(body: &serde_json::Value) -> Option<IpPureResult> {
+    let result = IpPureResult {
+        ip: json_string(body, &["ip"]),
+        asn: json_u64(body, &["asn"]),
+        as_organization: json_string(body, &["asOrganization", "as_organization", "org"]),
+        country_name: json_string(body, &["country"]),
+        country_code: json_string(body, &["countryCode", "country_code"])
+            .map(|value| value.to_ascii_uppercase()),
+        region: json_string(body, &["region"]),
+        region_code: json_string(body, &["regionCode", "region_code"]),
+        city: json_string(body, &["city"]),
+        timezone: json_string(body, &["timezone"]),
+        longitude: json_string(body, &["longitude"]),
+        latitude: json_string(body, &["latitude"]),
+        postal_code: json_string(body, &["postalCode", "postal_code"]),
+        fraud_score: json_f64(body, &["fraudScore", "fraud_score"]),
+        is_residential: json_bool(body, &["isResidential", "is_residential"]),
+        is_broadcast: json_bool(body, &["isBroadcast", "is_broadcast"]),
+        is_datacenter: json_bool(
+            body,
+            &["isDatacenter", "isDataCenter", "is_datacenter", "isHosting"],
+        ),
+        is_native: json_bool(body, &["isNative", "isNativeIP", "is_native"]),
+    };
+    if result.ip.is_none()
+        && result.asn.is_none()
+        && result.country_code.is_none()
+        && result.country_name.is_none()
+    {
+        None
+    } else {
+        Some(result)
+    }
+}
+
+fn json_string(body: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| {
+        let value = body.get(*key)?;
+        let value = match value {
+            serde_json::Value::String(value) => value.trim().to_string(),
+            serde_json::Value::Number(value) => value.to_string(),
+            _ => return None,
+        };
+        (!value.is_empty()).then_some(value)
+    })
+}
+
+fn json_u64(body: &serde_json::Value, keys: &[&str]) -> Option<u64> {
+    keys.iter().find_map(|key| {
+        body.get(*key).and_then(|value| {
+            value
+                .as_u64()
+                .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
+        })
+    })
+}
+
+fn json_f64(body: &serde_json::Value, keys: &[&str]) -> Option<f64> {
+    keys.iter().find_map(|key| {
+        body.get(*key).and_then(|value| {
+            value
+                .as_f64()
+                .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
+        })
+    })
+}
+
+fn json_bool(body: &serde_json::Value, keys: &[&str]) -> Option<bool> {
+    keys.iter().find_map(|key| {
+        body.get(*key).and_then(|value| {
+            value.as_bool().or_else(|| {
+                value
+                    .as_str()
+                    .and_then(|value| match value.to_ascii_lowercase().as_str() {
+                        "true" | "1" | "yes" => Some(true),
+                        "false" | "0" | "no" => Some(false),
+                        _ => None,
+                    })
+            })
+        })
+    })
+}
+
+fn risk_level(score: f64) -> &'static str {
+    if score <= 0.25 {
+        "Low"
+    } else if score <= 0.5 {
+        "Medium"
+    } else if score <= 0.75 {
+        "High"
+    } else {
+        "Very High"
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ippure_metadata(
+    ippure: Option<&IpPureResult>,
+    ip_address: Option<&str>,
+    country_code: Option<&str>,
+    is_residential: bool,
+    ip_type: Option<&str>,
+    risk_score: f64,
+    risk_level: &str,
+) -> serde_json::Value {
+    let is_broadcast = ippure.and_then(|result| result.is_broadcast);
+    let is_native = ippure
+        .and_then(|result| result.is_native)
+        .or_else(|| is_broadcast.map(|value| !value));
+    let is_datacenter = ippure
+        .and_then(|result| result.is_datacenter)
+        .or_else(|| ippure.and_then(|result| result.is_residential.map(|value| !value)))
+        .or_else(|| ip_type.map(|value| value.eq_ignore_ascii_case("datacenter")));
+    serde_json::json!({
+        "source": if ippure.is_some() { "ippure" } else { "fallback" },
+        "ip": ip_address,
+        "asn": ippure.and_then(|result| result.asn),
+        "as_organization": ippure.and_then(|result| result.as_organization.as_deref()),
+        "country": ippure.and_then(|result| result.country_name.as_deref()),
+        "country_code": country_code,
+        "region": ippure.and_then(|result| result.region.as_deref()),
+        "region_code": ippure.and_then(|result| result.region_code.as_deref()),
+        "city": ippure.and_then(|result| result.city.as_deref()),
+        "timezone": ippure.and_then(|result| result.timezone.as_deref()),
+        "longitude": ippure.and_then(|result| result.longitude.as_deref()),
+        "latitude": ippure.and_then(|result| result.latitude.as_deref()),
+        "postal_code": ippure.and_then(|result| result.postal_code.as_deref()),
+        "fraud_score": ippure.and_then(|result| result.fraud_score).unwrap_or(risk_score * 100.0),
+        "risk_level": risk_level,
+        "is_residential": is_residential,
+        "is_datacenter": is_datacenter,
+        "is_broadcast": is_broadcast,
+        "is_native": is_native,
+    })
 }
 
 /// Query ip-api.com — auto-detects caller IP, returns IP/country/proxy/hosting.
@@ -568,66 +814,6 @@ async fn query_ipinfo(
     None
 }
 
-async fn check_google(client: &reqwest::Client) -> EndpointCheck {
-    match client
-        .get("https://www.google.com/generate_204")
-        .send()
-        .await
-    {
-        Ok(r) => {
-            let status = r.status();
-            let code = status.as_u16();
-            if code == 204 || status.is_success() {
-                EndpointCheck::ok(Some(code), format!("http {code}"))
-            } else {
-                EndpointCheck::fail(Some(code), format!("http {code}"))
-            }
-        }
-        Err(e) => EndpointCheck::fail(None, shorten_detail(e.to_string())),
-    }
-}
-
-async fn check_chatgpt(client: &reqwest::Client) -> EndpointCheck {
-    match client.get("https://chatgpt.com/").send().await {
-        Ok(r) => {
-            let status = r.status();
-            let code = status.as_u16();
-            if status == reqwest::StatusCode::FORBIDDEN {
-                return EndpointCheck::fail(Some(code), "http 403");
-            }
-            if !status.is_success() && !status.is_redirection() {
-                return EndpointCheck::fail(Some(code), format!("http {code}"));
-            }
-            match r.text().await {
-                Ok(body) => {
-                    if body.contains("unsupported_country") {
-                        EndpointCheck::fail(Some(code), "unsupported_country")
-                    } else if body.contains("unavailable in your country") {
-                        EndpointCheck::fail(Some(code), "unavailable in your country")
-                    } else if body.contains("not available") {
-                        EndpointCheck::fail(Some(code), "not available")
-                    } else {
-                        EndpointCheck::ok(Some(code), format!("http {code}"))
-                    }
-                }
-                Err(e) => EndpointCheck::ok(
-                    Some(code),
-                    format!("body read failed: {}", shorten_detail(e.to_string())),
-                ),
-            }
-        }
-        Err(e) => EndpointCheck::fail(None, shorten_detail(e.to_string())),
-    }
-}
-
-fn shorten_detail(detail: String) -> String {
-    const MAX_LEN: usize = 160;
-    if detail.chars().count() <= MAX_LEN {
-        return detail;
-    }
-    detail.chars().take(MAX_LEN).collect::<String>() + "..."
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -654,6 +840,9 @@ mod tests {
                 risk_score: 0.5,
                 risk_level: "Unknown".into(),
                 checked_at,
+                details: Some(serde_json::json!({
+                    "schema_version": QUALITY_SCHEMA_VERSION
+                })),
                 incomplete_retry_count: incomplete_retries,
             }),
         }
@@ -682,5 +871,40 @@ mod tests {
         assert!(!quality_checked_at_is_stale(Some(&fresh), &now, 2));
         assert!(quality_checked_at_is_stale(Some(&stale), &now, 2));
         assert!(quality_checked_at_is_stale(Some("invalid"), &now, 2));
+    }
+
+    #[test]
+    fn ippure_fields_drive_risk_and_native_metadata() {
+        let body = serde_json::json!({
+            "ip": "104.28.123.123",
+            "asn": 13335,
+            "asOrganization": "Cloudflare, Inc.",
+            "country": "United States",
+            "countryCode": "US",
+            "fraudScore": 75,
+            "isResidential": false,
+            "isBroadcast": false
+        });
+        let parsed = parse_ippure(&body).unwrap();
+        assert_eq!(parsed.ip.as_deref(), Some("104.28.123.123"));
+        assert_eq!(parsed.asn, Some(13335));
+        assert_eq!(parsed.fraud_score, Some(75.0));
+        assert_eq!(parsed.is_residential, Some(false));
+
+        let metadata = ippure_metadata(
+            Some(&parsed),
+            parsed.ip.as_deref(),
+            parsed.country_code.as_deref(),
+            false,
+            Some("Datacenter"),
+            0.75,
+            risk_level(0.75),
+        );
+        assert_eq!(metadata["source"], "ippure");
+        assert_eq!(metadata["asn"], 13335);
+        assert_eq!(metadata["is_native"], true);
+        assert_eq!(metadata["is_datacenter"], true);
+        assert_eq!(metadata["fraud_score"], 75.0);
+        assert_eq!(metadata["risk_level"], "High");
     }
 }

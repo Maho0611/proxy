@@ -768,6 +768,7 @@ pub async fn sync_proxy_bindings(state: &Arc<AppState>, mode: SyncMode) -> SyncB
                 batch,
                 &stale_before,
                 crate::quality::checker::MAX_INCOMPLETE_RETRIES,
+                crate::quality::checker::QUALITY_SCHEMA_VERSION,
             )
             .unwrap_or_default()
         {

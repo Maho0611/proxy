@@ -307,7 +307,18 @@ curl -X POST "https://proxy.mui.moe/api/relay?api_key=xxx&url=https://api.exampl
 
 #### 代理池监听端口（Proxy Pool Listener）
 
-zenproxy 可以作为标准的 SOCKS5 / HTTP 代理服务器使用，每次连接自动从代理池随机选择一个节点，实现代理轮换。单个端口同时支持 SOCKS5 和 HTTP CONNECT 协议（自动检测）。
+zenproxy 可以作为标准的 SOCKS5 / HTTP 代理服务器使用，每个新 TCP 连接自动从代理池随机选择一个节点。单个端口同时支持 SOCKS5 和 HTTP CONNECT（自动检测），并可让多个独立账号自然并发使用同一个共享代理池。
+
+迁移期推荐保留静态共享账号并同时启用独立账号：
+
+```env
+ZENPROXY_PROXY_AUTH_MODE=hybrid
+ZENPROXY_PROXY_CREDENTIAL_SECRET=<openssl rand -hex 32>
+ZENPROXY_PUBLIC_PROXY_HOST=<服务器公网 IP 或 DNS-only 域名>
+ZENPROXY_PUBLIC_PROXY_PORT=1080
+```
+
+每个 Discord 用户首次打开仪表盘时会自动获得独立代理账号，无需管理员分配。用户可直接选择协议、国家、上游类型和能力标签并复制多种格式的代理 URL；管理员只需在 `/admin` 处理启停、轮换和排障。数据库不保存代理明文密码。
 
 **配置方式（二选一）：**
 
@@ -340,6 +351,8 @@ password = "mypassword"
 | `-chatgpt` | ChatGPT 可访问 | `myuser-chatgpt` |
 | `-google` | Google 可访问 | `myuser-google` |
 | `-type-TYPE` | 指定代理类型 | `myuser-type-vmess` |
+| `-session-ID-rotate-SECONDS` | 指定时间内固定出口，到期轮换 | `myuser-session-crawler_01-rotate-300` |
+| `-fixed-SLOT` | 使用已申请的固定出口槽位 | `zp_xxx-fixed-f123abc` |
 
 后缀可自由组合：`myuser-country-US-residential-chatgpt`
 
@@ -355,15 +368,50 @@ curl -x socks5://myuser-country-US-residential:mypass@proxy.example.com:1080 htt
 # HTTP CONNECT — ChatGPT 可用代理
 curl -x http://myuser-chatgpt:mypass@proxy.example.com:1080 https://httpbin.org/ip
 
+# HTTP CONNECT — crawler_01 在 5 分钟内固定出口，到期后换 IP
+curl -x http://myuser-session-crawler_01-rotate-300:mypass@proxy.example.com:1080 https://httpbin.org/ip
+
+# HTTP CONNECT — 使用数据库账号已申请的固定出口槽位
+curl -x http://zp_xxx-fixed-f123abc:mypass@proxy.example.com:1080 https://httpbin.org/ip
+
 # 多次请求验证 IP 轮换
 for i in $(seq 1 5); do
   curl -s -x socks5://myuser:mypass@proxy.example.com:1080 https://httpbin.org/ip
 done
 ```
 
+Session ID 限制为 1～32 个字母、数字或下划线，间隔支持 1～86400 秒。不带定时后缀的 URL 仍按每个新 TCP 连接随机出口；同一账号可以同时使用普通随机 URL 和多个独立的定时 Session URL。已建立的长连接不会在中途切换 IP。
+
+固定出口槽位由登录用户在仪表盘自行申请，旧静态 Listener 账号不能伪造或使用数据库槽位。槽位正常时持续使用同一个已测出口 IP；出口失效、被上游订阅移除、出口 IP 或国家变化时，系统只从槽位原国家选择替代出口。槽位用户名保持不变，且不会跨国家回退。
+
 > **重试机制：** 连接失败时自动重试最多 3 个不同的代理节点。
 
-> **Docker 部署：** 需要在 `docker-compose.yml` 的 zenproxy 服务中手动添加端口映射（如 `- "1080:1080"`），并将 `ZENPROXY_PROXY_LISTENER` 环境变量传入容器。
+> **Docker 部署：** `docker-compose.yml` 已包含代理端口映射。在 `.env` 中设置 `ZENPROXY_PROXY_PORT`（远程客户端连接的宿主机端口）和 `ZENPROXY_PROXY_LISTENER=user:strong-password@0.0.0.0:1080` 即可。容器内端口固定为 1080。
+
+#### 固定出口管理与订阅
+
+固定出口管理接口接受登录会话或 `Authorization: Bearer {api_key}`，每个账号最多保存 50 个槽位（技术安全上限，不涉及计费或额度）：
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| `GET /api/fixed-exits` | 查看自己的槽位和订阅链接 |
+| `POST /api/fixed-exits` | 按国家、类型和质量条件批量申请 |
+| `POST /api/fixed-exits/pin` | 把指定 `proxy_id` 加入固定槽位 |
+| `PATCH /api/fixed-exits/:id` | 修改名称或是否加入订阅 |
+| `POST /api/fixed-exits/:id/replace` | 手动更换同国家出口 |
+| `DELETE /api/fixed-exits/:id` | 删除槽位 |
+| `POST /api/fixed-exits/subscription/rotate-token` | 轮换固定订阅 Token |
+
+批量申请示例：
+
+```bash
+curl -X POST https://proxy.example.com/api/fixed-exits \
+  -H "Authorization: Bearer <api_key>" \
+  -H "Content-Type: application/json" \
+  -d '{"count":10,"country":"US","residential":false}'
+```
+
+每个账号会生成四种独立订阅地址：Clash HTTP、Clash SOCKS5、HTTP URL 列表和 SOCKS5 URL 列表。订阅只包含用户勾选的槽位，只暴露统一网关及槽位凭据，不包含真实上游节点配置。订阅 Token 可以单独轮换；代理密码轮换后，重新刷新原订阅链接即可获得新密码。
 
 #### 代理列表（/api/proxies）
 
@@ -450,29 +498,30 @@ https://proxy.mui.moe/sub/{subscription_password}/trojan/clash.yaml
 
 #### 质量检测（Quality Check）
 
-验活通过后会自动探测并保存出口 IP；通过 ip-api.com 和 ipinfo.io 进一步获取地理位置、风险评估。公共代理接口和 Clash 订阅会按出口 IP 自动去重，同一出口只返回状态最佳的一条节点，无需手动维护。
+验活通过后会自动探测并保存出口 IP。质量检测优先使用 IPPure 获取 IP、ASN、地理位置、欺诈分、住宅/机房及原生/广播属性；IPPure 省略字段或暂时不可用时，再由 ip-api.com 和 ipinfo.io 补齐。公共代理接口和 Clash 订阅会按出口 IP 自动去重，同一出口只返回状态最佳的一条节点，无需手动维护。
 
 **检测内容：**
 | 项目 | 来源 | 说明 |
 |------|------|------|
-| IP 地址 | ip-api.com / ipinfo.io | 代理出口 IP |
-| 国家 | ip-api.com / ipinfo.io | 国家代码 |
-| IP 类型 | ipinfo.io | ISP / Datacenter 等 |
-| 是否住宅 | ipinfo.io | company.type == "isp" |
-| ChatGPT 可访问 | chatgpt.com | 检测是否被封锁 |
+| IP 地址、ASN、地区 | IPPure（优先） | 代理出口及运营商信息 |
+| 风险、住宅/机房、原生/广播 | IPPure（优先） | `fraudScore` 转换为 0-1 风险系数 |
+| IP/国家/IP 类型补充 | ip-api.com / ipinfo.io | IPPure 缺少字段时回退 |
+| ChatGPT 可访问 | chatgpt.com / ios.chat.openai.com | 区分不可用和仅 Web 可用 |
 | Google 可访问 | google.com/generate_204 | 检测连通性 |
-| 风险评分 | ip-api.com | proxy + hosting 综合评分 |
+| 扩展解锁 | Sora / Gemini / Copilot / Claude / Netflix / YouTube Premium / Spotify / TikTok | 保存可用状态、地区和判定详情 |
+
+扩展结果保存在质量对象的 `details.ip` 和 `details.unlock` 字段中，用户及管理后台的代理质量表可以直接展开查看。解锁结果是未登录状态下的地区与网络可达性探测，不代表账号、付费套餐或特定内容一定可用。
 
 ### 服务端部署
 
 #### Docker Compose
 
-Compose 内置 Caddy 反代和 PostgreSQL。宿主机只发布 Caddy 的 `80/443` 端口，`zenproxy:3000` 和 `postgres:5432` 只在 Docker 网络内访问。
+Compose 内置 Caddy 反代和 PostgreSQL。宿主机发布 Caddy 的 `80/443` 端口，并按 `.env` 中的 `ZENPROXY_PROXY_PORT` 发布标准 SOCKS5/HTTP 代理入口；PostgreSQL 不向宿主机发布端口。
 
 ```bash
 cp .env.example .env
-# 编辑 .env：生产环境建议设置 CADDY_SITE_ADDRESS=proxy.example.com
-# 并将 ZENPROXY_OAUTH_REDIRECT_URI 改为 https://proxy.example.com/api/auth/callback
+# 编辑 .env：设置站点地址、强代理密码和公开代理端口
+# 将 ZENPROXY_OAUTH_REDIRECT_URI 改为 https://proxy.example.com/api/auth/callback
 docker compose up -d --build
 ```
 

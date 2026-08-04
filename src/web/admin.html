@@ -108,6 +108,44 @@ tr:hover td { background:rgba(70,220,255,.035); }
 .metric-pair { display:flex; align-items:baseline; gap:5px; }
 .metric-pair strong { color:var(--text-bright); font:700 14px Consolas,monospace; }
 .metric-pair small { color:var(--text-dim); font-size:10px; }
+.credential-preview { display:none; margin-top:14px; padding:13px; border:1px solid var(--warn); background:rgba(255,200,87,.06); color:var(--text); font:12px/1.7 Consolas,monospace; white-space:pre-wrap; word-break:break-all; }
+.account-create-grid { display:grid; grid-template-columns:1fr 1fr 1fr auto; gap:12px; align-items:end; }
+.proxy-card { padding:8px 12px 14px; overflow-x:hidden; }
+.proxy-table { table-layout:fixed; }
+.proxy-table th, .proxy-table td { padding:10px 8px; vertical-align:middle; }
+.proxy-table th { white-space:nowrap; }
+.proxy-table td { white-space:normal; overflow-wrap:anywhere; line-height:1.35; }
+.proxy-table .cell-primary { color:var(--text-bright); font-weight:600; }
+.proxy-table .cell-meta { color:var(--text-dim); font-size:10px; margin-top:4px; }
+.proxy-table .proxy-node-cell .badge { margin-top:5px; }
+.proxy-table .proxy-endpoint { font-family:Consolas,"Courier New",monospace; font-size:11px; word-break:break-all; }
+.proxy-table .proxy-owner-cell { font-size:11px; }
+.proxy-table .proxy-owner-cell .cell-primary { font-weight:500; }
+.proxy-table .unlock-summary { display:flex; flex-wrap:wrap; align-items:center; gap:5px 8px; }
+.proxy-table .unlock-item { display:inline-flex; align-items:center; gap:4px; color:var(--text-dim); font-size:10px; white-space:nowrap; }
+.proxy-table .unlock-item .badge { padding:2px 5px; }
+.proxy-table .unlock-toggle { flex-basis:100%; width:max-content; display:inline-flex; align-items:center; gap:4px; padding:1px 0; border:0; background:transparent; color:var(--primary); font:10px Consolas,monospace; cursor:pointer; }
+.proxy-table .unlock-toggle::before { content:"▸"; display:inline-block; transition:transform .16s ease; }
+.proxy-table .unlock-toggle[aria-expanded="true"]::before { transform:rotate(90deg); }
+.proxy-table .unlock-toggle:hover { color:var(--primary-hover); }
+.proxy-table .unlock-detail-row td { padding:0 8px 12px; background:rgba(70,220,255,.018); }
+.proxy-table .unlock-detail-row:hover td { background:rgba(70,220,255,.018); }
+.proxy-table .unlock-detail-panel { padding:12px 14px 14px; border:1px solid rgba(70,220,255,.2); border-left:2px solid var(--primary); background:rgba(4,12,23,.72); }
+.proxy-table .unlock-detail-header { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:10px; color:var(--text-bright); font-size:11px; }
+.proxy-table .unlock-detail-header span { color:var(--success); font:10px Consolas,monospace; }
+.proxy-table .unlock-detail-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:6px 12px; }
+.proxy-table .unlock-detail-item { min-width:0; display:flex; align-items:center; justify-content:space-between; gap:12px; padding:6px 8px; border:1px solid rgba(29,64,85,.55); background:rgba(13,25,43,.72); font-size:10px; }
+.proxy-table .unlock-detail-name { overflow:hidden; color:var(--text); text-overflow:ellipsis; white-space:nowrap; }
+.proxy-table .unlock-detail-state { flex:none; font-family:Consolas,monospace; white-space:nowrap; }
+.proxy-table .unlock-detail-state.is-available { color:var(--success); }
+.proxy-table .unlock-detail-state.is-unavailable { color:var(--danger); }
+.proxy-table .unlock-detail-state.is-error { color:var(--text-dim); }
+.proxy-table .proxy-check-cell { font-size:10px; }
+.proxy-table .proxy-check-cell .badge { margin-top:4px; }
+.proxy-table .proxy-action-cell { text-align:right; }
+@media(max-width:1100px) { .proxy-card { overflow-x:auto; } .proxy-table { min-width:1040px; } }
+@media(max-width:900px) { .account-create-grid { grid-template-columns:1fr 1fr; } }
+@media(max-width:650px) { .account-create-grid { grid-template-columns:1fr; } }
 @keyframes pulse { 50% { opacity:.35; box-shadow:0 0 2px var(--success); } }
 @media(max-width:900px) { .header { position:relative; align-items:flex-start; gap:12px; } .header .nav { flex-wrap:wrap; justify-content:flex-end; } .command-banner { align-items:flex-start; } .command-banner h2 { font-size:24px; } }
 @media(max-width:650px) { .grid-2 { grid-template-columns:1fr; } .header { padding:13px 16px; flex-direction:column; } .header .nav { justify-content:flex-start; } .container { padding:22px 12px 60px; } .command-banner { display:block; } .command-clock { display:none; } .stat-grid { grid-template-columns:repeat(2,1fr); } .card { padding:13px; } }
@@ -188,6 +226,28 @@ tr:hover td { background:rgba(70,220,255,.035); }
         <tbody id="user-table"></tbody>
       </table>
       <div class="empty" id="user-empty">暂无注册用户</div>
+    </div>
+  </div>
+
+  <!-- Proxy account management -->
+  <div class="section">
+    <div class="section-title">固定入口代理账号 <span id="proxy-account-count" style="font-weight:400;font-size:13px;color:var(--text-dim)"></span></div>
+    <div class="card" style="margin-bottom:12px">
+      <div class="account-create-grid">
+        <div class="form-group"><label>用途标签</label><input id="account-label" placeholder="例如：爬虫服务器 A"></div>
+        <div class="form-group"><label>基础用户名（不允许连字符）</label><input id="account-username" placeholder="例如：zp_crawler_a"></div>
+        <div class="form-group"><label>绑定登录用户（可留空）</label><select id="account-owner"><option value="">不绑定用户</option></select></div>
+        <button class="btn btn-primary" onclick="createProxyAccount()">创建账号</button>
+      </div>
+      <div style="color:var(--text-dim);font-size:12px">每个登录用户首次打开仪表盘时会自动获得独立账号，无需管理员分配。此处保留手动创建、启停和排障能力；所有账号共用当前代理池与公网端口，不设置额度、计费或人为并发限制。</div>
+      <div class="credential-preview" id="account-credential-preview"></div>
+    </div>
+    <div class="card">
+      <table>
+        <thead><tr><th>标签</th><th>用户名</th><th>绑定用户</th><th>状态</th><th>凭据版本</th><th>最后使用</th><th>创建时间</th><th>操作</th></tr></thead>
+        <tbody id="proxy-account-table"></tbody>
+      </table>
+      <div class="empty" id="proxy-account-empty">暂无代理账号</div>
     </div>
   </div>
 
@@ -282,22 +342,21 @@ tr:hover td { background:rgba(70,220,255,.035); }
         <option value="residential">Residential</option>
       </select>
     </div>
-    <div class="card">
-      <table>
+    <div class="card proxy-card">
+      <table class="proxy-table">
+        <colgroup>
+          <col style="width:16%"><col style="width:14%"><col style="width:8%">
+          <col style="width:12%"><col style="width:19%"><col style="width:8%">
+          <col style="width:11%"><col style="width:8%"><col style="width:4%">
+        </colgroup>
         <thead><tr>
-          <th onclick="sortBy('name')">名称</th>
-          <th onclick="sortBy('type')">类型</th>
-          <th onclick="sortBy('server')">服务器</th>
-          <th onclick="sortBy('is_valid')">状态</th>
-          <th onclick="sortBy('error_count')">错误数</th>
-          <th>端口</th>
-          <th>IP</th>
-          <th onclick="sortBy('country')">国家</th>
-          <th>IP类型</th>
+          <th onclick="sortBy('name')">节点</th>
+          <th onclick="sortBy('server')">服务端 / 接入</th>
+          <th onclick="sortBy('is_valid')">运行状态</th>
+          <th onclick="sortBy('country')">IP 概况</th>
+          <th>ASN / 机构</th>
           <th onclick="sortBy('risk')">风险</th>
-          <th>ChatGPT</th>
-          <th>Google</th>
-          <th>住宅</th>
+          <th>流媒体解锁</th>
           <th>质检时间</th>
           <th>操作</th>
         </tr></thead>
@@ -326,6 +385,8 @@ let proxyHasPrevious = false;
 let proxyFilterTimer = null;
 let proxyLoadSequence = 0;
 let defaultSubRefreshInterval = 0;
+let adminUsers = [];
+let latestProxyCredential = '';
 
 // --- Auth ---
 const STORAGE_KEY = 'zenproxy_admin_password';
@@ -433,6 +494,8 @@ async function loadStats() {
 async function loadUsers() {
   const d = await api('/api/admin/users');
   if(!d) return;
+  adminUsers = d.users || [];
+  updateProxyOwnerOptions();
   document.getElementById('s-users').textContent = d.total ?? 0;
   const tb = document.getElementById('user-table');
   const empty = document.getElementById('user-empty');
@@ -459,6 +522,128 @@ async function loadUsers() {
       </td>
     </tr>`;
   }).join('');
+}
+
+function updateProxyOwnerOptions() {
+  const select = document.getElementById('account-owner');
+  if (!select) return;
+  const previous = select.value;
+  select.replaceChildren(new Option('不绑定用户', ''));
+  for (const user of adminUsers) {
+    select.add(new Option(`${user.username} (${user.id})`, user.id));
+  }
+  if ([...select.options].some(option => option.value === previous)) select.value = previous;
+}
+
+async function loadProxyAccounts() {
+  const d = await api('/api/admin/proxy-accounts');
+  if (!d) return;
+  const accounts = d.accounts || [];
+  const byUser = Object.fromEntries(adminUsers.map(user => [String(user.id), user]));
+  document.getElementById('proxy-account-count').textContent = `(${accounts.length} · ${esc(d.auth_mode || '-')})`;
+  const table = document.getElementById('proxy-account-table');
+  const empty = document.getElementById('proxy-account-empty');
+  if (!accounts.length) { table.innerHTML = ''; empty.style.display = ''; return; }
+  empty.style.display = 'none';
+  table.innerHTML = accounts.map(account => {
+    const owner = account.owner_user_id ? byUser[String(account.owner_user_id)] : null;
+    const ownerText = owner ? `${owner.username} (${owner.id})` : (account.owner_user_id || '未绑定');
+    const status = account.enabled
+      ? '<span class="badge badge-active">启用</span>'
+      : '<span class="badge badge-banned">禁用</span>';
+    return `<tr>
+      <td>${esc(account.label)}</td>
+      <td><code>${esc(account.username)}</code></td>
+      <td>${esc(ownerText)}</td>
+      <td>${status}</td>
+      <td>v${account.credential_version}</td>
+      <td>${fmtDate(account.last_used_at)}</td>
+      <td>${fmtDate(account.created_at)}</td>
+      <td class="btn-group">
+        <button class="btn btn-primary btn-sm" onclick="revealProxyAccount('${account.id}')">连接信息</button>
+        <button class="btn btn-warn btn-sm" onclick="rotateProxyAccount('${account.id}')">轮换密码</button>
+        <button class="btn btn-sm" onclick="editProxyAccount('${account.id}', '${account.enabled}')">编辑</button>
+        <button class="btn ${account.enabled ? 'btn-danger' : 'btn-success'} btn-sm" onclick="setProxyAccountEnabled('${account.id}', ${!account.enabled})">${account.enabled ? '禁用' : '启用'}</button>
+        <button class="btn btn-danger btn-sm" onclick="deleteProxyAccount('${account.id}')">删除</button>
+      </td>
+    </tr>`;
+  }).join('');
+}
+
+async function createProxyAccount() {
+  const label = document.getElementById('account-label').value.trim();
+  const username = document.getElementById('account-username').value.trim();
+  const owner = document.getElementById('account-owner').value;
+  if (!label || !username) return toast('请填写标签和基础用户名');
+  const d = await api('/api/admin/proxy-accounts', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({ label, username, owner_user_id: owner || null })
+  });
+  if (!d || d.error) return toast('创建失败：' + (d?.error || '请求失败'));
+  showProxyCredential(d, '账号已创建，请立即复制连接信息');
+  document.getElementById('account-label').value = '';
+  document.getElementById('account-username').value = '';
+  document.getElementById('account-owner').value = '';
+  loadProxyAccounts();
+}
+
+function showProxyCredential(data, heading) {
+  const gateway = data.gateway || {};
+  const account = data.account || {};
+  const host = gateway.host || '<未配置公网入口>';
+  const port = gateway.port || '<未配置端口>';
+  latestProxyCredential = `http://${encodeURIComponent(account.username || '')}:${encodeURIComponent(data.password || '')}@${host}:${port}`;
+  const preview = document.getElementById('account-credential-preview');
+  preview.style.display = 'block';
+  preview.textContent = `${heading}\n用户名: ${account.username}\n密码: ${data.password}\nHTTP URL: ${latestProxyCredential}\n\n此区域不会写入浏览器存储；离开页面后可通过“连接信息”重新生成。`;
+  preview.onclick = () => navigator.clipboard.writeText(latestProxyCredential).then(() => toast('HTTP URL 已复制'));
+}
+
+async function revealProxyAccount(id) {
+  const d = await api(`/api/admin/proxy-accounts/${id}/reveal`, {method:'POST', cache:'no-store'});
+  if (!d || d.error) return toast('显示失败：' + (d?.error || '请求失败'));
+  showProxyCredential(d, '当前连接信息（点击此区域复制 HTTP URL）');
+}
+
+async function rotateProxyAccount(id) {
+  if (!confirm('确定轮换密码？旧密码会立即失效。')) return;
+  const d = await api(`/api/admin/proxy-accounts/${id}/rotate-password`, {method:'POST', cache:'no-store'});
+  if (!d || d.error) return toast('轮换失败：' + (d?.error || '请求失败'));
+  showProxyCredential(d, '密码已轮换，请更新使用端配置');
+  loadProxyAccounts();
+}
+
+async function setProxyAccountEnabled(id, enabled) {
+  const d = await api(`/api/admin/proxy-accounts/${id}`, {
+    method:'PATCH', headers:{'Content-Type':'application/json'}, body:JSON.stringify({enabled})
+  });
+  if (!d || d.error) return toast('更新失败：' + (d?.error || '请求失败'));
+  toast(enabled ? '账号已启用' : '账号已禁用');
+  loadProxyAccounts();
+}
+
+async function editProxyAccount(id) {
+  const label = prompt('输入新的用途标签；取消则不修改标签：');
+  if (label === null) return;
+  const owner = prompt('输入要绑定的 Discord 用户 ID；留空表示解除绑定：');
+  if (owner === null) return;
+  const d = await api(`/api/admin/proxy-accounts/${id}`, {
+    method:'PATCH',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({label, owner_user_id:owner, clear_owner:owner.trim()===''})
+  });
+  if (!d || d.error) return toast('更新失败：' + (d?.error || '请求失败'));
+  toast('账号信息已更新');
+  loadProxyAccounts();
+}
+
+async function deleteProxyAccount(id) {
+  if (!confirm('确定删除代理账号？该账号的新连接会立即认证失败。')) return;
+  const d = await api(`/api/admin/proxy-accounts/${id}`, {method:'DELETE'});
+  if (!d || d.error) return toast('删除失败：' + (d?.error || '请求失败'));
+  toast('代理账号已删除');
+  loadProxyAccounts();
 }
 
 async function deleteUser(id) {
@@ -668,7 +853,7 @@ function renderProxies() {
   if(!currentProxies.length) { tb.innerHTML=''; empty.style.display=''; renderPagination(0, 0); return; }
   empty.style.display='none';
 
-  tb.innerHTML = currentProxies.map(p => {
+  tb.innerHTML = currentProxies.map((p, index) => {
     const q = p.quality;
     const yes = '<span class="badge badge-valid">Yes</span>';
     const no = '<span class="badge badge-invalid">No</span>';
@@ -678,26 +863,73 @@ function renderProxies() {
       const cls = q.risk_score<0.25?'badge-risk-low':q.risk_score<0.5?'badge-risk-med':'badge-risk-high';
       riskBadge = `<span class="badge ${cls}">${q.risk_level} ${(q.risk_score*100).toFixed(0)}%</span>`;
     }
+    const ipOwner = renderIpOwner(q);
+    const unlockDetails = renderUnlockDetails(q);
+    const unlockDetailId = `unlock-detail-${index}`;
+    const ipMeta = q
+      ? [q.country, q.ip_type, q.is_residential?'住宅':'非住宅'].filter(Boolean).map(esc).join(' · ')
+      : '-';
     return `<tr>
-      <td>${esc(p.name)}</td>
-      <td><span class="badge badge-type">${esc(p.type)}</span></td>
-      <td>${esc(p.server)}:${p.port}</td>
-      <td>${p.status==='valid'?'<span class="badge badge-valid">有效</span>':p.status==='untested'?'<span class="badge badge-untested">待检测</span>':'<span class="badge badge-invalid">无效</span>'}</td>
-      <td>${p.error_count}</td>
-      <td>${p.local_port||'-'}</td>
-      <td>${q&&q.ip_address?esc(q.ip_address):'-'}</td>
-      <td>${q&&q.country?esc(q.country):'-'}</td>
-      <td>${q&&q.ip_type?esc(q.ip_type):'-'}</td>
+      <td class="proxy-node-cell"><div class="cell-primary">${esc(p.name)}</div><span class="badge badge-type">${esc(p.type)}</span></td>
+      <td><div class="cell-primary proxy-endpoint">${esc(p.server)}:${p.port}</div><div class="cell-meta">接入端口 ${p.local_port||'未分配'}</div></td>
+      <td>${p.status==='valid'?'<span class="badge badge-valid">有效</span>':p.status==='untested'?'<span class="badge badge-untested">待检测</span>':'<span class="badge badge-invalid">无效</span>'}<div class="cell-meta">错误 ${p.error_count}</div></td>
+      <td><div class="cell-primary">${q&&q.ip_address?esc(q.ip_address):'-'}</div><div class="cell-meta">${ipMeta}</div></td>
+      <td class="proxy-owner-cell">${ipOwner}</td>
       <td>${riskBadge}</td>
-      <td>${q?(q.chatgpt?yes:no):na}</td>
-      <td>${q?(q.google?yes:no):na}</td>
-      <td>${q?(q.is_residential?yes:no):na}</td>
-      <td>${q&&q.checked_at?`${fmtDate(q.checked_at)}${q.stale?' <span class="badge badge-invalid">已过期</span>':''}`:'-'}</td>
-      <td><button class="btn btn-danger btn-sm" onclick="deleteProxy('${p.id}')">删除</button></td>
-    </tr>`;
+      <td><div class="unlock-summary"><span class="unlock-item">GPT ${q?(q.chatgpt?yes:no):na}</span><span class="unlock-item">Google ${q?(q.google?yes:no):na}</span>${unlockDetails.panel?`<button type="button" class="unlock-toggle" aria-expanded="false" aria-controls="${unlockDetailId}" onclick="toggleUnlockRow(this)">${unlockDetails.summary}</button>`:'<span class="cell-meta">无详细检测</span>'}</div></td>
+      <td class="proxy-check-cell">${q&&q.checked_at?`${fmtDate(q.checked_at)}${q.stale?' <br><span class="badge badge-invalid">已过期</span>':''}`:'-'}</td>
+      <td class="proxy-action-cell"><button class="btn btn-danger btn-sm" onclick="deleteProxy('${p.id}')" title="删除代理">删</button></td>
+    </tr>${unlockDetails.panel?`<tr class="unlock-detail-row" id="${unlockDetailId}" hidden><td colspan="9">${unlockDetails.panel}</td></tr>`:''}`;
   }).join('');
 
   renderPagination(proxyFiltered, proxyTotalPages);
+}
+
+const unlockLabels = {
+  google:'Google', chatgpt:'ChatGPT', sora:'Sora', gemini:'Gemini',
+  copilot:'Copilot', claude:'Claude', netflix:'Netflix',
+  youtube_premium:'YouTube Premium', spotify:'Spotify', tiktok:'TikTok'
+};
+
+function renderIpOwner(q) {
+  const ip = q?.details?.ip;
+  if(!ip) return '-';
+  const asn = ip.asn ? `AS${ip.asn}` : '';
+  const org = ip.as_organization || '';
+  const flags = [];
+  if(ip.is_native === true) flags.push('原生');
+  else if(ip.is_broadcast === true) flags.push('广播');
+  if(ip.is_datacenter === true) flags.push('机房');
+  else if(ip.is_residential === true) flags.push('住宅');
+  const location = [ip.city, ip.region, ip.country].filter(Boolean).join(', ');
+  if(!asn && !org && !flags.length) return '-';
+  return `<div title="${esc(location)}"><div class="cell-primary">${esc([asn,org].filter(Boolean).join(' · '))}</div>${flags.length?`<div class="cell-meta">${esc(flags.join(' · '))}</div>`:''}</div>`;
+}
+
+function renderUnlockDetails(q) {
+  const checks = q?.details?.unlock;
+  if(!checks || typeof checks!=='object') return {summary:'-', panel:''};
+  const entries = Object.entries(checks);
+  if(!entries.length) return {summary:'-', panel:''};
+  const passed = entries.filter(([,item]) => item?.available===true).length;
+  const rows = entries.map(([key,item]) => {
+    const state = item?.available===true?'Yes':item?.available===false?'No':'Error';
+    const stateClass = item?.available===true?'is-available':item?.available===false?'is-unavailable':'is-error';
+    const region = item?.region?` (${item.region})`:'';
+    return `<div class="unlock-detail-item" title="${esc(item?.detail||'')}"><span class="unlock-detail-name">${esc(unlockLabels[key]||key)}</span><span class="unlock-detail-state ${stateClass}">${esc(state+region)}</span></div>`;
+  }).join('');
+  return {
+    summary:`${passed}/${entries.length} 通过`,
+    panel:`<div class="unlock-detail-panel"><div class="unlock-detail-header">解锁检测详情 <span>${passed}/${entries.length} 通过</span></div><div class="unlock-detail-grid">${rows}</div></div>`
+  };
+}
+
+function toggleUnlockRow(button) {
+  const detailRow = button.closest('tr')?.nextElementSibling;
+  if(!detailRow?.classList.contains('unlock-detail-row')) return;
+  const expanded = button.getAttribute('aria-expanded') !== 'true';
+  button.setAttribute('aria-expanded', String(expanded));
+  detailRow.hidden = !expanded;
 }
 
 function renderPagination(total, totalPages) {
@@ -808,7 +1040,7 @@ async function cleanupUselessProxies() {
   refresh();
 }
 
-function refresh() { loadStats(); loadUsers(); loadSubscriptions(); loadProxies(); }
+function refresh() { loadStats(); loadUsers().then(loadProxyAccounts); loadSubscriptions(); loadProxies(); }
 
 // Init: check auth
 function updateCommandTime() {

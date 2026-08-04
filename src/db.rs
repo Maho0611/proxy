@@ -122,6 +122,40 @@ pub struct User {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ProxyAccount {
+    pub id: String,
+    pub label: String,
+    pub username: String,
+    pub owner_user_id: Option<String>,
+    pub enabled: bool,
+    pub credential_version: i32,
+    pub last_used_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct FixedProxySlot {
+    pub id: String,
+    pub account_id: String,
+    pub slot_key: String,
+    pub label: String,
+    pub country: String,
+    pub proxy_type: Option<String>,
+    pub residential: bool,
+    pub chatgpt: bool,
+    pub google: bool,
+    pub proxy_id: String,
+    pub exit_ip: String,
+    pub included_in_subscription: bool,
+    pub replacement_count: i32,
+    pub last_replacement_reason: Option<String>,
+    pub last_replaced_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Session {
     pub id: String,
     pub user_id: String,
@@ -312,9 +346,59 @@ impl Database {
                     expires_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS proxy_accounts (
+                    id TEXT PRIMARY KEY,
+                    label TEXT NOT NULL,
+                    username TEXT NOT NULL UNIQUE,
+                    owner_user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+                    enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                    credential_version INTEGER NOT NULL DEFAULT 1,
+                    last_used_at TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS fixed_proxy_slots (
+                    id TEXT PRIMARY KEY,
+                    account_id TEXT NOT NULL REFERENCES proxy_accounts(id) ON DELETE CASCADE,
+                    slot_key TEXT NOT NULL,
+                    label TEXT NOT NULL,
+                    country TEXT NOT NULL,
+                    proxy_type TEXT,
+                    residential BOOLEAN NOT NULL DEFAULT FALSE,
+                    chatgpt BOOLEAN NOT NULL DEFAULT FALSE,
+                    google BOOLEAN NOT NULL DEFAULT FALSE,
+                    proxy_id TEXT NOT NULL,
+                    exit_ip TEXT NOT NULL,
+                    included_in_subscription BOOLEAN NOT NULL DEFAULT TRUE,
+                    replacement_count INTEGER NOT NULL DEFAULT 0,
+                    last_replacement_reason TEXT,
+                    last_replaced_at TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(account_id, slot_key),
+                    UNIQUE(account_id, exit_ip)
+                );
+
+                CREATE TABLE IF NOT EXISTS fixed_proxy_subscriptions (
+                    account_id TEXT PRIMARY KEY REFERENCES proxy_accounts(id) ON DELETE CASCADE,
+                    token_version INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id);
                 CREATE INDEX IF NOT EXISTS idx_sessions_expires_at ON sessions(expires_at);
                 CREATE INDEX IF NOT EXISTS idx_users_api_key ON users(api_key);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_proxy_accounts_owner_user_id
+                    ON proxy_accounts(owner_user_id)
+                    WHERE owner_user_id IS NOT NULL;
+                CREATE INDEX IF NOT EXISTS idx_proxy_accounts_username_enabled
+                    ON proxy_accounts(username, enabled);
+                CREATE INDEX IF NOT EXISTS idx_fixed_proxy_slots_account
+                    ON fixed_proxy_slots(account_id, created_at);
+                CREATE INDEX IF NOT EXISTS idx_fixed_proxy_slots_proxy
+                    ON fixed_proxy_slots(proxy_id);
                 CREATE INDEX IF NOT EXISTS idx_proxies_subscription_id ON proxies(subscription_id);
                 CREATE INDEX IF NOT EXISTS idx_proxies_endpoint_subscription
                     ON proxies ((LOWER(server)), port, proxy_type, subscription_id)
@@ -965,9 +1049,11 @@ impl Database {
         limit: usize,
         stale_before: &str,
         max_incomplete_retries: u8,
+        quality_schema_version: u8,
     ) -> Result<Vec<(ProxyRow, Option<ProxyQuality>)>, postgres::Error> {
         let limit = limit.max(1) as i64;
         let max_incomplete_retries = max_incomplete_retries as i32;
+        let quality_schema_version = quality_schema_version as i32;
         self.with_conn(|conn| {
             let rows = conn.query(
                 "SELECT
@@ -984,6 +1070,7 @@ impl Database {
                    AND (
                         q.proxy_id IS NULL
                         OR q.checked_at <= $1
+                        OR COALESCE((q.extra_json::jsonb ->> 'schema_version')::int, 0) < $3
                         OR (
                             (q.country IS NULL OR q.ip_type IS NULL OR q.ip_address IS NULL OR q.risk_level = 'Unknown')
                             AND COALESCE((q.extra_json::jsonb ->> 'incomplete_retry_count')::int, 0) < $2
@@ -994,8 +1081,13 @@ impl Database {
                     q.checked_at ASC NULLS FIRST,
                     p.last_validated DESC NULLS LAST,
                     p.updated_at DESC
-                 LIMIT $3",
-                &[&stale_before, &max_incomplete_retries, &limit],
+                 LIMIT $4",
+                &[
+                    &stale_before,
+                    &max_incomplete_retries,
+                    &quality_schema_version,
+                    &limit,
+                ],
             )?;
             Ok(rows.iter().map(proxy_record_from_join_row).collect())
         })
@@ -2158,6 +2250,361 @@ impl Database {
         })
     }
 
+    pub fn get_fixed_proxy_slots(
+        &self,
+        account_id: &str,
+    ) -> Result<Vec<FixedProxySlot>, postgres::Error> {
+        self.with_conn(|conn| {
+            let rows = conn.query(
+                "SELECT id, account_id, slot_key, label, country, proxy_type,
+                        residential, chatgpt, google, proxy_id, exit_ip,
+                        included_in_subscription, replacement_count,
+                        last_replacement_reason, last_replaced_at,
+                        created_at, updated_at
+                 FROM fixed_proxy_slots
+                 WHERE account_id = $1
+                 ORDER BY created_at, id",
+                &[&account_id],
+            )?;
+            Ok(rows.iter().map(fixed_proxy_slot_from_row).collect())
+        })
+    }
+
+    pub fn get_all_fixed_proxy_slots(&self) -> Result<Vec<FixedProxySlot>, postgres::Error> {
+        self.with_conn(|conn| {
+            let rows = conn.query(
+                "SELECT id, account_id, slot_key, label, country, proxy_type,
+                        residential, chatgpt, google, proxy_id, exit_ip,
+                        included_in_subscription, replacement_count,
+                        last_replacement_reason, last_replaced_at,
+                        created_at, updated_at
+                 FROM fixed_proxy_slots
+                 ORDER BY account_id, created_at, id",
+                &[],
+            )?;
+            Ok(rows.iter().map(fixed_proxy_slot_from_row).collect())
+        })
+    }
+
+    pub fn get_fixed_proxy_slot_by_key(
+        &self,
+        account_id: &str,
+        slot_key: &str,
+    ) -> Result<Option<FixedProxySlot>, postgres::Error> {
+        self.with_conn(|conn| {
+            let row = conn.query_opt(
+                "SELECT id, account_id, slot_key, label, country, proxy_type,
+                        residential, chatgpt, google, proxy_id, exit_ip,
+                        included_in_subscription, replacement_count,
+                        last_replacement_reason, last_replaced_at,
+                        created_at, updated_at
+                 FROM fixed_proxy_slots
+                 WHERE account_id = $1 AND slot_key = $2",
+                &[&account_id, &slot_key],
+            )?;
+            Ok(row.as_ref().map(fixed_proxy_slot_from_row))
+        })
+    }
+
+    pub fn get_fixed_proxy_slot_by_id(
+        &self,
+        account_id: &str,
+        id: &str,
+    ) -> Result<Option<FixedProxySlot>, postgres::Error> {
+        self.with_conn(|conn| {
+            let row = conn.query_opt(
+                "SELECT id, account_id, slot_key, label, country, proxy_type,
+                        residential, chatgpt, google, proxy_id, exit_ip,
+                        included_in_subscription, replacement_count,
+                        last_replacement_reason, last_replaced_at,
+                        created_at, updated_at
+                 FROM fixed_proxy_slots
+                 WHERE account_id = $1 AND id = $2",
+                &[&account_id, &id],
+            )?;
+            Ok(row.as_ref().map(fixed_proxy_slot_from_row))
+        })
+    }
+
+    pub fn insert_fixed_proxy_slots(
+        &self,
+        slots: &[FixedProxySlot],
+    ) -> Result<(), postgres::Error> {
+        if slots.is_empty() {
+            return Ok(());
+        }
+        self.with_conn(|conn| {
+            let mut tx = conn.transaction()?;
+            for slot in slots {
+                tx.execute(
+                    "INSERT INTO fixed_proxy_slots (
+                        id, account_id, slot_key, label, country, proxy_type,
+                        residential, chatgpt, google, proxy_id, exit_ip,
+                        included_in_subscription, replacement_count,
+                        last_replacement_reason, last_replaced_at,
+                        created_at, updated_at
+                     ) VALUES (
+                        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
+                        $12, $13, $14, $15, $16, $17
+                     )",
+                    &[
+                        &slot.id,
+                        &slot.account_id,
+                        &slot.slot_key,
+                        &slot.label,
+                        &slot.country,
+                        &slot.proxy_type,
+                        &slot.residential,
+                        &slot.chatgpt,
+                        &slot.google,
+                        &slot.proxy_id,
+                        &slot.exit_ip,
+                        &slot.included_in_subscription,
+                        &slot.replacement_count,
+                        &slot.last_replacement_reason,
+                        &slot.last_replaced_at,
+                        &slot.created_at,
+                        &slot.updated_at,
+                    ],
+                )?;
+            }
+            tx.commit()
+        })
+    }
+
+    pub fn update_fixed_proxy_slot_settings(
+        &self,
+        account_id: &str,
+        id: &str,
+        label: Option<&str>,
+        included_in_subscription: Option<bool>,
+    ) -> Result<Option<FixedProxySlot>, postgres::Error> {
+        let now = chrono::Utc::now().to_rfc3339();
+        self.with_conn(|conn| {
+            let row = conn.query_opt(
+                "UPDATE fixed_proxy_slots SET
+                    label = COALESCE($1, label),
+                    included_in_subscription = COALESCE($2, included_in_subscription),
+                    updated_at = $3
+                 WHERE account_id = $4 AND id = $5
+                 RETURNING id, account_id, slot_key, label, country, proxy_type,
+                           residential, chatgpt, google, proxy_id, exit_ip,
+                           included_in_subscription, replacement_count,
+                           last_replacement_reason, last_replaced_at,
+                           created_at, updated_at",
+                &[&label, &included_in_subscription, &now, &account_id, &id],
+            )?;
+            Ok(row.as_ref().map(fixed_proxy_slot_from_row))
+        })
+    }
+
+    pub fn update_fixed_proxy_slot_assignment(
+        &self,
+        account_id: &str,
+        id: &str,
+        proxy_id: &str,
+        exit_ip: &str,
+        reason: &str,
+    ) -> Result<Option<FixedProxySlot>, postgres::Error> {
+        let now = chrono::Utc::now().to_rfc3339();
+        self.with_conn(|conn| {
+            let row = conn.query_opt(
+                "UPDATE fixed_proxy_slots SET
+                    proxy_id = $1,
+                    exit_ip = $2,
+                    replacement_count = replacement_count + 1,
+                    last_replacement_reason = $3,
+                    last_replaced_at = $4,
+                    updated_at = $4
+                 WHERE account_id = $5 AND id = $6
+                 RETURNING id, account_id, slot_key, label, country, proxy_type,
+                           residential, chatgpt, google, proxy_id, exit_ip,
+                           included_in_subscription, replacement_count,
+                           last_replacement_reason, last_replaced_at,
+                           created_at, updated_at",
+                &[&proxy_id, &exit_ip, &reason, &now, &account_id, &id],
+            )?;
+            Ok(row.as_ref().map(fixed_proxy_slot_from_row))
+        })
+    }
+
+    pub fn delete_fixed_proxy_slot(
+        &self,
+        account_id: &str,
+        id: &str,
+    ) -> Result<bool, postgres::Error> {
+        self.with_conn(|conn| {
+            Ok(conn.execute(
+                "DELETE FROM fixed_proxy_slots WHERE account_id = $1 AND id = $2",
+                &[&account_id, &id],
+            )? > 0)
+        })
+    }
+
+    pub fn get_or_create_fixed_subscription_version(
+        &self,
+        account_id: &str,
+    ) -> Result<i32, postgres::Error> {
+        let now = chrono::Utc::now().to_rfc3339();
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO fixed_proxy_subscriptions (
+                    account_id, token_version, created_at, updated_at
+                 ) VALUES ($1, 1, $2, $2)
+                 ON CONFLICT (account_id) DO NOTHING",
+                &[&account_id, &now],
+            )?;
+            let row = conn.query_one(
+                "SELECT token_version FROM fixed_proxy_subscriptions WHERE account_id = $1",
+                &[&account_id],
+            )?;
+            Ok(row.get(0))
+        })
+    }
+
+    pub fn rotate_fixed_subscription_version(
+        &self,
+        account_id: &str,
+    ) -> Result<i32, postgres::Error> {
+        let now = chrono::Utc::now().to_rfc3339();
+        self.with_conn(|conn| {
+            let row = conn.query_one(
+                "INSERT INTO fixed_proxy_subscriptions (
+                    account_id, token_version, created_at, updated_at
+                 ) VALUES ($1, 2, $2, $2)
+                 ON CONFLICT (account_id) DO UPDATE SET
+                    token_version = fixed_proxy_subscriptions.token_version + 1,
+                    updated_at = EXCLUDED.updated_at
+                 RETURNING token_version",
+                &[&account_id, &now],
+            )?;
+            Ok(row.get(0))
+        })
+    }
+
+    pub fn get_proxy_accounts(&self) -> Result<Vec<ProxyAccount>, postgres::Error> {
+        self.with_conn(|conn| {
+            let rows = conn.query(
+                "SELECT id, label, username, owner_user_id, enabled, credential_version,
+                        last_used_at, created_at, updated_at
+                 FROM proxy_accounts ORDER BY created_at DESC",
+                &[],
+            )?;
+            Ok(rows.iter().map(proxy_account_from_row).collect())
+        })
+    }
+
+    pub fn get_proxy_account_by_id(
+        &self,
+        id: &str,
+    ) -> Result<Option<ProxyAccount>, postgres::Error> {
+        self.with_conn(|conn| {
+            let row = conn.query_opt(
+                "SELECT id, label, username, owner_user_id, enabled, credential_version,
+                        last_used_at, created_at, updated_at
+                 FROM proxy_accounts WHERE id = $1",
+                &[&id],
+            )?;
+            Ok(row.as_ref().map(proxy_account_from_row))
+        })
+    }
+
+    pub fn get_proxy_account_for_owner(
+        &self,
+        owner_user_id: &str,
+    ) -> Result<Option<ProxyAccount>, postgres::Error> {
+        self.with_conn(|conn| {
+            let row = conn.query_opt(
+                "SELECT id, label, username, owner_user_id, enabled, credential_version,
+                        last_used_at, created_at, updated_at
+                 FROM proxy_accounts WHERE owner_user_id = $1",
+                &[&owner_user_id],
+            )?;
+            Ok(row.as_ref().map(proxy_account_from_row))
+        })
+    }
+
+    pub fn insert_proxy_account(&self, account: &ProxyAccount) -> Result<(), postgres::Error> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO proxy_accounts (
+                    id, label, username, owner_user_id, enabled, credential_version,
+                    last_used_at, created_at, updated_at
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+                &[
+                    &account.id,
+                    &account.label,
+                    &account.username,
+                    &account.owner_user_id,
+                    &account.enabled,
+                    &account.credential_version,
+                    &account.last_used_at,
+                    &account.created_at,
+                    &account.updated_at,
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn update_proxy_account(
+        &self,
+        id: &str,
+        label: Option<&str>,
+        update_owner: bool,
+        owner_user_id: Option<&str>,
+        enabled: Option<bool>,
+    ) -> Result<Option<ProxyAccount>, postgres::Error> {
+        let now = chrono::Utc::now().to_rfc3339();
+        self.with_conn(|conn| {
+            let row = conn.query_opt(
+                "UPDATE proxy_accounts SET
+                    label = COALESCE($1, label),
+                    owner_user_id = CASE WHEN $2 THEN $3 ELSE owner_user_id END,
+                    enabled = COALESCE($4, enabled),
+                    updated_at = $5
+                 WHERE id = $6
+                 RETURNING id, label, username, owner_user_id, enabled, credential_version,
+                           last_used_at, created_at, updated_at",
+                &[&label, &update_owner, &owner_user_id, &enabled, &now, &id],
+            )?;
+            Ok(row.as_ref().map(proxy_account_from_row))
+        })
+    }
+
+    pub fn rotate_proxy_account(&self, id: &str) -> Result<Option<ProxyAccount>, postgres::Error> {
+        let now = chrono::Utc::now().to_rfc3339();
+        self.with_conn(|conn| {
+            let row = conn.query_opt(
+                "UPDATE proxy_accounts SET
+                    credential_version = credential_version + 1,
+                    updated_at = $1
+                 WHERE id = $2
+                 RETURNING id, label, username, owner_user_id, enabled, credential_version,
+                           last_used_at, created_at, updated_at",
+                &[&now, &id],
+            )?;
+            Ok(row.as_ref().map(proxy_account_from_row))
+        })
+    }
+
+    pub fn delete_proxy_account(&self, id: &str) -> Result<bool, postgres::Error> {
+        self.with_conn(|conn| {
+            Ok(conn.execute("DELETE FROM proxy_accounts WHERE id = $1", &[&id])? > 0)
+        })
+    }
+
+    pub fn touch_proxy_account_last_used(&self, id: &str) -> Result<(), postgres::Error> {
+        let now = chrono::Utc::now().to_rfc3339();
+        self.with_conn(|conn| {
+            conn.execute(
+                "UPDATE proxy_accounts SET last_used_at = $1 WHERE id = $2",
+                &[&now, &id],
+            )?;
+            Ok(())
+        })
+    }
+
     pub fn get_user_by_id(&self, id: &str) -> Result<Option<User>, postgres::Error> {
         self.with_conn(|conn| {
             let row = conn.query_opt(
@@ -2438,6 +2885,42 @@ fn user_from_row(row: &Row) -> User {
         api_key: row.get(8),
         created_at: row.get(9),
         updated_at: row.get(10),
+    }
+}
+
+fn proxy_account_from_row(row: &Row) -> ProxyAccount {
+    ProxyAccount {
+        id: row.get(0),
+        label: row.get(1),
+        username: row.get(2),
+        owner_user_id: row.get(3),
+        enabled: row.get(4),
+        credential_version: row.get(5),
+        last_used_at: row.get(6),
+        created_at: row.get(7),
+        updated_at: row.get(8),
+    }
+}
+
+fn fixed_proxy_slot_from_row(row: &Row) -> FixedProxySlot {
+    FixedProxySlot {
+        id: row.get(0),
+        account_id: row.get(1),
+        slot_key: row.get(2),
+        label: row.get(3),
+        country: row.get(4),
+        proxy_type: row.get(5),
+        residential: row.get(6),
+        chatgpt: row.get(7),
+        google: row.get(8),
+        proxy_id: row.get(9),
+        exit_ip: row.get(10),
+        included_in_subscription: row.get(11),
+        replacement_count: row.get(12),
+        last_replacement_reason: row.get(13),
+        last_replaced_at: row.get(14),
+        created_at: row.get(15),
+        updated_at: row.get(16),
     }
 }
 

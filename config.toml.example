@@ -48,6 +48,17 @@ max_checks_per_run = 200
 [relay]
 timeout_secs = 600
 
+[proxy_access]
+# static = 仅旧共享账号；hybrid = 旧共享账号 + 独立账号；
+# accounts/database = 仅独立账号。
+auth_mode = "static"
+# 启用 hybrid/accounts/database 前替换为至少 32 字节的随机主密钥。
+# 主密钥不会作为代理密码直接发送；每个密码由账号 ID 和版本号派生。
+credential_secret = "replace-with-at-least-32-random-bytes"
+# 必须是远程客户端实际连接的公网 IP 或 DNS-only 域名，不能从网页域名推断。
+public_host = "SERVER_IP"
+public_port = 1080
+
 [subscription]
 password = "change-subscription-password"
 # URL subscriptions refresh automatically once a day. Set 0 only when you

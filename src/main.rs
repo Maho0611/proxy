@@ -3,14 +3,17 @@ mod bindings;
 mod config;
 mod db;
 mod error;
+mod fixed_proxy;
 mod parser;
 mod pool;
+mod proxy_account;
 mod proxy_listener;
+mod proxy_rotation;
 mod quality;
 mod singbox;
 
 use crate::config::AppConfig;
-use crate::db::{Database, User};
+use crate::db::{Database, ProxyAccount, User};
 use crate::pool::manager::ProxyPool;
 use crate::singbox::process::SingboxManager;
 use dashmap::DashMap;
@@ -33,6 +36,15 @@ pub struct AppState {
     pub dashboard_stats_cache: DashMap<(), DashboardStatsCacheEntry>,
     /// Auth cache: (api_key | session_id) → (User, expires_at_instant).
     pub auth_cache: DashMap<String, (User, tokio::time::Instant)>,
+    /// Live proxy-account cache keyed by base username. Admin mutations update
+    /// it synchronously so disable/delete/rotation take effect immediately.
+    pub proxy_accounts: DashMap<String, ProxyAccount>,
+    /// Throttles best-effort last_used_at writes for busy accounts.
+    pub proxy_account_last_used: DashMap<String, tokio::time::Instant>,
+    /// Timed-rotation sessions keyed by account, session ID, interval and filters.
+    pub proxy_rotation_sessions: DashMap<String, Arc<proxy_rotation::RotationSession>>,
+    /// Per-slot locks make fixed-exit replacement converge under concurrent use.
+    pub fixed_proxy_slot_locks: DashMap<String, Arc<Mutex<()>>>,
     /// Serializes binding changes during validation/quality work.
     pub validation_lock: Mutex<()>,
     /// Prevents duplicate validation runs from being queued/spawned.
@@ -64,7 +76,11 @@ async fn main() {
         .init();
 
     let config = AppConfig::load().expect("Failed to load config");
-    tracing::info!("Proxy starting on {}:{}", config.server.host, config.server.port);
+    tracing::info!(
+        "Proxy starting on {}:{}",
+        config.server.host,
+        config.server.port
+    );
 
     // Ensure data directory exists
     std::fs::create_dir_all("data").ok();
@@ -87,7 +103,8 @@ async fn main() {
     db.clear_all_proxy_local_ports().ok();
 
     // Initialize SingboxManager and start with minimal config
-    let mut manager = SingboxManager::new(config.singbox.clone(), config.validation.batch_size as u16);
+    let mut manager =
+        SingboxManager::new(config.singbox.clone(), config.validation.batch_size as u16);
     if let Err(e) = manager.start().await {
         tracing::warn!("Failed to start sing-box: {e}");
     }
@@ -95,7 +112,12 @@ async fn main() {
     // Create initial bindings for valid proxies
     {
         let mut proxies = pool.get_valid_proxies();
-        proxies.truncate(config.singbox.prebound_proxies.min(config.singbox.max_proxies));
+        proxies.truncate(
+            config
+                .singbox
+                .prebound_proxies
+                .min(config.singbox.max_proxies),
+        );
         if !proxies.is_empty() {
             let desired: Vec<(String, serde_json::Value)> = proxies
                 .iter()
@@ -119,6 +141,14 @@ async fn main() {
 
     let singbox = Arc::new(Mutex::new(manager));
 
+    let proxy_accounts = DashMap::new();
+    for account in db
+        .get_proxy_accounts()
+        .expect("Failed to load proxy accounts")
+    {
+        proxy_accounts.insert(account.username.clone(), account);
+    }
+
     let state = Arc::new(AppState {
         config: config.clone(),
         db,
@@ -129,6 +159,10 @@ async fn main() {
         subscription_export_cache: DashMap::new(),
         dashboard_stats_cache: DashMap::new(),
         auth_cache: DashMap::new(),
+        proxy_accounts,
+        proxy_account_last_used: DashMap::new(),
+        proxy_rotation_sessions: DashMap::new(),
+        fixed_proxy_slot_locks: DashMap::new(),
         validation_lock: Mutex::new(()),
         validation_running: AtomicBool::new(false),
         quality_running: AtomicBool::new(false),
@@ -169,7 +203,8 @@ async fn start_background_tasks(state: Arc<AppState>) {
             tracing::error!("Startup validation error: {e}");
         }
 
-        let interval = std::time::Duration::from_secs(state_clone.config.validation.interval_mins * 60);
+        let interval =
+            std::time::Duration::from_secs(state_clone.config.validation.interval_mins * 60);
         loop {
             tokio::time::sleep(interval).await;
             tracing::info!("Running periodic proxy validation...");
@@ -189,11 +224,7 @@ async fn start_background_tasks(state: Arc<AppState>) {
         // Wait a bit on startup for proxies to be validated first
         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
         let idle_interval = std::time::Duration::from_secs(
-            state_clone
-                .config
-                .quality
-                .interval_mins
-                .saturating_mul(60),
+            state_clone.config.quality.interval_mins.saturating_mul(60),
         );
         loop {
             if let Err(e) = quality::checker::check_all(state_clone.clone()).await {
@@ -247,7 +278,36 @@ async fn start_background_tasks(state: Arc<AppState>) {
         loop {
             tokio::time::sleep(interval).await;
             let now = tokio::time::Instant::now();
-            state_clone.auth_cache.retain(|_, (_, expires)| now < *expires);
+            state_clone
+                .auth_cache
+                .retain(|_, (_, expires)| now < *expires);
+        }
+    });
+
+    let state_clone = state.clone();
+    // Periodic cleanup for inactive timed proxy-rotation sessions.
+    tokio::spawn(async move {
+        let interval = std::time::Duration::from_secs(60);
+        loop {
+            tokio::time::sleep(interval).await;
+            let count = proxy_rotation::cleanup_idle_sessions(&state_clone).await;
+            if count > 0 {
+                tracing::info!("Cleaned up {count} idle timed-rotation sessions");
+            }
+        }
+    });
+
+    let state_clone = state.clone();
+    // Periodically repair fixed slots whose assigned upstream disappeared,
+    // became invalid, changed country, or changed its measured exit address.
+    tokio::spawn(async move {
+        let interval = std::time::Duration::from_secs(60);
+        loop {
+            tokio::time::sleep(interval).await;
+            let count = fixed_proxy::reconcile_all(&state_clone).await;
+            if count > 0 {
+                tracing::info!("Reconciled {count} fixed proxy slots");
+            }
         }
     });
 
@@ -397,10 +457,7 @@ async fn refresh_due_subscriptions(state: &Arc<AppState>) {
         return;
     }
 
-    tracing::info!(
-        "Auto-refreshing {} due subscriptions...",
-        refreshable.len()
-    );
+    tracing::info!("Auto-refreshing {} due subscriptions...", refreshable.len());
 
     let mut success = 0;
     let mut failed = 0;
@@ -421,9 +478,7 @@ async fn refresh_due_subscriptions(state: &Arc<AppState>) {
         }
     }
 
-    tracing::info!(
-        "Auto-refresh complete: {success} succeeded, {failed} failed"
-    );
+    tracing::info!("Auto-refresh complete: {success} succeeded, {failed} failed");
 
     // Run validation once after all subscriptions are refreshed
     if success > 0 {
