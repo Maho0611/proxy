@@ -110,6 +110,25 @@ tr:hover td { background:rgba(70,220,255,.035); }
 .metric-pair small { color:var(--text-dim); font-size:10px; }
 .credential-preview { display:none; margin-top:14px; padding:13px; border:1px solid var(--warn); background:rgba(255,200,87,.06); color:var(--text); font:12px/1.7 Consolas,monospace; white-space:pre-wrap; word-break:break-all; }
 .account-create-grid { display:grid; grid-template-columns:1fr 1fr 1fr auto; gap:12px; align-items:end; }
+.proxy-card { padding:8px 12px 14px; overflow-x:hidden; }
+.proxy-table { table-layout:fixed; }
+.proxy-table th, .proxy-table td { padding:10px 8px; vertical-align:middle; }
+.proxy-table th { white-space:nowrap; }
+.proxy-table td { white-space:normal; overflow-wrap:anywhere; line-height:1.35; }
+.proxy-table .cell-primary { color:var(--text-bright); font-weight:600; }
+.proxy-table .cell-meta { color:var(--text-dim); font-size:10px; margin-top:4px; }
+.proxy-table .proxy-node-cell .badge { margin-top:5px; }
+.proxy-table .proxy-endpoint { font-family:Consolas,"Courier New",monospace; font-size:11px; word-break:break-all; }
+.proxy-table .proxy-owner-cell { font-size:11px; }
+.proxy-table .proxy-owner-cell .cell-primary { font-weight:500; }
+.proxy-table .unlock-summary { display:flex; flex-wrap:wrap; align-items:center; gap:5px 8px; }
+.proxy-table .unlock-item { display:inline-flex; align-items:center; gap:4px; color:var(--text-dim); font-size:10px; white-space:nowrap; }
+.proxy-table .unlock-item .badge { padding:2px 5px; }
+.proxy-table .unlock-summary details { flex-basis:100%; margin-top:1px; font-size:10px; }
+.proxy-table .proxy-check-cell { font-size:10px; }
+.proxy-table .proxy-check-cell .badge { margin-top:4px; }
+.proxy-table .proxy-action-cell { text-align:right; }
+@media(max-width:1100px) { .proxy-card { overflow-x:auto; } .proxy-table { min-width:1040px; } }
 @media(max-width:900px) { .account-create-grid { grid-template-columns:1fr 1fr; } }
 @media(max-width:650px) { .account-create-grid { grid-template-columns:1fr; } }
 @keyframes pulse { 50% { opacity:.35; box-shadow:0 0 2px var(--success); } }
@@ -308,24 +327,21 @@ tr:hover td { background:rgba(70,220,255,.035); }
         <option value="residential">Residential</option>
       </select>
     </div>
-    <div class="card">
-      <table>
+    <div class="card proxy-card">
+      <table class="proxy-table">
+        <colgroup>
+          <col style="width:16%"><col style="width:14%"><col style="width:8%">
+          <col style="width:12%"><col style="width:19%"><col style="width:8%">
+          <col style="width:11%"><col style="width:8%"><col style="width:4%">
+        </colgroup>
         <thead><tr>
-          <th onclick="sortBy('name')">名称</th>
-          <th onclick="sortBy('type')">类型</th>
-          <th onclick="sortBy('server')">服务器</th>
-          <th onclick="sortBy('is_valid')">状态</th>
-          <th onclick="sortBy('error_count')">错误数</th>
-          <th>端口</th>
-          <th>IP</th>
-          <th onclick="sortBy('country')">国家</th>
-          <th>IP类型</th>
+          <th onclick="sortBy('name')">节点</th>
+          <th onclick="sortBy('server')">服务端 / 接入</th>
+          <th onclick="sortBy('is_valid')">运行状态</th>
+          <th onclick="sortBy('country')">IP 概况</th>
           <th>ASN / 机构</th>
           <th onclick="sortBy('risk')">风险</th>
-          <th>ChatGPT</th>
-          <th>Google</th>
-          <th>更多解锁</th>
-          <th>住宅</th>
+          <th>流媒体解锁</th>
           <th>质检时间</th>
           <th>操作</th>
         </tr></thead>
@@ -834,24 +850,19 @@ function renderProxies() {
     }
     const ipOwner = renderIpOwner(q);
     const unlockDetails = renderUnlockDetails(q);
+    const ipMeta = q
+      ? [q.country, q.ip_type, q.is_residential?'住宅':'非住宅'].filter(Boolean).map(esc).join(' · ')
+      : '-';
     return `<tr>
-      <td>${esc(p.name)}</td>
-      <td><span class="badge badge-type">${esc(p.type)}</span></td>
-      <td>${esc(p.server)}:${p.port}</td>
-      <td>${p.status==='valid'?'<span class="badge badge-valid">有效</span>':p.status==='untested'?'<span class="badge badge-untested">待检测</span>':'<span class="badge badge-invalid">无效</span>'}</td>
-      <td>${p.error_count}</td>
-      <td>${p.local_port||'-'}</td>
-      <td>${q&&q.ip_address?esc(q.ip_address):'-'}</td>
-      <td>${q&&q.country?esc(q.country):'-'}</td>
-      <td>${q&&q.ip_type?esc(q.ip_type):'-'}</td>
-      <td>${ipOwner}</td>
+      <td class="proxy-node-cell"><div class="cell-primary">${esc(p.name)}</div><span class="badge badge-type">${esc(p.type)}</span></td>
+      <td><div class="cell-primary proxy-endpoint">${esc(p.server)}:${p.port}</div><div class="cell-meta">接入端口 ${p.local_port||'未分配'}</div></td>
+      <td>${p.status==='valid'?'<span class="badge badge-valid">有效</span>':p.status==='untested'?'<span class="badge badge-untested">待检测</span>':'<span class="badge badge-invalid">无效</span>'}<div class="cell-meta">错误 ${p.error_count}</div></td>
+      <td><div class="cell-primary">${q&&q.ip_address?esc(q.ip_address):'-'}</div><div class="cell-meta">${ipMeta}</div></td>
+      <td class="proxy-owner-cell">${ipOwner}</td>
       <td>${riskBadge}</td>
-      <td>${q?(q.chatgpt?yes:no):na}</td>
-      <td>${q?(q.google?yes:no):na}</td>
-      <td>${unlockDetails}</td>
-      <td>${q?(q.is_residential?yes:no):na}</td>
-      <td>${q&&q.checked_at?`${fmtDate(q.checked_at)}${q.stale?' <span class="badge badge-invalid">已过期</span>':''}`:'-'}</td>
-      <td><button class="btn btn-danger btn-sm" onclick="deleteProxy('${p.id}')">删除</button></td>
+      <td><div class="unlock-summary"><span class="unlock-item">GPT ${q?(q.chatgpt?yes:no):na}</span><span class="unlock-item">Google ${q?(q.google?yes:no):na}</span>${unlockDetails}</div></td>
+      <td class="proxy-check-cell">${q&&q.checked_at?`${fmtDate(q.checked_at)}${q.stale?' <br><span class="badge badge-invalid">已过期</span>':''}`:'-'}</td>
+      <td class="proxy-action-cell"><button class="btn btn-danger btn-sm" onclick="deleteProxy('${p.id}')" title="删除代理">删</button></td>
     </tr>`;
   }).join('');
 
@@ -876,7 +887,7 @@ function renderIpOwner(q) {
   else if(ip.is_residential === true) flags.push('住宅');
   const location = [ip.city, ip.region, ip.country].filter(Boolean).join(', ');
   if(!asn && !org && !flags.length) return '-';
-  return `<div title="${esc(location)}">${esc([asn,org].filter(Boolean).join(' · '))}${flags.length?`<br><span style="color:var(--text-dim);font-size:11px">${esc(flags.join(' · '))}</span>`:''}</div>`;
+  return `<div title="${esc(location)}"><div class="cell-primary">${esc([asn,org].filter(Boolean).join(' · '))}</div>${flags.length?`<div class="cell-meta">${esc(flags.join(' · '))}</div>`:''}</div>`;
 }
 
 function renderUnlockDetails(q) {

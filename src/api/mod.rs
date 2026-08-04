@@ -176,8 +176,14 @@ async fn user_page() -> axum::response::Html<&'static str> {
     axum::response::Html(include_str!("../web/user.html"))
 }
 
-async fn admin_page() -> axum::response::Html<&'static str> {
-    axum::response::Html(include_str!("../web/admin.html"))
+async fn admin_page() -> impl axum::response::IntoResponse {
+    (
+        [(
+            axum::http::header::CACHE_CONTROL,
+            "no-store, no-cache, must-revalidate",
+        )],
+        axum::response::Html(include_str!("../web/admin.html")),
+    )
 }
 
 async fn docs_page() -> axum::response::Html<String> {
