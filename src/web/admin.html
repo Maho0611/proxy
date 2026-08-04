@@ -340,7 +340,7 @@ body.modal-open { overflow:hidden; }
           </div>
         </div>
       </div>
-      <button class="btn btn-primary" onclick="adminAddSubscription()">添加订阅</button>
+      <button class="btn btn-primary" id="add-sub-submit" onclick="adminAddSubscription()">添加订阅</button>
     </div>
   </div>
 
@@ -561,7 +561,14 @@ async function api(path, opts={}) {
       location.reload();
       return null;
     }
-    return await r.json();
+    const text = await r.text();
+    if (!text) return r.ok ? {} : { error: `HTTP ${r.status} ${r.statusText}` };
+    try {
+      return JSON.parse(text);
+    } catch (_) {
+      const summary = text.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 180);
+      return { error: `HTTP ${r.status} ${r.statusText}${summary ? ': ' + summary : ''}` };
+    }
   }
   catch(e) { toast('错误: '+e.message); return null; }
 }
@@ -979,6 +986,10 @@ async function saveEditSubscription(event) {
     return toast('自动更新间隔必须是大于等于 0 的整数');
   }
   if (!url && (refreshInterval ?? 0) > 0) return toast('仅 URL 订阅支持自动更新');
+  if (url && url !== String(subscription.url || '').trim()) {
+    const duplicate = currentSubscriptions.find(item => String(item.id) !== String(subscription.id) && String(item.url || '').trim() === url);
+    if (duplicate) return toast(`该订阅 URL 已被“${duplicate.name}”使用`);
+  }
 
   const sourceChanged = subType !== subscription.sub_type
     || url !== (subscription.url || '')
@@ -1033,6 +1044,8 @@ function updateProxySourceFilter(subscriptions) {
 }
 
 async function adminAddSubscription() {
+  const submitButton = document.getElementById('add-sub-submit');
+  if (submitButton.disabled) return;
   const name = document.getElementById('add-sub-name').value.trim();
   const subType = document.getElementById('add-sub-type').value;
   const url = document.getElementById('add-sub-url').value.trim();
@@ -1044,18 +1057,27 @@ async function adminAddSubscription() {
   if (!url && !content) return toast('请输入 URL 或粘贴内容');
   if (refreshInterval != null && (refreshInterval < 0 || !Number.isFinite(refreshInterval))) return toast('自动更新间隔必须是大于等于 0 的数字');
   if (!url && (refreshInterval ?? 0) > 0) return toast('仅 URL 订阅支持自动更新');
+  if (url) {
+    const duplicate = currentSubscriptions.find(item => String(item.url || '').trim() === url);
+    if (duplicate) return toast(`订阅“${duplicate.name}”已存在，无需重复添加`);
+  }
   const body = { name, type: subType };
   if (url) body.url = url;
   else body.content = content;
   if (refreshInterval != null) body.refresh_interval_mins = refreshInterval;
+  submitButton.disabled = true;
+  submitButton.textContent = '添加中...';
   toast('正在添加订阅...');
   const d = await api('/api/subscriptions', {
     method: 'POST',
     headers: { ...authHeaders(), 'Content-Type': 'application/json' },
     body: JSON.stringify(body)
   });
+  submitButton.disabled = false;
+  submitButton.textContent = '添加订阅';
   if (d && d.subscription) {
-    toast(`已添加 ${d.proxies_added} 个代理`);
+    if (d.already_exists) toast(`订阅“${d.subscription.name}”已存在，未重复导入`);
+    else toast(`已添加 ${d.proxies_added} 个代理`);
     document.getElementById('add-sub-name').value = '';
     document.getElementById('add-sub-type').value = 'auto';
     document.getElementById('add-sub-url').value = '';

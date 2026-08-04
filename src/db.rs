@@ -439,9 +439,59 @@ impl Database {
         })
     }
 
-    pub fn insert_subscription(&self, sub: &Subscription) -> Result<(), postgres::Error> {
+    pub fn get_subscription_by_url(
+        &self,
+        url: &str,
+    ) -> Result<Option<Subscription>, postgres::Error> {
         self.with_conn(|conn| {
-            conn.execute(
+            let row = conn.query_opt(
+                "SELECT id, name, sub_type, url, content, proxy_count,
+                        raw_proxy_count, duplicate_proxy_count,
+                        refresh_interval_mins, last_refresh_at, created_at, updated_at
+                 FROM subscriptions
+                 WHERE BTRIM(url) = $1
+                 ORDER BY created_at ASC, id ASC
+                 LIMIT 1",
+                &[&url],
+            )?;
+            Ok(row.as_ref().map(subscription_from_row))
+        })
+    }
+
+    /// Atomically create a URL subscription and its proxy inventory unless the
+    /// same URL is already present. The advisory lock makes repeated clicks
+    /// and concurrent requests idempotent without requiring legacy duplicate
+    /// rows to be deleted before a unique index can be introduced.
+    pub fn insert_subscription_with_proxies_unless_url_exists(
+        &self,
+        sub: &Subscription,
+        proxies: &[ProxyRow],
+    ) -> Result<Option<Subscription>, postgres::Error> {
+        self.with_conn(|conn| {
+            let mut tx = conn.transaction()?;
+
+            if let Some(url) = sub.url.as_deref() {
+                tx.query_one(
+                    "SELECT pg_advisory_xact_lock(hashtext($1)::bigint)",
+                    &[&url],
+                )?;
+                if let Some(row) = tx.query_opt(
+                    "SELECT id, name, sub_type, url, content, proxy_count,
+                            raw_proxy_count, duplicate_proxy_count,
+                            refresh_interval_mins, last_refresh_at, created_at, updated_at
+                     FROM subscriptions
+                     WHERE BTRIM(url) = $1
+                     ORDER BY created_at ASC, id ASC
+                     LIMIT 1",
+                    &[&url],
+                )? {
+                    let existing = subscription_from_row(&row);
+                    tx.commit()?;
+                    return Ok(Some(existing));
+                }
+            }
+
+            tx.execute(
                 "INSERT INTO subscriptions (
                     id, name, sub_type, url, content, proxy_count,
                     raw_proxy_count, duplicate_proxy_count,
@@ -465,7 +515,58 @@ impl Database {
                     &sub.updated_at,
                 ],
             )?;
-            Ok(())
+
+            if !proxies.is_empty() {
+                let stmt = tx.prepare(
+                    "INSERT INTO proxies (
+                        id, subscription_id, name, proxy_type, server, port, config_json,
+                        is_valid, local_port, error_count, last_error, last_validated, created_at, updated_at, orphaned_at
+                     ) VALUES (
+                        $1, $2, $3, $4, $5, $6, $7,
+                        $8, $9, $10, $11, $12, $13, $14, $15
+                     )
+                     ON CONFLICT (id) DO UPDATE SET
+                        subscription_id = EXCLUDED.subscription_id,
+                        name = EXCLUDED.name,
+                        proxy_type = EXCLUDED.proxy_type,
+                        server = EXCLUDED.server,
+                        port = EXCLUDED.port,
+                        config_json = EXCLUDED.config_json,
+                        is_valid = EXCLUDED.is_valid,
+                        local_port = EXCLUDED.local_port,
+                        error_count = EXCLUDED.error_count,
+                        last_error = EXCLUDED.last_error,
+                        last_validated = EXCLUDED.last_validated,
+                        created_at = EXCLUDED.created_at,
+                        updated_at = EXCLUDED.updated_at,
+                        orphaned_at = EXCLUDED.orphaned_at",
+                )?;
+                for proxy in proxies {
+                    tx.execute(
+                        &stmt,
+                        &[
+                            &proxy.id,
+                            &proxy.subscription_id,
+                            &proxy.name,
+                            &proxy.proxy_type,
+                            &proxy.server,
+                            &proxy.port,
+                            &proxy.config_json,
+                            &proxy.is_valid,
+                            &proxy.local_port,
+                            &proxy.error_count,
+                            &proxy.last_error,
+                            &proxy.last_validated,
+                            &proxy.created_at,
+                            &proxy.updated_at,
+                            &proxy.orphaned_at,
+                        ],
+                    )?;
+                }
+            }
+
+            tx.commit()?;
+            Ok(None)
         })
     }
 
@@ -544,6 +645,55 @@ impl Database {
                 ],
             )?;
             Ok(())
+        })
+    }
+
+    /// Update a subscription after atomically reserving its new URL. Returns
+    /// the conflicting subscription when another row already owns that URL.
+    pub fn update_subscription_settings_unless_url_exists(
+        &self,
+        sub: &Subscription,
+    ) -> Result<Option<Subscription>, postgres::Error> {
+        self.with_conn(|conn| {
+            let mut tx = conn.transaction()?;
+            if let Some(url) = sub.url.as_deref() {
+                tx.query_one(
+                    "SELECT pg_advisory_xact_lock(hashtext($1)::bigint)",
+                    &[&url],
+                )?;
+                if let Some(row) = tx.query_opt(
+                    "SELECT id, name, sub_type, url, content, proxy_count,
+                            raw_proxy_count, duplicate_proxy_count,
+                            refresh_interval_mins, last_refresh_at, created_at, updated_at
+                     FROM subscriptions
+                     WHERE BTRIM(url) = $1 AND id <> $2
+                     ORDER BY created_at ASC, id ASC
+                     LIMIT 1",
+                    &[&url, &sub.id],
+                )? {
+                    let existing = subscription_from_row(&row);
+                    tx.commit()?;
+                    return Ok(Some(existing));
+                }
+            }
+
+            tx.execute(
+                "UPDATE subscriptions
+                 SET name = $1, sub_type = $2, url = $3, content = $4,
+                     refresh_interval_mins = $5, updated_at = $6
+                 WHERE id = $7",
+                &[
+                    &sub.name,
+                    &sub.sub_type,
+                    &sub.url,
+                    &sub.content,
+                    &sub.refresh_interval_mins,
+                    &sub.updated_at,
+                    &sub.id,
+                ],
+            )?;
+            tx.commit()?;
+            Ok(None)
         })
     }
 
