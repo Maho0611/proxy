@@ -138,19 +138,45 @@ pub async fn add_subscription(
     let req: AddSubscriptionRequest = serde_json::from_slice(&bytes)
         .map_err(|e| AppError::BadRequest(format!("Invalid JSON: {e}")))?;
 
+    let name = req.name.trim();
+    if name.is_empty() {
+        return Err(AppError::BadRequest("Subscription name is required".into()));
+    }
+    let url = req
+        .url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    let inline_content = req
+        .content
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+
     let refresh_interval_mins = validate_refresh_interval_mins(req.refresh_interval_mins)?;
-    if req.url.is_none() && refresh_interval_mins.unwrap_or(0) > 0 {
+    if url.is_none() && refresh_interval_mins.unwrap_or(0) > 0 {
         return Err(AppError::BadRequest(
             "Auto-refresh requires a subscription URL".into(),
         ));
     }
 
+    // Make repeated submissions idempotent before downloading or parsing the
+    // source. A second atomic check is performed together with the final DB
+    // insert to cover concurrent requests that both pass this fast path.
+    if let Some(ref url) = url {
+        if let Some(existing) = state.db.get_subscription_by_url(url)? {
+            return Ok(already_imported_response(existing));
+        }
+    }
+
     // Fetch content from URL or use provided content
-    let content = if let Some(ref url) = req.url {
+    let content = if let Some(ref url) = url {
         fetch_subscription_content(url, &req.sub_type)
             .await
             .map_err(AppError::Internal)?
-    } else if let Some(ref content) = req.content {
+    } else if let Some(ref content) = inline_content {
         content.clone()
     } else {
         return Err(AppError::BadRequest(
@@ -174,14 +200,10 @@ pub async fn add_subscription(
 
     let subscription = Subscription {
         id: sub_id.clone(),
-        name: req.name.clone(),
+        name: name.to_owned(),
         sub_type: req.sub_type.clone(),
-        url: req.url.clone(),
-        content: if req.url.is_some() {
-            None
-        } else {
-            Some(content)
-        },
+        url: url.clone(),
+        content: if url.is_some() { None } else { Some(content) },
         proxy_count: parsed.len() as i32,
         raw_proxy_count: raw_proxy_count as i32,
         duplicate_proxy_count: duplicate_proxy_count as i32,
@@ -190,8 +212,6 @@ pub async fn add_subscription(
         created_at: now.clone(),
         updated_at: now.clone(),
     };
-
-    state.db.insert_subscription(&subscription)?;
 
     // Insert proxies
     let mut proxy_rows = Vec::with_capacity(parsed.len());
@@ -216,7 +236,12 @@ pub async fn add_subscription(
         });
     }
 
-    state.db.insert_proxies_batch(&proxy_rows)?;
+    if let Some(existing) = state
+        .db
+        .insert_subscription_with_proxies_unless_url_exists(&subscription, &proxy_rows)?
+    {
+        return Ok(already_imported_response(existing));
+    }
     state.db.inherit_exact_duplicate_states(
         &proxy_rows
             .iter()
@@ -230,7 +255,7 @@ pub async fn add_subscription(
 
     tracing::info!(
         "Added subscription '{}' with {added} proxies (discarded {duplicate_proxy_count} exact duplicates)",
-        req.name
+        name
     );
 
     // Assign ports then validate in background (must be sequential, not two separate spawns)
@@ -247,6 +272,20 @@ pub async fn add_subscription(
         "proxies_added": added,
         "duplicates_discarded": duplicate_proxy_count,
     })))
+}
+
+fn already_imported_response(subscription: Subscription) -> Json<serde_json::Value> {
+    let message = format!(
+        "Subscription URL already exists as '{}' and was not imported again",
+        subscription.name
+    );
+    Json(json!({
+        "message": message,
+        "subscription": subscription,
+        "already_exists": true,
+        "proxies_added": 0,
+        "duplicates_discarded": 0,
+    }))
 }
 
 pub async fn delete_subscription(
@@ -371,6 +410,7 @@ pub async fn edit_subscription(
         ));
     }
 
+    let url_changed = subscription.url != url;
     subscription.name = name.to_owned();
     subscription.sub_type = sub_type;
     subscription.url = url;
@@ -382,7 +422,19 @@ pub async fn edit_subscription(
     subscription.refresh_interval_mins = refresh_interval_mins;
     subscription.updated_at = chrono::Utc::now().to_rfc3339();
 
-    state.db.update_subscription_settings(&subscription)?;
+    if url_changed {
+        if let Some(existing) = state
+            .db
+            .update_subscription_settings_unless_url_exists(&subscription)?
+        {
+            return Err(AppError::BadRequest(format!(
+                "该订阅 URL 已被‘{}’使用",
+                existing.name
+            )));
+        }
+    } else {
+        state.db.update_subscription_settings(&subscription)?;
+    }
     crate::api::sub_export::invalidate_subscription_export_cache(state.as_ref());
     crate::api::fetch::invalidate_stats_cache(state.as_ref());
 
