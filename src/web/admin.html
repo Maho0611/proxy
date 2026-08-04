@@ -124,7 +124,22 @@ tr:hover td { background:rgba(70,220,255,.035); }
 .proxy-table .unlock-summary { display:flex; flex-wrap:wrap; align-items:center; gap:5px 8px; }
 .proxy-table .unlock-item { display:inline-flex; align-items:center; gap:4px; color:var(--text-dim); font-size:10px; white-space:nowrap; }
 .proxy-table .unlock-item .badge { padding:2px 5px; }
-.proxy-table .unlock-summary details { flex-basis:100%; margin-top:1px; font-size:10px; }
+.proxy-table .unlock-toggle { flex-basis:100%; width:max-content; display:inline-flex; align-items:center; gap:4px; padding:1px 0; border:0; background:transparent; color:var(--primary); font:10px Consolas,monospace; cursor:pointer; }
+.proxy-table .unlock-toggle::before { content:"▸"; display:inline-block; transition:transform .16s ease; }
+.proxy-table .unlock-toggle[aria-expanded="true"]::before { transform:rotate(90deg); }
+.proxy-table .unlock-toggle:hover { color:var(--primary-hover); }
+.proxy-table .unlock-detail-row td { padding:0 8px 12px; background:rgba(70,220,255,.018); }
+.proxy-table .unlock-detail-row:hover td { background:rgba(70,220,255,.018); }
+.proxy-table .unlock-detail-panel { padding:12px 14px 14px; border:1px solid rgba(70,220,255,.2); border-left:2px solid var(--primary); background:rgba(4,12,23,.72); }
+.proxy-table .unlock-detail-header { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:10px; color:var(--text-bright); font-size:11px; }
+.proxy-table .unlock-detail-header span { color:var(--success); font:10px Consolas,monospace; }
+.proxy-table .unlock-detail-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:6px 12px; }
+.proxy-table .unlock-detail-item { min-width:0; display:flex; align-items:center; justify-content:space-between; gap:12px; padding:6px 8px; border:1px solid rgba(29,64,85,.55); background:rgba(13,25,43,.72); font-size:10px; }
+.proxy-table .unlock-detail-name { overflow:hidden; color:var(--text); text-overflow:ellipsis; white-space:nowrap; }
+.proxy-table .unlock-detail-state { flex:none; font-family:Consolas,monospace; white-space:nowrap; }
+.proxy-table .unlock-detail-state.is-available { color:var(--success); }
+.proxy-table .unlock-detail-state.is-unavailable { color:var(--danger); }
+.proxy-table .unlock-detail-state.is-error { color:var(--text-dim); }
 .proxy-table .proxy-check-cell { font-size:10px; }
 .proxy-table .proxy-check-cell .badge { margin-top:4px; }
 .proxy-table .proxy-action-cell { text-align:right; }
@@ -838,7 +853,7 @@ function renderProxies() {
   if(!currentProxies.length) { tb.innerHTML=''; empty.style.display=''; renderPagination(0, 0); return; }
   empty.style.display='none';
 
-  tb.innerHTML = currentProxies.map(p => {
+  tb.innerHTML = currentProxies.map((p, index) => {
     const q = p.quality;
     const yes = '<span class="badge badge-valid">Yes</span>';
     const no = '<span class="badge badge-invalid">No</span>';
@@ -850,6 +865,7 @@ function renderProxies() {
     }
     const ipOwner = renderIpOwner(q);
     const unlockDetails = renderUnlockDetails(q);
+    const unlockDetailId = `unlock-detail-${index}`;
     const ipMeta = q
       ? [q.country, q.ip_type, q.is_residential?'住宅':'非住宅'].filter(Boolean).map(esc).join(' · ')
       : '-';
@@ -860,10 +876,10 @@ function renderProxies() {
       <td><div class="cell-primary">${q&&q.ip_address?esc(q.ip_address):'-'}</div><div class="cell-meta">${ipMeta}</div></td>
       <td class="proxy-owner-cell">${ipOwner}</td>
       <td>${riskBadge}</td>
-      <td><div class="unlock-summary"><span class="unlock-item">GPT ${q?(q.chatgpt?yes:no):na}</span><span class="unlock-item">Google ${q?(q.google?yes:no):na}</span>${unlockDetails}</div></td>
+      <td><div class="unlock-summary"><span class="unlock-item">GPT ${q?(q.chatgpt?yes:no):na}</span><span class="unlock-item">Google ${q?(q.google?yes:no):na}</span>${unlockDetails.panel?`<button type="button" class="unlock-toggle" aria-expanded="false" aria-controls="${unlockDetailId}" onclick="toggleUnlockRow(this)">${unlockDetails.summary}</button>`:'<span class="cell-meta">无详细检测</span>'}</div></td>
       <td class="proxy-check-cell">${q&&q.checked_at?`${fmtDate(q.checked_at)}${q.stale?' <br><span class="badge badge-invalid">已过期</span>':''}`:'-'}</td>
       <td class="proxy-action-cell"><button class="btn btn-danger btn-sm" onclick="deleteProxy('${p.id}')" title="删除代理">删</button></td>
-    </tr>`;
+    </tr>${unlockDetails.panel?`<tr class="unlock-detail-row" id="${unlockDetailId}" hidden><td colspan="9">${unlockDetails.panel}</td></tr>`:''}`;
   }).join('');
 
   renderPagination(proxyFiltered, proxyTotalPages);
@@ -892,16 +908,28 @@ function renderIpOwner(q) {
 
 function renderUnlockDetails(q) {
   const checks = q?.details?.unlock;
-  if(!checks || typeof checks!=='object') return '-';
+  if(!checks || typeof checks!=='object') return {summary:'-', panel:''};
   const entries = Object.entries(checks);
+  if(!entries.length) return {summary:'-', panel:''};
   const passed = entries.filter(([,item]) => item?.available===true).length;
   const rows = entries.map(([key,item]) => {
     const state = item?.available===true?'Yes':item?.available===false?'No':'Error';
-    const color = item?.available===true?'var(--success)':item?.available===false?'var(--danger)':'var(--text-dim)';
+    const stateClass = item?.available===true?'is-available':item?.available===false?'is-unavailable':'is-error';
     const region = item?.region?` (${item.region})`:'';
-    return `<div title="${esc(item?.detail||'')}" style="display:flex;justify-content:space-between;gap:12px"><span>${esc(unlockLabels[key]||key)}</span><span style="color:${color}">${esc(state+region)}</span></div>`;
+    return `<div class="unlock-detail-item" title="${esc(item?.detail||'')}"><span class="unlock-detail-name">${esc(unlockLabels[key]||key)}</span><span class="unlock-detail-state ${stateClass}">${esc(state+region)}</span></div>`;
   }).join('');
-  return `<details><summary style="cursor:pointer;white-space:nowrap">${passed}/${entries.length} 通过</summary><div style="min-width:210px;display:grid;gap:3px;margin-top:6px">${rows}</div></details>`;
+  return {
+    summary:`${passed}/${entries.length} 通过`,
+    panel:`<div class="unlock-detail-panel"><div class="unlock-detail-header">解锁检测详情 <span>${passed}/${entries.length} 通过</span></div><div class="unlock-detail-grid">${rows}</div></div>`
+  };
+}
+
+function toggleUnlockRow(button) {
+  const detailRow = button.closest('tr')?.nextElementSibling;
+  if(!detailRow?.classList.contains('unlock-detail-row')) return;
+  const expanded = button.getAttribute('aria-expanded') !== 'true';
+  button.setAttribute('aria-expanded', String(expanded));
+  detailRow.hidden = !expanded;
 }
 
 function renderPagination(total, totalPages) {
