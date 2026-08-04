@@ -526,6 +526,27 @@ impl Database {
         })
     }
 
+    pub fn update_subscription_settings(&self, sub: &Subscription) -> Result<(), postgres::Error> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "UPDATE subscriptions
+                 SET name = $1, sub_type = $2, url = $3, content = $4,
+                     refresh_interval_mins = $5, updated_at = $6
+                 WHERE id = $7",
+                &[
+                    &sub.name,
+                    &sub.sub_type,
+                    &sub.url,
+                    &sub.content,
+                    &sub.refresh_interval_mins,
+                    &sub.updated_at,
+                    &sub.id,
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
     pub fn get_subscription_default_refresh_interval_mins(
         &self,
         fallback: u64,
