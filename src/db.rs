@@ -174,6 +174,7 @@ pub struct ProxyListQuery {
     pub direction: Option<String>,
     pub search: Option<String>,
     pub status: Option<String>,
+    pub subscription_id: Option<String>,
     pub proxy_type: Option<String>,
     pub quality: Option<String>,
     pub sort: Option<String>,
@@ -3035,6 +3036,17 @@ fn build_proxy_list_where(
         }
     }
 
+    if let Some(subscription_id) = query
+        .subscription_id
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
+        params.push(Box::new(subscription_id.to_string()));
+        let idx = params.len();
+        conditions.push(format!("p.subscription_id = ${idx}"));
+    }
+
     if let Some(proxy_type) = query
         .proxy_type
         .as_ref()
@@ -3267,6 +3279,23 @@ mod tests {
 
         assert_eq!(clause, "WHERE p.orphaned_at IS NULL");
         assert!(params.is_empty());
+    }
+
+    #[test]
+    fn proxy_list_filters_by_subscription_source() {
+        let query = ProxyListQuery {
+            subscription_id: Some("sub-source-1".to_string()),
+            ..Default::default()
+        };
+        let mut params: Vec<Box<dyn ToSql + Sync>> = Vec::new();
+
+        let clause = build_proxy_list_where(&query, &mut params);
+
+        assert_eq!(
+            clause,
+            "WHERE p.orphaned_at IS NULL AND p.subscription_id = $1"
+        );
+        assert_eq!(params.len(), 1);
     }
 
     #[test]

@@ -123,6 +123,7 @@ pub struct ListProxyQuery {
     pub direction: Option<String>,
     pub search: Option<String>,
     pub status: Option<String>,
+    pub subscription_id: Option<String>,
     #[serde(rename = "type")]
     pub proxy_type: Option<String>,
     pub quality: Option<String>,
@@ -201,6 +202,7 @@ pub fn list_query_to_db(query: &ListProxyQuery) -> ProxyListQuery {
         direction: query.direction.clone(),
         search: query.search.clone(),
         status: query.status.clone(),
+        subscription_id: query.subscription_id.clone(),
         proxy_type: query.proxy_type.clone(),
         quality: query.quality.clone(),
         sort: query.sort.clone(),
