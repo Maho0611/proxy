@@ -108,6 +108,10 @@ tr:hover td { background:rgba(70,220,255,.035); }
 .metric-pair { display:flex; align-items:baseline; gap:5px; }
 .metric-pair strong { color:var(--text-bright); font:700 14px Consolas,monospace; }
 .metric-pair small { color:var(--text-dim); font-size:10px; }
+.credential-preview { display:none; margin-top:14px; padding:13px; border:1px solid var(--warn); background:rgba(255,200,87,.06); color:var(--text); font:12px/1.7 Consolas,monospace; white-space:pre-wrap; word-break:break-all; }
+.account-create-grid { display:grid; grid-template-columns:1fr 1fr 1fr auto; gap:12px; align-items:end; }
+@media(max-width:900px) { .account-create-grid { grid-template-columns:1fr 1fr; } }
+@media(max-width:650px) { .account-create-grid { grid-template-columns:1fr; } }
 @keyframes pulse { 50% { opacity:.35; box-shadow:0 0 2px var(--success); } }
 @media(max-width:900px) { .header { position:relative; align-items:flex-start; gap:12px; } .header .nav { flex-wrap:wrap; justify-content:flex-end; } .command-banner { align-items:flex-start; } .command-banner h2 { font-size:24px; } }
 @media(max-width:650px) { .grid-2 { grid-template-columns:1fr; } .header { padding:13px 16px; flex-direction:column; } .header .nav { justify-content:flex-start; } .container { padding:22px 12px 60px; } .command-banner { display:block; } .command-clock { display:none; } .stat-grid { grid-template-columns:repeat(2,1fr); } .card { padding:13px; } }
@@ -188,6 +192,28 @@ tr:hover td { background:rgba(70,220,255,.035); }
         <tbody id="user-table"></tbody>
       </table>
       <div class="empty" id="user-empty">暂无注册用户</div>
+    </div>
+  </div>
+
+  <!-- Proxy account management -->
+  <div class="section">
+    <div class="section-title">固定入口代理账号 <span id="proxy-account-count" style="font-weight:400;font-size:13px;color:var(--text-dim)"></span></div>
+    <div class="card" style="margin-bottom:12px">
+      <div class="account-create-grid">
+        <div class="form-group"><label>用途标签</label><input id="account-label" placeholder="例如：爬虫服务器 A"></div>
+        <div class="form-group"><label>基础用户名（不允许连字符）</label><input id="account-username" placeholder="例如：zp_crawler_a"></div>
+        <div class="form-group"><label>绑定登录用户（可留空）</label><select id="account-owner"><option value="">不绑定用户</option></select></div>
+        <button class="btn btn-primary" onclick="createProxyAccount()">创建账号</button>
+      </div>
+      <div style="color:var(--text-dim);font-size:12px">每个登录用户首次打开仪表盘时会自动获得独立账号，无需管理员分配。此处保留手动创建、启停和排障能力；所有账号共用当前代理池与公网端口，不设置额度、计费或人为并发限制。</div>
+      <div class="credential-preview" id="account-credential-preview"></div>
+    </div>
+    <div class="card">
+      <table>
+        <thead><tr><th>标签</th><th>用户名</th><th>绑定用户</th><th>状态</th><th>凭据版本</th><th>最后使用</th><th>创建时间</th><th>操作</th></tr></thead>
+        <tbody id="proxy-account-table"></tbody>
+      </table>
+      <div class="empty" id="proxy-account-empty">暂无代理账号</div>
     </div>
   </div>
 
@@ -326,6 +352,8 @@ let proxyHasPrevious = false;
 let proxyFilterTimer = null;
 let proxyLoadSequence = 0;
 let defaultSubRefreshInterval = 0;
+let adminUsers = [];
+let latestProxyCredential = '';
 
 // --- Auth ---
 const STORAGE_KEY = 'zenproxy_admin_password';
@@ -433,6 +461,8 @@ async function loadStats() {
 async function loadUsers() {
   const d = await api('/api/admin/users');
   if(!d) return;
+  adminUsers = d.users || [];
+  updateProxyOwnerOptions();
   document.getElementById('s-users').textContent = d.total ?? 0;
   const tb = document.getElementById('user-table');
   const empty = document.getElementById('user-empty');
@@ -459,6 +489,128 @@ async function loadUsers() {
       </td>
     </tr>`;
   }).join('');
+}
+
+function updateProxyOwnerOptions() {
+  const select = document.getElementById('account-owner');
+  if (!select) return;
+  const previous = select.value;
+  select.replaceChildren(new Option('不绑定用户', ''));
+  for (const user of adminUsers) {
+    select.add(new Option(`${user.username} (${user.id})`, user.id));
+  }
+  if ([...select.options].some(option => option.value === previous)) select.value = previous;
+}
+
+async function loadProxyAccounts() {
+  const d = await api('/api/admin/proxy-accounts');
+  if (!d) return;
+  const accounts = d.accounts || [];
+  const byUser = Object.fromEntries(adminUsers.map(user => [String(user.id), user]));
+  document.getElementById('proxy-account-count').textContent = `(${accounts.length} · ${esc(d.auth_mode || '-')})`;
+  const table = document.getElementById('proxy-account-table');
+  const empty = document.getElementById('proxy-account-empty');
+  if (!accounts.length) { table.innerHTML = ''; empty.style.display = ''; return; }
+  empty.style.display = 'none';
+  table.innerHTML = accounts.map(account => {
+    const owner = account.owner_user_id ? byUser[String(account.owner_user_id)] : null;
+    const ownerText = owner ? `${owner.username} (${owner.id})` : (account.owner_user_id || '未绑定');
+    const status = account.enabled
+      ? '<span class="badge badge-active">启用</span>'
+      : '<span class="badge badge-banned">禁用</span>';
+    return `<tr>
+      <td>${esc(account.label)}</td>
+      <td><code>${esc(account.username)}</code></td>
+      <td>${esc(ownerText)}</td>
+      <td>${status}</td>
+      <td>v${account.credential_version}</td>
+      <td>${fmtDate(account.last_used_at)}</td>
+      <td>${fmtDate(account.created_at)}</td>
+      <td class="btn-group">
+        <button class="btn btn-primary btn-sm" onclick="revealProxyAccount('${account.id}')">连接信息</button>
+        <button class="btn btn-warn btn-sm" onclick="rotateProxyAccount('${account.id}')">轮换密码</button>
+        <button class="btn btn-sm" onclick="editProxyAccount('${account.id}', '${account.enabled}')">编辑</button>
+        <button class="btn ${account.enabled ? 'btn-danger' : 'btn-success'} btn-sm" onclick="setProxyAccountEnabled('${account.id}', ${!account.enabled})">${account.enabled ? '禁用' : '启用'}</button>
+        <button class="btn btn-danger btn-sm" onclick="deleteProxyAccount('${account.id}')">删除</button>
+      </td>
+    </tr>`;
+  }).join('');
+}
+
+async function createProxyAccount() {
+  const label = document.getElementById('account-label').value.trim();
+  const username = document.getElementById('account-username').value.trim();
+  const owner = document.getElementById('account-owner').value;
+  if (!label || !username) return toast('请填写标签和基础用户名');
+  const d = await api('/api/admin/proxy-accounts', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({ label, username, owner_user_id: owner || null })
+  });
+  if (!d || d.error) return toast('创建失败：' + (d?.error || '请求失败'));
+  showProxyCredential(d, '账号已创建，请立即复制连接信息');
+  document.getElementById('account-label').value = '';
+  document.getElementById('account-username').value = '';
+  document.getElementById('account-owner').value = '';
+  loadProxyAccounts();
+}
+
+function showProxyCredential(data, heading) {
+  const gateway = data.gateway || {};
+  const account = data.account || {};
+  const host = gateway.host || '<未配置公网入口>';
+  const port = gateway.port || '<未配置端口>';
+  latestProxyCredential = `http://${encodeURIComponent(account.username || '')}:${encodeURIComponent(data.password || '')}@${host}:${port}`;
+  const preview = document.getElementById('account-credential-preview');
+  preview.style.display = 'block';
+  preview.textContent = `${heading}\n用户名: ${account.username}\n密码: ${data.password}\nHTTP URL: ${latestProxyCredential}\n\n此区域不会写入浏览器存储；离开页面后可通过“连接信息”重新生成。`;
+  preview.onclick = () => navigator.clipboard.writeText(latestProxyCredential).then(() => toast('HTTP URL 已复制'));
+}
+
+async function revealProxyAccount(id) {
+  const d = await api(`/api/admin/proxy-accounts/${id}/reveal`, {method:'POST', cache:'no-store'});
+  if (!d || d.error) return toast('显示失败：' + (d?.error || '请求失败'));
+  showProxyCredential(d, '当前连接信息（点击此区域复制 HTTP URL）');
+}
+
+async function rotateProxyAccount(id) {
+  if (!confirm('确定轮换密码？旧密码会立即失效。')) return;
+  const d = await api(`/api/admin/proxy-accounts/${id}/rotate-password`, {method:'POST', cache:'no-store'});
+  if (!d || d.error) return toast('轮换失败：' + (d?.error || '请求失败'));
+  showProxyCredential(d, '密码已轮换，请更新使用端配置');
+  loadProxyAccounts();
+}
+
+async function setProxyAccountEnabled(id, enabled) {
+  const d = await api(`/api/admin/proxy-accounts/${id}`, {
+    method:'PATCH', headers:{'Content-Type':'application/json'}, body:JSON.stringify({enabled})
+  });
+  if (!d || d.error) return toast('更新失败：' + (d?.error || '请求失败'));
+  toast(enabled ? '账号已启用' : '账号已禁用');
+  loadProxyAccounts();
+}
+
+async function editProxyAccount(id) {
+  const label = prompt('输入新的用途标签；取消则不修改标签：');
+  if (label === null) return;
+  const owner = prompt('输入要绑定的 Discord 用户 ID；留空表示解除绑定：');
+  if (owner === null) return;
+  const d = await api(`/api/admin/proxy-accounts/${id}`, {
+    method:'PATCH',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({label, owner_user_id:owner, clear_owner:owner.trim()===''})
+  });
+  if (!d || d.error) return toast('更新失败：' + (d?.error || '请求失败'));
+  toast('账号信息已更新');
+  loadProxyAccounts();
+}
+
+async function deleteProxyAccount(id) {
+  if (!confirm('确定删除代理账号？该账号的新连接会立即认证失败。')) return;
+  const d = await api(`/api/admin/proxy-accounts/${id}`, {method:'DELETE'});
+  if (!d || d.error) return toast('删除失败：' + (d?.error || '请求失败'));
+  toast('代理账号已删除');
+  loadProxyAccounts();
 }
 
 async function deleteUser(id) {
@@ -808,7 +960,7 @@ async function cleanupUselessProxies() {
   refresh();
 }
 
-function refresh() { loadStats(); loadUsers(); loadSubscriptions(); loadProxies(); }
+function refresh() { loadStats(); loadUsers().then(loadProxyAccounts); loadSubscriptions(); loadProxies(); }
 
 // Init: check auth
 function updateCommandTime() {

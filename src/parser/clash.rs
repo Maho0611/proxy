@@ -425,12 +425,19 @@ mod tests {
 
     #[test]
     fn test_parse_sc0() {
-        let content = std::fs::read_to_string("C:/tmp/sc0.yaml").unwrap();
+        let content = r#"
+proxies:
+  - name: local-socks
+    type: socks5
+    server: 127.0.0.1
+    port: 1080
+    username: test-user
+    password: test-password
+"#;
         let result = parse(&content);
-        println!("Parsed {} proxies", result.len());
-        for p in &result {
-            println!("  {} | {} | {}:{}", p.name, p.proxy_type, p.server, p.port);
-        }
-        assert!(result.len() > 0, "Should parse some proxies");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].name, "local-socks");
+        assert_eq!(result[0].server, "127.0.0.1");
+        assert_eq!(result[0].port, 1080);
     }
 }

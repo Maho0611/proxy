@@ -66,6 +66,15 @@ tr:hover td { background:rgba(108,99,255,.03); }
 .filter-bar { display:flex; gap:12px; margin-bottom:16px; flex-wrap:wrap; align-items:center; }
 .filter-bar input, .filter-bar select { padding:8px 12px; background:#0f1117; border:1px solid var(--border); border-radius:8px; color:var(--text); font-size:13px; outline:none; }
 .filter-bar input:focus, .filter-bar select:focus { border-color:var(--primary); }
+.builder-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(190px,1fr)); gap:12px; }
+.builder-meta { display:flex; gap:14px; flex-wrap:wrap; margin-bottom:16px; color:var(--text-dim); font-size:13px; }
+.builder-meta strong { color:var(--text-bright); }
+.builder-output { display:grid; gap:9px; margin-top:16px; }
+.builder-output-row { display:grid; grid-template-columns:150px 1fr auto; gap:8px; align-items:center; }
+.builder-output-row label { color:var(--text-dim); font-size:12px; }
+.builder-output-row input { min-width:0; width:100%; padding:9px 11px; background:#0a0c10; border:1px solid var(--border); border-radius:6px; color:var(--text); font:12px Consolas,monospace; }
+.access-note { color:var(--text-dim); font-size:12px; line-height:1.7; margin-top:12px; }
+@media(max-width:700px) { .builder-output-row { grid-template-columns:1fr; } }
 
 /* API Key card */
 .apikey-card { background:linear-gradient(135deg, #1e2235 0%, #1a1d27 100%); border:1px solid var(--border); border-radius:14px; padding:24px; position:relative; overflow:hidden; }
@@ -145,6 +154,46 @@ tr:hover td { background:rgba(108,99,255,.03); }
         <strong>请求转发（/api/relay）：</strong>仅支持 Query 方式认证，Header 和 Cookie 会原样转发给目标<br>
         <code>curl "https://proxy.mui.moe/api/relay?api_key=&lt;key&gt;&amp;url=https://httpbin.org/ip&amp;country=US"</code><br>
         默认总超时 600 秒，可在 <code>config.toml</code> 的 <code>relay.timeout_secs</code> 调整
+      </div>
+    </div>
+  </div>
+
+  <!-- Fixed gateway URL builder -->
+  <div class="section">
+    <div class="section-title">固定入口 · 动态出口</div>
+    <div class="card">
+      <div id="proxy-access-empty" class="empty">正在加载代理账号...</div>
+      <div id="proxy-access-panel" style="display:none">
+        <div class="builder-meta">
+          <span>账号：<strong id="proxy-access-label">-</strong></span>
+          <span>基础用户名：<strong id="proxy-access-username">-</strong></span>
+          <span>入口：<strong id="proxy-access-gateway">-</strong></span>
+          <span>状态：<strong id="proxy-access-status">-</strong></span>
+          <span>换 IP：<strong>每个新 TCP 连接随机出口</strong></span>
+        </div>
+        <div class="builder-grid">
+          <div class="form-group"><label>连接协议</label><select id="builder-protocol" onchange="buildProxyUrls()"><option value="http">HTTP</option><option value="socks5h">SOCKS5（远程 DNS）</option></select></div>
+          <div class="form-group"><label>国家 / 地区</label><select id="builder-country" onchange="buildProxyUrls()"><option value="">随机国家</option></select></div>
+          <div class="form-group"><label>上游代理类型</label><select id="builder-type" onchange="buildProxyUrls()"><option value="">随机类型</option></select></div>
+        </div>
+        <div class="checkbox-group">
+          <label><input type="checkbox" id="builder-residential" onchange="buildProxyUrls()"> 住宅 IP</label>
+          <label><input type="checkbox" id="builder-chatgpt" onchange="buildProxyUrls()"> ChatGPT 可用</label>
+          <label><input type="checkbox" id="builder-google" onchange="buildProxyUrls()"> Google 可用</label>
+        </div>
+        <div class="apikey-actions">
+          <button class="btn btn-primary btn-sm" onclick="revealProxyCredential()">显示并生成完整连接信息</button>
+          <button class="btn btn-outline btn-sm" onclick="hideProxyCredential()">隐藏密码</button>
+          <button class="btn btn-danger btn-sm" onclick="rotateProxyCredential()">轮换代理密码</button>
+        </div>
+        <div class="builder-output">
+          <div class="builder-output-row"><label>完整代理 URL</label><input id="builder-url" readonly><button class="btn btn-outline btn-sm" onclick="copyBuilder('builder-url')">复制</button></div>
+          <div class="builder-output-row"><label>HOST:PORT:USER:PASS</label><input id="builder-host-first" readonly><button class="btn btn-outline btn-sm" onclick="copyBuilder('builder-host-first')">复制</button></div>
+          <div class="builder-output-row"><label>USER:PASS@HOST:PORT</label><input id="builder-user-first" readonly><button class="btn btn-outline btn-sm" onclick="copyBuilder('builder-user-first')">复制</button></div>
+          <div class="builder-output-row"><label>curl</label><input id="builder-curl" readonly><button class="btn btn-outline btn-sm" onclick="copyBuilder('builder-curl')">复制</button></div>
+          <div class="builder-output-row"><label>环境变量 / JSON</label><input id="builder-env" readonly><button class="btn btn-outline btn-sm" onclick="copyBuilder('builder-env')">复制</button></div>
+        </div>
+        <div class="access-note">筛选条件会编码进用户名，不影响账号密码。页面不会把代理密码保存到 localStorage；刷新或点击“隐藏密码”后需要重新显示。HTTP/SOCKS5 认证握手本身不加密，请仅在可信网络或受控机器间使用。</div>
       </div>
     </div>
   </div>
@@ -250,6 +299,8 @@ let proxyHasNext = false;
 let proxyHasPrevious = false;
 let proxyFilterTimer = null;
 let proxyLoadSequence = 0;
+let proxyAccess = null;
+let proxyPassword = null;
 
 function toast(msg) {
   const t = document.createElement('div');
@@ -326,6 +377,121 @@ async function regenerateKey() {
       toast('API Key 已重新生成');
     }
   } catch(e) { toast('错误: ' + e.message); }
+}
+
+async function loadProxyAccess() {
+  try {
+    const r = await fetch('/api/proxy-access');
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
+    proxyAccess = d;
+    const empty = document.getElementById('proxy-access-empty');
+    const panel = document.getElementById('proxy-access-panel');
+    if (!d.account) {
+      panel.style.display = 'none';
+      empty.style.display = '';
+      empty.textContent = '当前认证模式未启用独立代理账号。';
+      return;
+    }
+    empty.style.display = 'none';
+    panel.style.display = '';
+    document.getElementById('proxy-access-label').textContent = d.account.label;
+    document.getElementById('proxy-access-username').textContent = d.account.username;
+    document.getElementById('proxy-access-gateway').textContent = `${d.gateway.host || '未配置'}:${d.gateway.port || '-'}`;
+    document.getElementById('proxy-access-status').textContent = d.account.enabled ? '启用' : '已禁用';
+    fillBuilderSelect('builder-country', d.filters?.countries || [], '随机国家');
+    fillBuilderSelect('builder-type', d.filters?.proxy_types || [], '随机类型');
+    buildProxyUrls();
+  } catch (e) {
+    const empty = document.getElementById('proxy-access-empty');
+    empty.style.display = '';
+    empty.textContent = '代理账号加载失败：' + e.message;
+  }
+}
+
+function fillBuilderSelect(id, values, emptyLabel) {
+  const select = document.getElementById(id);
+  const previous = select.value;
+  select.replaceChildren(new Option(emptyLabel, ''));
+  for (const value of values) select.add(new Option(value, value));
+  if (values.includes(previous)) select.value = previous;
+}
+
+function selectedProxyUsername() {
+  if (!proxyAccess?.account) return '';
+  let username = proxyAccess.account.username;
+  const country = document.getElementById('builder-country').value;
+  const type = document.getElementById('builder-type').value;
+  if (country) username += '-country-' + country;
+  if (document.getElementById('builder-residential').checked) username += '-residential';
+  if (document.getElementById('builder-chatgpt').checked) username += '-chatgpt';
+  if (document.getElementById('builder-google').checked) username += '-google';
+  if (type) username += '-type-' + type;
+  return username;
+}
+
+function buildProxyUrls() {
+  if (!proxyAccess?.account) return;
+  const protocol = document.getElementById('builder-protocol').value;
+  const rawHost = proxyAccess.gateway?.host || '';
+  const host = rawHost.includes(':') && !rawHost.startsWith('[') ? `[${rawHost}]` : rawHost;
+  const port = proxyAccess.gateway?.port || '';
+  const username = selectedProxyUsername();
+  const password = proxyPassword;
+  const hidden = '点击上方按钮显示密码';
+  if (!host || !port || !password) {
+    for (const id of ['builder-url','builder-host-first','builder-user-first','builder-curl','builder-env']) {
+      document.getElementById(id).value = !host || !port ? '公网代理入口尚未配置' : hidden;
+    }
+    return;
+  }
+  const encodedUser = encodeURIComponent(username);
+  const encodedPassword = encodeURIComponent(password);
+  const proxyUrl = `${protocol}://${encodedUser}:${encodedPassword}@${host}:${port}`;
+  document.getElementById('builder-url').value = proxyUrl;
+  document.getElementById('builder-host-first').value = `${rawHost}:${port}:${username}:${password}`;
+  document.getElementById('builder-user-first').value = `${username}:${password}@${host}:${port}`;
+  document.getElementById('builder-curl').value = `curl -x '${proxyUrl}' https://api.ipify.org`;
+  document.getElementById('builder-env').value = `HTTPS_PROXY='${proxyUrl}'  {"proxy":"${proxyUrl}"}`;
+}
+
+async function revealProxyCredential() {
+  try {
+    const r = await fetch('/api/proxy-access/reveal', { method:'POST', cache:'no-store' });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
+    proxyAccess.account = d.account;
+    proxyAccess.gateway = d.gateway;
+    proxyPassword = d.password;
+    buildProxyUrls();
+    toast('完整连接信息已生成');
+  } catch (e) { toast('显示失败：' + e.message); }
+}
+
+function hideProxyCredential() {
+  proxyPassword = null;
+  buildProxyUrls();
+  toast('代理密码已从页面内存隐藏');
+}
+
+async function rotateProxyCredential() {
+  if (!confirm('确定轮换代理密码？旧密码会立即失效，其他机器上的配置需要同步更新。')) return;
+  try {
+    const r = await fetch('/api/proxy-access/rotate-password', { method:'POST', cache:'no-store' });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
+    proxyAccess.account = d.account;
+    proxyAccess.gateway = d.gateway;
+    proxyPassword = d.password;
+    buildProxyUrls();
+    toast('代理密码已轮换，完整连接信息已更新');
+  } catch (e) { toast('轮换失败：' + e.message); }
+}
+
+function copyBuilder(id) {
+  const value = document.getElementById(id).value;
+  if (!proxyPassword) return toast('请先显示完整连接信息');
+  navigator.clipboard.writeText(value).then(() => toast('已复制到剪贴板'));
 }
 
 // --- Proxy data ---
@@ -521,7 +687,7 @@ async function doRelay() {
   }
 }
 
-function refresh() { loadProxies(); }
+function refresh() { loadProxyAccess(); loadProxies(); }
 checkAuth();
 </script>
 </body>

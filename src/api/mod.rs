@@ -2,11 +2,13 @@ pub mod admin;
 pub mod auth;
 pub mod client_fetch;
 pub mod fetch;
+pub mod proxy_access;
 pub mod relay;
 pub mod sub_export;
 pub mod subscription;
 
 use crate::AppState;
+use axum::extract::DefaultBodyLimit;
 use axum::{
     extract::State,
     http::{Request, StatusCode},
@@ -15,7 +17,6 @@ use axum::{
     routing::{delete, get, patch, post},
     Router,
 };
-use axum::extract::DefaultBodyLimit;
 use std::sync::Arc;
 use tower_http::cors::CorsLayer;
 
@@ -28,18 +29,48 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/auth/logout", post(auth::logout))
         .route("/api/auth/regenerate-key", post(auth::regenerate_key));
 
+    let proxy_access_routes = Router::new()
+        .route("/api/proxy-access", get(proxy_access::get_user_access))
+        .route(
+            "/api/proxy-access/reveal",
+            post(proxy_access::reveal_user_credential),
+        )
+        .route(
+            "/api/proxy-access/rotate-password",
+            post(proxy_access::rotate_user_credential),
+        );
+
     // Admin routes — protected by admin password
     let admin_routes = Router::new()
         .route("/api/admin/proxies", get(admin::list_proxies))
         .route("/api/admin/proxies/:id", delete(admin::delete_proxy))
         .route("/api/admin/proxies/cleanup", post(admin::cleanup_proxies))
         .route("/api/admin/validate", post(admin::trigger_validation))
-        .route("/api/admin/quality-check", post(admin::trigger_quality_check))
+        .route(
+            "/api/admin/quality-check",
+            post(admin::trigger_quality_check),
+        )
         .route("/api/admin/stats", get(admin::get_stats))
         .route("/api/admin/users", get(admin::list_users))
         .route("/api/admin/users/:id", delete(admin::delete_user))
         .route("/api/admin/users/:id/ban", post(admin::ban_user))
         .route("/api/admin/users/:id/unban", post(admin::unban_user))
+        .route(
+            "/api/admin/proxy-accounts",
+            get(proxy_access::list_admin_accounts).post(proxy_access::create_admin_account),
+        )
+        .route(
+            "/api/admin/proxy-accounts/:id",
+            patch(proxy_access::update_admin_account).delete(proxy_access::delete_admin_account),
+        )
+        .route(
+            "/api/admin/proxy-accounts/:id/reveal",
+            post(proxy_access::reveal_admin_credential),
+        )
+        .route(
+            "/api/admin/proxy-accounts/:id/rotate-password",
+            post(proxy_access::rotate_admin_credential),
+        )
         .route(
             "/api/subscriptions",
             get(subscription::list_subscriptions).post(subscription::add_subscription),
@@ -65,8 +96,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/proxies", get(fetch::list_all_proxies))
         .route(
             "/api/relay",
-            get(relay::relay_request)
-                .post(relay::relay_request),
+            get(relay::relay_request).post(relay::relay_request),
         )
         .layer(DefaultBodyLimit::max(10 * 1024 * 1024)); // 10 MB
 
@@ -89,6 +119,7 @@ pub fn router(state: Arc<AppState>) -> Router {
 
     Router::new()
         .merge(auth_routes)
+        .merge(proxy_access_routes)
         .merge(admin_routes)
         .merge(fetch_relay_routes)
         .merge(subscription_export_routes)
@@ -128,7 +159,7 @@ async fn admin_page() -> axum::response::Html<&'static str> {
 }
 
 async fn docs_page() -> axum::response::Html<String> {
-    use pulldown_cmark::{Parser, Options, html};
+    use pulldown_cmark::{html, Options, Parser};
     let readme = include_str!("../../README.md");
     let mut options = Options::empty();
     options.insert(Options::ENABLE_TABLES);

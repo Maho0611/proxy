@@ -131,13 +131,15 @@ async fn handle_socks5(
     let username = String::from_utf8_lossy(&uname).to_string();
     let password = String::from_utf8_lossy(&passwd).to_string();
 
-    let filter = match authenticate_and_parse(&cfg, &username, &password) {
-        Some(f) => f,
+    let auth = match authenticate_and_parse(&state, &cfg, &username, &password) {
+        Some(auth) => auth,
         None => {
             stream.write_all(&[0x01, 0x01]).await.ok();
             return Err("SOCKS5 auth failed".into());
         }
     };
+    mark_account_used(&state, auth.account_id.as_deref());
+    let filter = auth.filter;
     write_all(&mut stream, &[0x01, 0x00]).await?;
 
     // --- CONNECT request ---
@@ -164,15 +166,14 @@ async fn handle_socks5(
         }
         Err(e) => {
             write_all(&mut stream, &[0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await?;
-            Err(format!("Connect to {target_host}:{target_port} failed: {e}"))
+            Err(format!(
+                "Connect to {target_host}:{target_port} failed: {e}"
+            ))
         }
     }
 }
 
-async fn read_socks5_address(
-    stream: &mut TcpStream,
-    atyp: u8,
-) -> Result<(String, u16), String> {
+async fn read_socks5_address(stream: &mut TcpStream, atyp: u8) -> Result<(String, u16), String> {
     match atyp {
         0x01 => {
             // IPv4
@@ -240,8 +241,7 @@ async fn handle_http_proxy(
         }
     }
 
-    let header_str =
-        String::from_utf8_lossy(&buf[..header_end]).to_string();
+    let header_str = String::from_utf8_lossy(&buf[..header_end]).to_string();
 
     let first_line = header_str
         .lines()
@@ -260,8 +260,8 @@ async fn handle_http_proxy(
         }
     };
 
-    let filter = match authenticate_and_parse(&cfg, &username, &password) {
-        Some(f) => f,
+    let auth = match authenticate_and_parse(&state, &cfg, &username, &password) {
+        Some(auth) => auth,
         None => {
             stream
                 .write_all(b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"proxy\"\r\n\r\n")
@@ -270,6 +270,8 @@ async fn handle_http_proxy(
             return Err("HTTP proxy auth failed".into());
         }
     };
+    mark_account_used(&state, auth.account_id.as_deref());
+    let filter = auth.filter;
 
     let parts: Vec<&str> = first_line.split_whitespace().collect();
     if parts.len() < 3 {
@@ -352,9 +354,8 @@ async fn connect_through_pool(
     target_port: u16,
 ) -> Result<(TcpStream, BindingUseGuard), String> {
     let max_attempts = 3;
-    let candidates =
-        crate::api::fetch::pick_random_valid_proxies(state, filter, max_attempts)
-            .map_err(|e| format!("No proxies available: {e}"))?;
+    let candidates = crate::api::fetch::pick_random_valid_proxies(state, filter, max_attempts)
+        .map_err(|e| format!("No proxies available: {e}"))?;
 
     if candidates.is_empty() {
         return Err("No proxies match the given filters".into());
@@ -438,7 +439,10 @@ async fn socks5_connect_upstream(
     let mut reply_hdr = [0u8; 4];
     read_exact(&mut stream, &mut reply_hdr).await?;
     if reply_hdr[1] != 0x00 {
-        return Err(format!("Upstream SOCKS5 CONNECT rejected: code {}", reply_hdr[1]));
+        return Err(format!(
+            "Upstream SOCKS5 CONNECT rejected: code {}",
+            reply_hdr[1]
+        ));
     }
 
     // Skip BND.ADDR + BND.PORT based on address type
@@ -469,7 +473,52 @@ async fn socks5_connect_upstream(
 
 /// Verify credentials and extract per-connection filters from the username.
 /// Returns `None` if auth fails.
+struct ProxyAuthentication {
+    filter: ProxyFilter,
+    account_id: Option<String>,
+}
+
 fn authenticate_and_parse(
+    state: &AppState,
+    cfg: &crate::config::ProxyListenerConfig,
+    username: &str,
+    password: &str,
+) -> Option<ProxyAuthentication> {
+    if state.config.proxy_access.static_enabled() {
+        if let Some(filter) = authenticate_static_and_parse(cfg, username, password) {
+            return Some(ProxyAuthentication {
+                filter,
+                account_id: None,
+            });
+        }
+    }
+
+    if !state.config.proxy_access.accounts_enabled() {
+        return None;
+    }
+
+    let (base_username, suffix) = match username.split_once('-') {
+        Some((base, suffix)) => (base, Some(suffix)),
+        None => (username, None),
+    };
+    let account = state.proxy_accounts.get(base_username)?;
+    if !account.enabled
+        || !crate::proxy_account::verify_password(
+            &state.config.proxy_access.credential_secret,
+            account.value(),
+            password,
+        )
+    {
+        return None;
+    }
+
+    Some(ProxyAuthentication {
+        filter: suffix.map(parse_filter_suffix).unwrap_or_default(),
+        account_id: Some(account.id.clone()),
+    })
+}
+
+fn authenticate_static_and_parse(
     cfg: &crate::config::ProxyListenerConfig,
     username: &str,
     password: &str,
@@ -490,6 +539,30 @@ fn authenticate_and_parse(
         return None;
     }
     Some(parse_filter_suffix(&suffix[1..]))
+}
+
+fn mark_account_used(state: &AppState, account_id: Option<&str>) {
+    let Some(account_id) = account_id else {
+        return;
+    };
+    let now = tokio::time::Instant::now();
+    let should_write = state
+        .proxy_account_last_used
+        .get(account_id)
+        .map(|last| now.duration_since(*last) >= std::time::Duration::from_secs(60))
+        .unwrap_or(true);
+    if !should_write {
+        return;
+    }
+    state
+        .proxy_account_last_used
+        .insert(account_id.to_string(), now);
+    if let Err(error) = state.db.touch_proxy_account_last_used(account_id) {
+        tracing::warn!(
+            account_id,
+            "Failed to update proxy account last-used time: {error}"
+        );
+    }
 }
 
 /// Parse `-country-US-residential-chatgpt-google-type-vmess` into a `ProxyFilter`.
@@ -541,8 +614,7 @@ fn parse_filter_suffix(suffix: &str) -> ProxyFilter {
 // ---------------------------------------------------------------------------
 
 fn find_header_end(buf: &[u8]) -> Option<usize> {
-    buf.windows(4)
-        .position(|w| w == b"\r\n\r\n")
+    buf.windows(4).position(|w| w == b"\r\n\r\n")
 }
 
 fn extract_header(headers: &str, name: &str) -> Option<String> {
@@ -678,15 +750,15 @@ mod tests {
             password: "secret".into(),
         };
         // Correct base
-        let f = authenticate_and_parse(&cfg, "admin", "secret");
+        let f = authenticate_static_and_parse(&cfg, "admin", "secret");
         assert!(f.is_some());
         // With filters
-        let f = authenticate_and_parse(&cfg, "admin-country-US", "secret").unwrap();
+        let f = authenticate_static_and_parse(&cfg, "admin-country-US", "secret").unwrap();
         assert_eq!(f.country, Some("US".into()));
         // Wrong password
-        assert!(authenticate_and_parse(&cfg, "admin", "wrong").is_none());
+        assert!(authenticate_static_and_parse(&cfg, "admin", "wrong").is_none());
         // Wrong username
-        assert!(authenticate_and_parse(&cfg, "other", "secret").is_none());
+        assert!(authenticate_static_and_parse(&cfg, "other", "secret").is_none());
     }
 
     #[test]
@@ -724,7 +796,7 @@ mod tests {
 
     #[test]
     fn header_end_detection() {
-        assert_eq!(find_header_end(b"GET / HTTP/1.1\r\n\r\nBody"), Some(16));
+        assert_eq!(find_header_end(b"GET / HTTP/1.1\r\n\r\nBody"), Some(14));
         assert_eq!(find_header_end(b"Incomplete\r\n"), None);
     }
 }

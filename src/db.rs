@@ -122,6 +122,19 @@ pub struct User {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ProxyAccount {
+    pub id: String,
+    pub label: String,
+    pub username: String,
+    pub owner_user_id: Option<String>,
+    pub enabled: bool,
+    pub credential_version: i32,
+    pub last_used_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Session {
     pub id: String,
     pub user_id: String,
@@ -312,9 +325,26 @@ impl Database {
                     expires_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS proxy_accounts (
+                    id TEXT PRIMARY KEY,
+                    label TEXT NOT NULL,
+                    username TEXT NOT NULL UNIQUE,
+                    owner_user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+                    enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                    credential_version INTEGER NOT NULL DEFAULT 1,
+                    last_used_at TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id);
                 CREATE INDEX IF NOT EXISTS idx_sessions_expires_at ON sessions(expires_at);
                 CREATE INDEX IF NOT EXISTS idx_users_api_key ON users(api_key);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_proxy_accounts_owner_user_id
+                    ON proxy_accounts(owner_user_id)
+                    WHERE owner_user_id IS NOT NULL;
+                CREATE INDEX IF NOT EXISTS idx_proxy_accounts_username_enabled
+                    ON proxy_accounts(username, enabled);
                 CREATE INDEX IF NOT EXISTS idx_proxies_subscription_id ON proxies(subscription_id);
                 CREATE INDEX IF NOT EXISTS idx_proxies_endpoint_subscription
                     ON proxies ((LOWER(server)), port, proxy_type, subscription_id)
@@ -2158,6 +2188,129 @@ impl Database {
         })
     }
 
+    pub fn get_proxy_accounts(&self) -> Result<Vec<ProxyAccount>, postgres::Error> {
+        self.with_conn(|conn| {
+            let rows = conn.query(
+                "SELECT id, label, username, owner_user_id, enabled, credential_version,
+                        last_used_at, created_at, updated_at
+                 FROM proxy_accounts ORDER BY created_at DESC",
+                &[],
+            )?;
+            Ok(rows.iter().map(proxy_account_from_row).collect())
+        })
+    }
+
+    pub fn get_proxy_account_by_id(
+        &self,
+        id: &str,
+    ) -> Result<Option<ProxyAccount>, postgres::Error> {
+        self.with_conn(|conn| {
+            let row = conn.query_opt(
+                "SELECT id, label, username, owner_user_id, enabled, credential_version,
+                        last_used_at, created_at, updated_at
+                 FROM proxy_accounts WHERE id = $1",
+                &[&id],
+            )?;
+            Ok(row.as_ref().map(proxy_account_from_row))
+        })
+    }
+
+    pub fn get_proxy_account_for_owner(
+        &self,
+        owner_user_id: &str,
+    ) -> Result<Option<ProxyAccount>, postgres::Error> {
+        self.with_conn(|conn| {
+            let row = conn.query_opt(
+                "SELECT id, label, username, owner_user_id, enabled, credential_version,
+                        last_used_at, created_at, updated_at
+                 FROM proxy_accounts WHERE owner_user_id = $1",
+                &[&owner_user_id],
+            )?;
+            Ok(row.as_ref().map(proxy_account_from_row))
+        })
+    }
+
+    pub fn insert_proxy_account(&self, account: &ProxyAccount) -> Result<(), postgres::Error> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO proxy_accounts (
+                    id, label, username, owner_user_id, enabled, credential_version,
+                    last_used_at, created_at, updated_at
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+                &[
+                    &account.id,
+                    &account.label,
+                    &account.username,
+                    &account.owner_user_id,
+                    &account.enabled,
+                    &account.credential_version,
+                    &account.last_used_at,
+                    &account.created_at,
+                    &account.updated_at,
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn update_proxy_account(
+        &self,
+        id: &str,
+        label: Option<&str>,
+        update_owner: bool,
+        owner_user_id: Option<&str>,
+        enabled: Option<bool>,
+    ) -> Result<Option<ProxyAccount>, postgres::Error> {
+        let now = chrono::Utc::now().to_rfc3339();
+        self.with_conn(|conn| {
+            let row = conn.query_opt(
+                "UPDATE proxy_accounts SET
+                    label = COALESCE($1, label),
+                    owner_user_id = CASE WHEN $2 THEN $3 ELSE owner_user_id END,
+                    enabled = COALESCE($4, enabled),
+                    updated_at = $5
+                 WHERE id = $6
+                 RETURNING id, label, username, owner_user_id, enabled, credential_version,
+                           last_used_at, created_at, updated_at",
+                &[&label, &update_owner, &owner_user_id, &enabled, &now, &id],
+            )?;
+            Ok(row.as_ref().map(proxy_account_from_row))
+        })
+    }
+
+    pub fn rotate_proxy_account(&self, id: &str) -> Result<Option<ProxyAccount>, postgres::Error> {
+        let now = chrono::Utc::now().to_rfc3339();
+        self.with_conn(|conn| {
+            let row = conn.query_opt(
+                "UPDATE proxy_accounts SET
+                    credential_version = credential_version + 1,
+                    updated_at = $1
+                 WHERE id = $2
+                 RETURNING id, label, username, owner_user_id, enabled, credential_version,
+                           last_used_at, created_at, updated_at",
+                &[&now, &id],
+            )?;
+            Ok(row.as_ref().map(proxy_account_from_row))
+        })
+    }
+
+    pub fn delete_proxy_account(&self, id: &str) -> Result<bool, postgres::Error> {
+        self.with_conn(|conn| {
+            Ok(conn.execute("DELETE FROM proxy_accounts WHERE id = $1", &[&id])? > 0)
+        })
+    }
+
+    pub fn touch_proxy_account_last_used(&self, id: &str) -> Result<(), postgres::Error> {
+        let now = chrono::Utc::now().to_rfc3339();
+        self.with_conn(|conn| {
+            conn.execute(
+                "UPDATE proxy_accounts SET last_used_at = $1 WHERE id = $2",
+                &[&now, &id],
+            )?;
+            Ok(())
+        })
+    }
+
     pub fn get_user_by_id(&self, id: &str) -> Result<Option<User>, postgres::Error> {
         self.with_conn(|conn| {
             let row = conn.query_opt(
@@ -2438,6 +2591,20 @@ fn user_from_row(row: &Row) -> User {
         api_key: row.get(8),
         created_at: row.get(9),
         updated_at: row.get(10),
+    }
+}
+
+fn proxy_account_from_row(row: &Row) -> ProxyAccount {
+    ProxyAccount {
+        id: row.get(0),
+        label: row.get(1),
+        username: row.get(2),
+        owner_user_id: row.get(3),
+        enabled: row.get(4),
+        credential_version: row.get(5),
+        last_used_at: row.get(6),
+        created_at: row.get(7),
+        updated_at: row.get(8),
     }
 }
 

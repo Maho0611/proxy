@@ -16,6 +16,8 @@ pub struct AppConfig {
     pub subscription: SubscriptionConfig,
     #[serde(default)]
     pub proxy_listener: Vec<ProxyListenerConfig>,
+    #[serde(default)]
+    pub proxy_access: ProxyAccessConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -234,6 +236,45 @@ pub struct ProxyListenerConfig {
     pub password: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProxyAccessConfig {
+    /// static: configured listener credential only; hybrid: static + accounts;
+    /// accounts/database: database accounts only.
+    #[serde(default = "default_proxy_auth_mode")]
+    pub auth_mode: String,
+    #[serde(default)]
+    pub credential_secret: String,
+    #[serde(default)]
+    pub public_host: String,
+    #[serde(default)]
+    pub public_port: u16,
+}
+
+impl Default for ProxyAccessConfig {
+    fn default() -> Self {
+        Self {
+            auth_mode: default_proxy_auth_mode(),
+            credential_secret: String::new(),
+            public_host: String::new(),
+            public_port: 0,
+        }
+    }
+}
+
+fn default_proxy_auth_mode() -> String {
+    "static".to_string()
+}
+
+impl ProxyAccessConfig {
+    pub fn static_enabled(&self) -> bool {
+        matches!(self.auth_mode.as_str(), "static" | "hybrid")
+    }
+
+    pub fn accounts_enabled(&self) -> bool {
+        matches!(self.auth_mode.as_str(), "hybrid" | "accounts" | "database")
+    }
+}
+
 impl AppConfig {
     pub fn load() -> Result<Self, Box<dyn std::error::Error>> {
         let content = std::fs::read_to_string("config.toml")
@@ -247,6 +288,19 @@ impl AppConfig {
         set_string_from_env(&mut self.server.host, "ZENPROXY_SERVER_HOST");
         set_u16_from_env(&mut self.server.port, "ZENPROXY_SERVER_PORT")?;
         set_string_from_env(&mut self.server.admin_password, "ZENPROXY_ADMIN_PASSWORD");
+        set_string_from_env(&mut self.proxy_access.auth_mode, "ZENPROXY_PROXY_AUTH_MODE");
+        set_string_from_env(
+            &mut self.proxy_access.credential_secret,
+            "ZENPROXY_PROXY_CREDENTIAL_SECRET",
+        );
+        set_string_from_env(
+            &mut self.proxy_access.public_host,
+            "ZENPROXY_PUBLIC_PROXY_HOST",
+        );
+        set_u16_from_env(
+            &mut self.proxy_access.public_port,
+            "ZENPROXY_PUBLIC_PROXY_PORT",
+        )?;
         if let Some(value) = env_value("ZENPROXY_SUBSCRIPTION_PASSWORD") {
             self.subscription.password = Some(value);
         }
@@ -254,7 +308,10 @@ impl AppConfig {
         set_string_from_env(&mut self.database.url, "ZENPROXY_DATABASE_URL");
 
         set_string_from_env(&mut self.oauth.client_id, "ZENPROXY_OAUTH_CLIENT_ID");
-        set_string_from_env(&mut self.oauth.client_secret, "ZENPROXY_OAUTH_CLIENT_SECRET");
+        set_string_from_env(
+            &mut self.oauth.client_secret,
+            "ZENPROXY_OAUTH_CLIENT_SECRET",
+        );
         set_string_from_env(&mut self.oauth.redirect_uri, "ZENPROXY_OAUTH_REDIRECT_URI");
         set_string_from_env(
             &mut self.oauth.required_guild_id,
@@ -278,6 +335,25 @@ impl AppConfig {
         }
         if !env_listeners.is_empty() {
             self.proxy_listener = env_listeners;
+        }
+
+        if !matches!(
+            self.proxy_access.auth_mode.as_str(),
+            "static" | "hybrid" | "accounts" | "database"
+        ) {
+            return Err(format!(
+                "invalid ZENPROXY_PROXY_AUTH_MODE: {}",
+                self.proxy_access.auth_mode
+            )
+            .into());
+        }
+        if self.proxy_access.accounts_enabled()
+            && self.proxy_access.credential_secret.as_bytes().len() < 32
+        {
+            return Err(
+                "ZENPROXY_PROXY_CREDENTIAL_SECRET must contain at least 32 bytes when account authentication is enabled"
+                    .into(),
+            );
         }
 
         Ok(())
@@ -336,10 +412,7 @@ mod tests {
             config.subscription_password(),
             "change-subscription-password"
         );
-        assert_ne!(
-            config.subscription_password(),
-            config.server.admin_password
-        );
+        assert_ne!(config.subscription_password(), config.server.admin_password);
     }
 
     #[test]

@@ -11,6 +11,7 @@
 
 # Deploy secrets
 /deploy/config.toml
+/.env
 /config.toml
 /node_modules/
 
