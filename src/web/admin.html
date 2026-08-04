@@ -349,6 +349,9 @@ tr:hover td { background:rgba(70,220,255,.035); }
     </div>
     <div class="filter-bar">
       <input id="f-search" placeholder="搜索名称/服务器..." oninput="queueLoadProxies()">
+      <select id="f-source" onchange="resetProxyCursor();loadProxies()">
+        <option value="">全部来源</option>
+      </select>
       <select id="f-status" onchange="resetProxyCursor();loadProxies()">
         <option value="">全部状态</option>
         <option value="valid">有效</option>
@@ -763,6 +766,7 @@ async function unbanUser(id) {
 async function loadSubscriptions() {
   const d = await api('/api/subscriptions');
   if(!d) return;
+  updateProxySourceFilter(d.subscriptions || []);
   defaultSubRefreshInterval = Number(d.default_refresh_interval_mins || 0);
   const defaultInput = document.getElementById('default-sub-refresh-interval');
   if (defaultInput) defaultInput.value = String(defaultSubRefreshInterval);
@@ -844,6 +848,21 @@ async function loadSubscriptions() {
   applyJobButtonState();
 }
 
+function updateProxySourceFilter(subscriptions) {
+  const select = document.getElementById('f-source');
+  if (!select) return;
+  const selected = select.value;
+  select.replaceChildren(new Option('全部来源', ''));
+  for (const subscription of subscriptions) {
+    select.add(new Option(subscription.name || subscription.id, subscription.id));
+  }
+  select.value = selected;
+  if (selected && select.value !== selected) {
+    resetProxyCursor();
+    loadProxies();
+  }
+}
+
 async function adminAddSubscription() {
   const name = document.getElementById('add-sub-name').value.trim();
   const subType = document.getElementById('add-sub-type').value;
@@ -918,10 +937,12 @@ async function loadProxies() {
     dir: sortDir,
   });
   const search = document.getElementById('f-search').value.trim();
+  const subscriptionId = document.getElementById('f-source').value;
   const status = document.getElementById('f-status').value;
   const type_ = document.getElementById('f-type').value;
   const quality = document.getElementById('f-quality').value;
   if (search) params.set('search', search);
+  if (subscriptionId) params.set('subscription_id', subscriptionId);
   if (status) params.set('status', status);
   if (type_) params.set('type', type_);
   if (quality) params.set('quality', quality);
