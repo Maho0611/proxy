@@ -4,6 +4,7 @@ mod config;
 mod db;
 mod error;
 mod fixed_proxy;
+mod jobs;
 mod parser;
 mod pool;
 mod proxy_account;
@@ -14,6 +15,7 @@ mod singbox;
 
 use crate::config::AppConfig;
 use crate::db::{Database, ProxyAccount, User};
+use crate::jobs::JobTracker;
 use crate::pool::manager::ProxyPool;
 use crate::singbox::process::SingboxManager;
 use dashmap::DashMap;
@@ -49,8 +51,12 @@ pub struct AppState {
     pub validation_lock: Mutex<()>,
     /// Prevents duplicate validation runs from being queued/spawned.
     pub validation_running: AtomicBool,
+    /// Observable state for the current or most recent validation run.
+    pub validation_progress: JobTracker,
     /// Prevents duplicate quality-check runs from being queued/spawned.
     pub quality_running: AtomicBool,
+    /// Observable state for the current or most recent quality-check run.
+    pub quality_progress: JobTracker,
 }
 
 #[derive(Debug, Clone)]
@@ -165,7 +171,9 @@ async fn main() {
         fixed_proxy_slot_locks: DashMap::new(),
         validation_lock: Mutex::new(()),
         validation_running: AtomicBool::new(false),
+        validation_progress: JobTracker::new("validation"),
         quality_running: AtomicBool::new(false),
+        quality_progress: JobTracker::new("quality-check"),
     });
 
     bindings::seed_managed_bindings(&state);

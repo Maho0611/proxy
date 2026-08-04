@@ -4,6 +4,7 @@ use crate::AppState;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 
 const EXIT_IP_URL: &str = "https://www.cloudflare.com/cdn-cgi/trace";
 const EXIT_IP_FALLBACK_URL: &str = "https://api.ipify.org";
@@ -24,6 +25,29 @@ fn acquire_running_guard(flag: &AtomicBool) -> Option<RunningGuard<'_>> {
         .map(|_| RunningGuard { flag })
 }
 
+pub fn start_validation(state: Arc<AppState>) -> bool {
+    if state
+        .validation_running
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return false;
+    }
+    state
+        .validation_progress
+        .begin(None, None, None, "waiting-for-bindings");
+    tokio::spawn(async move {
+        let _running = RunningGuard {
+            flag: &state.validation_running,
+        };
+        if let Err(error) = run_validation(state.clone()).await {
+            state.validation_progress.fail(&error);
+            tracing::error!("Manual validation failed: {error}");
+        }
+    });
+    true
+}
+
 pub async fn validate_all(state: Arc<AppState>) -> Result<(), String> {
     let _running = match acquire_running_guard(&state.validation_running) {
         Some(guard) => guard,
@@ -33,12 +57,22 @@ pub async fn validate_all(state: Arc<AppState>) -> Result<(), String> {
         }
     };
 
+    run_validation(state.clone()).await
+}
+
+async fn run_validation(state: Arc<AppState>) -> Result<(), String> {
+    state
+        .validation_progress
+        .begin(None, None, None, "waiting-for-bindings");
+
     // Serialize validations — wait if another is running, then check for remaining work
     let _lock = state.validation_lock.lock().await;
+    state.validation_progress.set_phase("preparing");
 
     let total = state.db.count_all_proxies().unwrap_or(0);
     if total == 0 {
         tracing::info!("No proxies to validate");
+        state.validation_progress.finish("没有可验活的代理");
         return Ok(());
     }
 
@@ -67,6 +101,8 @@ pub async fn validate_all(state: Arc<AppState>) -> Result<(), String> {
 
     loop {
         round += 1;
+        state.validation_progress.set_round(round as usize);
+        state.validation_progress.set_phase("binding");
 
         // Use validation-mode sorting: Untested get port priority over Valid
         let sync_result =
@@ -77,6 +113,7 @@ pub async fn validate_all(state: Arc<AppState>) -> Result<(), String> {
             .iter()
             .filter_map(|id| state.pool.get(id))
             .collect();
+        state.validation_progress.add_total(selected_work.len());
 
         let failed_to_bind: Vec<_> = selected_work
             .iter()
@@ -86,6 +123,7 @@ pub async fn validate_all(state: Arc<AppState>) -> Result<(), String> {
 
         for proxy in &failed_to_bind {
             drop_proxy_after_binding_failure(&state, proxy).await;
+            state.validation_progress.advance(false);
         }
 
         // Collect only the untested proxies selected for this round that actually got bindings.
@@ -114,9 +152,10 @@ pub async fn validate_all(state: Arc<AppState>) -> Result<(), String> {
             "Validation round {round}: checking {} proxies (max_proxies={max_proxies})",
             to_validate.len()
         );
+        state.validation_progress.set_phase("validating");
 
         // Validate this batch
-        let round_count = validate_batch(
+        let round_summary = validate_batch(
             &to_validate,
             &validation_url,
             fallback_url.as_deref(),
@@ -125,6 +164,7 @@ pub async fn validate_all(state: Arc<AppState>) -> Result<(), String> {
             &state,
         )
         .await;
+        let round_count = round_summary.completed;
 
         total_validated += round_count;
 
@@ -172,7 +212,149 @@ pub async fn validate_all(state: Arc<AppState>) -> Result<(), String> {
     tracing::info!(
         "Validation complete: {total_validated} checked in {round} rounds, {valid}/{total} valid"
     );
+    state.validation_progress.finish(format!(
+        "验活完成：本次检查 {total_validated} 条线路，当前 {valid}/{total} 有效"
+    ));
 
+    Ok(())
+}
+
+/// Force a health validation for every distinct active proxy definition owned
+/// by one subscription, regardless of its previous validation timestamp.
+pub fn start_subscription_validation(
+    state: Arc<AppState>,
+    subscription_id: String,
+    subscription_name: String,
+) -> bool {
+    if state
+        .validation_running
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return false;
+    }
+    state.validation_progress.begin(
+        Some(&subscription_id),
+        Some(&subscription_name),
+        None,
+        "waiting-for-bindings",
+    );
+    tokio::spawn(async move {
+        let _running = RunningGuard {
+            flag: &state.validation_running,
+        };
+        if let Err(error) =
+            run_subscription_validation(state.clone(), subscription_id, subscription_name).await
+        {
+            state.validation_progress.fail(&error);
+            tracing::error!("Manual subscription validation failed: {error}");
+        }
+    });
+    true
+}
+
+async fn run_subscription_validation(
+    state: Arc<AppState>,
+    subscription_id: String,
+    subscription_name: String,
+) -> Result<(), String> {
+    state.validation_progress.begin(
+        Some(&subscription_id),
+        Some(&subscription_name),
+        None,
+        "waiting-for-bindings",
+    );
+    let _lock = state.validation_lock.lock().await;
+    state.validation_progress.set_phase("preparing");
+
+    let rows = match state.db.get_proxies_by_subscription(&subscription_id) {
+        Ok(rows) => rows,
+        Err(error) => {
+            let message = format!("读取订阅代理失败: {error}");
+            state.validation_progress.fail(&message);
+            return Err(message);
+        }
+    };
+    let mut seen_definitions = std::collections::HashSet::new();
+    let target_ids: Vec<String> = rows
+        .into_iter()
+        .filter(|proxy| proxy.orphaned_at.is_none())
+        .filter(|proxy| {
+            seen_definitions.insert(crate::api::subscription::proxy_row_definition_key(proxy))
+        })
+        .map(|proxy| proxy.id)
+        .collect();
+    state.validation_progress.set_total(target_ids.len());
+
+    if target_ids.is_empty() {
+        state.validation_progress.finish("该订阅没有可验活的代理");
+        return Ok(());
+    }
+
+    let concurrency = state.config.validation.concurrency;
+    let timeout_duration = std::time::Duration::from_secs(state.config.validation.timeout_secs);
+    let validation_url = state.config.validation.url.clone();
+    let fallback_url = state.config.validation.fallback_url.clone();
+    let batch_size = state.config.validation.batch_size.max(1);
+    let mut total_validated = 0usize;
+
+    for (index, target_batch) in target_ids.chunks(batch_size).enumerate() {
+        state.validation_progress.set_round(index + 1);
+        state.validation_progress.set_phase("binding");
+        let sync_result = crate::api::subscription::sync_proxy_bindings(
+            &state,
+            SyncMode::Targeted(target_batch.to_vec()),
+        )
+        .await;
+        let selected_work: Vec<_> = sync_result
+            .work_ids
+            .iter()
+            .filter_map(|id| state.pool.get(id))
+            .collect();
+
+        for _ in 0..target_batch.len().saturating_sub(selected_work.len()) {
+            state.validation_progress.advance(false);
+        }
+        let failed_to_bind: Vec<_> = selected_work
+            .iter()
+            .filter(|proxy| proxy.local_port.is_none())
+            .cloned()
+            .collect();
+        for proxy in &failed_to_bind {
+            drop_proxy_after_binding_failure(&state, proxy).await;
+            state.validation_progress.advance(false);
+        }
+
+        let to_validate: Vec<_> = selected_work
+            .into_iter()
+            .filter(|proxy| proxy.local_port.is_some())
+            .collect();
+        state.validation_progress.set_phase("validating");
+        let summary = validate_batch(
+            &to_validate,
+            &validation_url,
+            fallback_url.as_deref(),
+            timeout_duration,
+            concurrency,
+            &state,
+        )
+        .await;
+        total_validated += summary.completed;
+    }
+
+    let _ = crate::api::subscription::sync_proxy_bindings(&state, SyncMode::Normal).await;
+    crate::api::sub_export::invalidate_subscription_export_cache(state.as_ref());
+    crate::api::fetch::invalidate_stats_cache(state.as_ref());
+    let reconciled = crate::fixed_proxy::reconcile_all(&state).await;
+    if reconciled > 0 {
+        tracing::info!("Reconciled {reconciled} fixed exits after subscription validation");
+    }
+
+    let progress = state.validation_progress.snapshot();
+    state.validation_progress.finish(format!(
+        "订阅“{subscription_name}”验活完成：检查 {total_validated} 条线路，通过 {}，未通过 {}",
+        progress.succeeded, progress.failed
+    ));
     Ok(())
 }
 
@@ -209,6 +391,13 @@ async fn drop_proxy_after_binding_failure(
 }
 
 /// Validate a batch of proxies concurrently, reusing one reqwest::Client per proxy port.
+#[derive(Default)]
+struct BatchSummary {
+    completed: usize,
+    succeeded: usize,
+    failed: usize,
+}
+
 async fn validate_batch(
     proxies: &[crate::pool::manager::PoolProxy],
     validation_url: &str,
@@ -216,9 +405,9 @@ async fn validate_batch(
     timeout: std::time::Duration,
     concurrency: usize,
     state: &Arc<AppState>,
-) -> usize {
+) -> BatchSummary {
     let semaphore = Arc::new(Semaphore::new(concurrency));
-    let mut handles = Vec::with_capacity(proxies.len());
+    let mut handles = JoinSet::new();
 
     for proxy in proxies {
         let local_port = match proxy.local_port {
@@ -233,7 +422,7 @@ async fn validate_batch(
         let proxy_id = proxy.id.clone();
         let proxy_name = proxy.name.clone();
 
-        let handle = tokio::spawn(async move {
+        handles.spawn(async move {
             let _permit = sem.acquire().await.unwrap();
 
             let proxy_addr = format!("http://127.0.0.1:{local_port}");
@@ -267,7 +456,7 @@ async fn validate_batch(
                                     Some("Failed to persist detected exit IP"),
                                 )
                                 .ok();
-                            return;
+                            return false;
                         }
                     };
                     let quality = state
@@ -295,6 +484,7 @@ async fn validate_batch(
                         state.pool.set_status(&id, ProxyStatus::Valid);
                         state.pool.set_quality(&id, quality.clone());
                     }
+                    true
                 }
                 Err(e) => {
                     tracing::debug!("Proxy {proxy_name} failed validation: {e}");
@@ -326,19 +516,24 @@ async fn validate_batch(
                         state.binding_usage.remove(&id);
                         state.pool.remove(&id);
                     }
+                    false
                 }
             }
         });
-        handles.push(handle);
     }
 
-    let mut count = 0;
-    for handle in handles {
-        if handle.await.is_ok() {
-            count += 1;
+    let mut summary = BatchSummary::default();
+    while let Some(result) = handles.join_next().await {
+        summary.completed += 1;
+        let succeeded = matches!(result, Ok(true));
+        if succeeded {
+            summary.succeeded += 1;
+        } else {
+            summary.failed += 1;
         }
+        state.validation_progress.advance(succeeded);
     }
-    count
+    summary
 }
 
 async fn detect_exit_ip(proxy_addr: &str, timeout: std::time::Duration) -> Result<String, String> {

@@ -33,11 +33,13 @@ fn default_sub_type() -> String {
     "auto".to_string()
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum SyncMode {
     Normal,
     Validation,
     QualityCheck,
+    /// Bind this explicit set for a manual subscription-scoped maintenance run.
+    Targeted(Vec<String>),
 }
 
 pub struct SyncBindingsResult {
@@ -674,6 +676,50 @@ pub async fn refresh_subscription(
     })))
 }
 
+pub async fn validate_subscription(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let sub = state
+        .db
+        .get_subscription(&id)?
+        .ok_or_else(|| AppError::NotFound("Subscription not found".into()))?;
+    if !crate::pool::validator::start_subscription_validation(
+        state,
+        sub.id.clone(),
+        sub.name.clone(),
+    ) {
+        return Ok(Json(json!({ "message": "Validation already running" })));
+    }
+    Ok(Json(json!({
+        "message": "Subscription validation started in background",
+        "subscription_id": sub.id,
+        "subscription_name": sub.name,
+    })))
+}
+
+pub async fn quality_check_subscription(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let sub = state
+        .db
+        .get_subscription(&id)?
+        .ok_or_else(|| AppError::NotFound("Subscription not found".into()))?;
+    if !crate::quality::checker::start_subscription_quality_check(
+        state,
+        sub.id.clone(),
+        sub.name.clone(),
+    ) {
+        return Ok(Json(json!({ "message": "Quality check already running" })));
+    }
+    Ok(Json(json!({
+        "message": "Subscription quality check started in background",
+        "subscription_id": sub.id,
+        "subscription_name": sub.name,
+    })))
+}
+
 /// Sync proxy bindings dynamically without restarting sing-box.
 ///
 /// Port pool total = max_proxies + batch_size.
@@ -714,7 +760,7 @@ pub async fn sync_proxy_bindings(state: &Arc<AppState>, mode: SyncMode) -> SyncB
             selected.push(crate::pool::manager::ProxyPool::from_db_parts(row, quality));
         }
     }
-    if matches!(mode, SyncMode::Validation) {
+    if matches!(&mode, SyncMode::Validation) {
         let cfg = &state.config.validation;
         let (new_limit, valid_limit, invalid_limit) = validation_batch_limits(
             batch,
@@ -759,7 +805,7 @@ pub async fn sync_proxy_bindings(state: &Arc<AppState>, mode: SyncMode) -> SyncB
         }
     }
     let quality_stale_hours = state.config.quality.stale_hours.max(1);
-    if matches!(mode, SyncMode::QualityCheck) {
+    if matches!(&mode, SyncMode::QualityCheck) {
         let stale_before =
             (chrono::Utc::now() - chrono::Duration::hours(quality_stale_hours as i64)).to_rfc3339();
         for (row, quality) in state
@@ -789,6 +835,26 @@ pub async fn sync_proxy_bindings(state: &Arc<AppState>, mode: SyncMode) -> SyncB
             }
         }
     }
+    if let SyncMode::Targeted(target_ids) = &mode {
+        for target_id in target_ids {
+            let Ok(Some((row, quality))) = state.db.get_proxy_record(target_id) else {
+                continue;
+            };
+            if row.orphaned_at.is_some() {
+                continue;
+            }
+            let definition = proxy_row_definition_key(&row);
+            if let Some(representative_id) = definition_representatives.get(&definition) {
+                if !work_ids.contains(representative_id) {
+                    work_ids.push(representative_id.clone());
+                }
+            } else if seen_ids.insert(row.id.clone()) {
+                definition_representatives.insert(definition, row.id.clone());
+                work_ids.push(row.id.clone());
+                selected.push(crate::pool::manager::ProxyPool::from_db_parts(row, quality));
+            }
+        }
+    }
 
     let mut managed_ids = std::collections::HashSet::new();
     let now = chrono::Utc::now();
@@ -799,7 +865,7 @@ pub async fn sync_proxy_bindings(state: &Arc<AppState>, mode: SyncMode) -> SyncB
     {
         managed_ids.insert(proxy.id.clone());
     }
-    match mode {
+    match &mode {
         SyncMode::Validation => {
             for id in &work_ids {
                 managed_ids.insert(id.clone());
@@ -816,6 +882,11 @@ pub async fn sync_proxy_bindings(state: &Arc<AppState>, mode: SyncMode) -> SyncB
                         extra += 1;
                     }
                 }
+            }
+        }
+        SyncMode::Targeted(_) => {
+            for id in &work_ids {
+                managed_ids.insert(id.clone());
             }
         }
         SyncMode::Normal => {}
@@ -842,10 +913,11 @@ pub async fn sync_proxy_bindings(state: &Arc<AppState>, mode: SyncMode) -> SyncB
 
     let selected_ids: Vec<String> = selected.iter().map(|p| p.id.clone()).collect();
 
-    let mode_str = match mode {
+    let mode_str = match &mode {
         SyncMode::Normal => "normal",
         SyncMode::Validation => "validation",
         SyncMode::QualityCheck => "quality-check",
+        SyncMode::Targeted(_) => "targeted",
     };
     tracing::info!(
         "Syncing bindings: {} selected, {} desired (mode={}, max={}, prebound={}, batch={})",

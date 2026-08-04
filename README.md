@@ -448,6 +448,7 @@ https://proxy.mui.moe/sub/{subscription_password}/trojan/clash.yaml
 | `POST /api/admin/proxies/cleanup` | 清理高错误代理 |
 | `POST /api/admin/validate` | 手动触发验证 |
 | `POST /api/admin/quality-check` | 手动触发质检 |
+| `GET /api/admin/jobs` | 查询验活/质检任务范围、阶段和实时进度 |
 | `GET /api/admin/users` | 用户列表 |
 | `DELETE /api/admin/users/:id` | 删除用户 |
 | `POST /api/admin/users/:id/ban` | 封禁用户 |
@@ -456,6 +457,8 @@ https://proxy.mui.moe/sub/{subscription_password}/trojan/clash.yaml
 | `POST /api/subscriptions` | 添加订阅 |
 | `DELETE /api/subscriptions/:id` | 删除订阅及其代理 |
 | `POST /api/subscriptions/:id/refresh` | 刷新订阅 |
+| `POST /api/subscriptions/:id/validate` | 强制验活指定订阅的全部节点 |
+| `POST /api/subscriptions/:id/quality-check` | 强制质检指定订阅的有效节点（包含解锁检测） |
 
 ### 验证与质检
 
@@ -471,6 +474,8 @@ https://proxy.mui.moe/sub/{subscription_password}/trojan/clash.yaml
 - 导入/刷新订阅后**立即触发**
 - 定时任务：每 `validation.interval_mins` 分钟运行一次
 - 定时订阅刷新后自动触发（需开启 `auto_refresh_interval_mins`）
+- 管理后台“全局验活队列”消费当前待检测、到期复验和冷却重试队列
+- 订阅行的“验活”会忽略上次验活时间，强制检查该订阅的全部不同代理配置
 
 **流程：**
 1. 每轮按 `new_proxy_percent` / `valid_recheck_percent` / `invalid_retry_percent` 分配新节点、到期有效节点、冷却后的无效节点名额，避免任一队列长期饿死
@@ -511,6 +516,8 @@ https://proxy.mui.moe/sub/{subscription_password}/trojan/clash.yaml
 | 扩展解锁 | Sora / Gemini / Copilot / Claude / Netflix / YouTube Premium / Spotify / TikTok | 保存可用状态、地区和判定详情 |
 
 扩展结果保存在质量对象的 `details.ip` 和 `details.unlock` 字段中，用户及管理后台的代理质量表可以直接展开查看。解锁结果是未登录状态下的地区与网络可达性探测，不代表账号、付费套餐或特定内容一定可用。
+
+解锁检测不在基础验活中执行，而是质量检测的一部分。“全局到期质检”只检查尚未质检、结果不完整或已经过期的有效节点；订阅行的“解锁质检”会强制重测该订阅当前有效节点，即使已有结果仍在有效期内。管理后台每 1.5 秒读取 `/api/admin/jobs`，显示当前范围、检测阶段、完成数、成功数和失败数。
 
 ### 服务端部署
 

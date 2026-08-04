@@ -48,6 +48,7 @@ body::before { content:""; position:fixed; inset:0; pointer-events:none; z-index
 .btn-success { color:var(--success); background:rgba(77,255,156,.08); }
 .btn-success:hover { background:var(--success); color:#03150b; }
 .btn-sm { padding:6px 12px; font-size:12px; }
+.btn:disabled { opacity:.42; cursor:not-allowed; transform:none; filter:none; box-shadow:none; }
 .btn-group { display:flex; gap:8px; flex-wrap:wrap; }
 table { width:100%; border-collapse:collapse; }
 th, td { text-align:left; padding:11px 12px; border-bottom:1px solid rgba(29,64,85,.62); font-size:12px; white-space:nowrap; }
@@ -110,6 +111,19 @@ tr:hover td { background:rgba(70,220,255,.035); }
 .metric-pair small { color:var(--text-dim); font-size:10px; }
 .credential-preview { display:none; margin-top:14px; padding:13px; border:1px solid var(--warn); background:rgba(255,200,87,.06); color:var(--text); font:12px/1.7 Consolas,monospace; white-space:pre-wrap; word-break:break-all; }
 .account-create-grid { display:grid; grid-template-columns:1fr 1fr 1fr auto; gap:12px; align-items:end; }
+.action-help { margin-top:10px; color:var(--text-dim); font-size:11px; line-height:1.7; }
+.job-grid { display:grid; grid-template-columns:repeat(2,minmax(260px,1fr)); gap:10px; margin-top:14px; }
+.job-card { padding:13px 14px; border:1px solid rgba(29,64,85,.8); background:rgba(7,17,30,.8); }
+.job-card-head { display:flex; align-items:center; justify-content:space-between; gap:12px; color:var(--text-bright); font-size:11px; }
+.job-card-status { color:var(--text-dim); font:10px Consolas,monospace; text-transform:uppercase; }
+.job-card.is-running .job-card-status { color:var(--primary); }
+.job-card.is-completed .job-card-status { color:var(--success); }
+.job-card.is-failed .job-card-status { color:var(--danger); }
+.job-progress { height:5px; margin:10px 0 8px; overflow:hidden; background:#030912; border:1px solid rgba(29,64,85,.75); }
+.job-progress-fill { height:100%; width:0; background:linear-gradient(90deg,var(--primary),var(--success)); transition:width .25s ease; }
+.job-progress-fill.indeterminate { width:38%; animation:job-scan 1.25s ease-in-out infinite alternate; }
+.job-card-detail { color:var(--text-dim); font:10px/1.6 Consolas,monospace; white-space:normal; }
+@keyframes job-scan { from { transform:translateX(-100%); } to { transform:translateX(265%); } }
 .proxy-card { padding:8px 12px 14px; overflow-x:hidden; }
 .proxy-table { table-layout:fixed; }
 .proxy-table th, .proxy-table td { padding:10px 8px; vertical-align:middle; }
@@ -145,6 +159,7 @@ tr:hover td { background:rgba(70,220,255,.035); }
 .proxy-table .proxy-action-cell { text-align:right; }
 @media(max-width:1100px) { .proxy-card { overflow-x:auto; } .proxy-table { min-width:1040px; } }
 @media(max-width:900px) { .account-create-grid { grid-template-columns:1fr 1fr; } }
+@media(max-width:900px) { .job-grid { grid-template-columns:1fr; } }
 @media(max-width:650px) { .account-create-grid { grid-template-columns:1fr; } }
 @keyframes pulse { 50% { opacity:.35; box-shadow:0 0 2px var(--success); } }
 @media(max-width:900px) { .header { position:relative; align-items:flex-start; gap:12px; } .header .nav { flex-wrap:wrap; justify-content:flex-end; } .command-banner { align-items:flex-start; } .command-banner h2 { font-size:24px; } }
@@ -210,10 +225,23 @@ tr:hover td { background:rgba(70,220,255,.035); }
   <div class="section">
     <div class="section-title">操作</div>
     <div class="btn-group">
-      <button class="btn btn-primary" onclick="triggerValidation()">启动批量验证</button>
-      <button class="btn btn-primary" onclick="triggerQualityCheck()">热池质量检测</button>
+      <button class="btn btn-primary" data-job-kind="validation" onclick="triggerValidation()">全局验活队列</button>
+      <button class="btn btn-primary" data-job-kind="quality" onclick="triggerQualityCheck()">全局到期质检</button>
       <button class="btn btn-danger" onclick="cleanupProxies()">清理高错误代理</button>
       <button class="btn btn-danger" onclick="cleanupUselessProxies()">删除三不通代理</button>
+    </div>
+    <div class="action-help">验活只判断代理连通性并获取出口 IP；质检会在验活通过的节点上检测 IP/ASN/风险，并同时执行 ChatGPT、Google、Netflix、Sora、Gemini 等解锁检测。订阅行中的按钮会强制检查该订阅，以上全局按钮只消费当前到期队列。</div>
+    <div class="job-grid">
+      <div class="job-card" id="job-validation">
+        <div class="job-card-head"><span>验活任务</span><span class="job-card-status">未运行</span></div>
+        <div class="job-progress"><div class="job-progress-fill"></div></div>
+        <div class="job-card-detail">等待任务</div>
+      </div>
+      <div class="job-card" id="job-quality">
+        <div class="job-card-head"><span>解锁质检任务</span><span class="job-card-status">未运行</span></div>
+        <div class="job-progress"><div class="job-progress-fill"></div></div>
+        <div class="job-card-detail">等待任务</div>
+      </div>
     </div>
   </div>
 
@@ -387,6 +415,9 @@ let proxyLoadSequence = 0;
 let defaultSubRefreshInterval = 0;
 let adminUsers = [];
 let latestProxyCredential = '';
+let currentJobs = null;
+let jobStatusLoading = false;
+const previousJobStatuses = { validation: 'idle', quality: 'idle' };
 
 // --- Auth ---
 const STORAGE_KEY = 'zenproxy_admin_password';
@@ -462,6 +493,69 @@ function toast(msg) {
 
 function esc(s) { if(!s) return ''; const d=document.createElement('div'); d.textContent=s; return d.innerHTML; }
 function fmtDate(s) { return s ? new Date(s).toLocaleString() : '-'; }
+
+const jobPhaseLabels = {
+  idle:'等待任务', 'waiting-for-bindings':'等待端口资源', preparing:'准备候选节点',
+  binding:'分配检测端口', validating:'连通性与出口 IP 检测',
+  'checking-unlock':'IP 质量与流媒体解锁检测', completed:'已完成', failed:'失败'
+};
+
+function applyJobButtonState() {
+  const validationRunning = currentJobs?.validation?.status === 'running';
+  const qualityRunning = currentJobs?.quality_check?.status === 'running';
+  document.querySelectorAll('[data-job-kind="validation"]').forEach(button => button.disabled = validationRunning);
+  document.querySelectorAll('[data-job-kind="quality"]').forEach(button => button.disabled = qualityRunning);
+}
+
+function renderJobCard(elementId, job) {
+  const card = document.getElementById(elementId);
+  if (!card || !job) return;
+  const statusLabels = { idle:'未运行', running:'运行中', completed:'已完成', failed:'失败' };
+  card.className = `job-card is-${job.status || 'idle'}`;
+  card.querySelector('.job-card-status').textContent = statusLabels[job.status] || job.status || '未知';
+  const fill = card.querySelector('.job-progress-fill');
+  const hasTotal = Number.isFinite(job.total) && job.total != null;
+  const determinate = hasTotal && (job.scope === 'subscription' || job.status !== 'running');
+  if (determinate) {
+    const percent = job.total > 0 ? Math.min(100, Math.round((job.completed || 0) * 100 / job.total)) : (job.status === 'running' ? 0 : 100);
+    fill.className = 'job-progress-fill';
+    fill.style.width = `${percent}%`;
+  } else {
+    fill.className = job.status === 'running' ? 'job-progress-fill indeterminate' : 'job-progress-fill';
+    fill.style.width = job.status === 'running' ? '' : '0';
+  }
+  const scope = job.scope === 'subscription' ? `订阅：${job.subscription_name || job.subscription_id || '-'}` : '范围：全局到期队列';
+  const amount = hasTotal
+    ? (job.scope === 'subscription' ? `${job.completed || 0}/${job.total}` : `已处理 ${job.completed || 0} · 已排入 ${job.total}`)
+    : `已处理 ${job.completed || 0}`;
+  const phase = jobPhaseLabels[job.phase] || job.phase || '-';
+  const round = job.round ? `第 ${job.round} 轮 · ` : '';
+  const outcome = `通过/成功 ${job.succeeded || 0} · 未通过/失败 ${job.failed || 0}`;
+  const message = job.message ? ` · ${job.message}` : '';
+  card.querySelector('.job-card-detail').textContent = `${scope} · ${round}${phase} · ${amount} · ${outcome}${message}`;
+}
+
+async function loadJobStatus() {
+  if (jobStatusLoading || !getPassword() || document.getElementById('app').style.display === 'none') return;
+  jobStatusLoading = true;
+  const d = await api('/api/admin/jobs');
+  jobStatusLoading = false;
+  if (!d) return;
+  currentJobs = d;
+  renderJobCard('job-validation', d.validation);
+  renderJobCard('job-quality', d.quality_check);
+  applyJobButtonState();
+  const completedNow = (previousJobStatuses.validation === 'running' && d.validation?.status !== 'running')
+    || (previousJobStatuses.quality === 'running' && d.quality_check?.status !== 'running');
+  previousJobStatuses.validation = d.validation?.status || 'idle';
+  previousJobStatuses.quality = d.quality_check?.status || 'idle';
+  if (completedNow) {
+    loadStats();
+    loadSubscriptions();
+    resetProxyCursor();
+    loadProxies();
+  }
+}
 
 async function loadStats() {
   const d = await api('/api/admin/stats');
@@ -740,11 +834,14 @@ async function loadSubscriptions() {
       <td>${fmtDate(s.last_refresh_at || s.updated_at)}</td>
       <td>${fmtDate(s.created_at)}</td>
       <td class="btn-group">
-        <button class="btn btn-primary btn-sm" onclick="refreshSub('${s.id}')">刷新</button>
+        <button class="btn btn-primary btn-sm" onclick="refreshSub('${s.id}')">刷新节点</button>
+        <button class="btn btn-success btn-sm" data-job-kind="validation" onclick="triggerSubValidation('${s.id}')" title="强制重新验活此订阅的全部节点">验活</button>
+        <button class="btn btn-primary btn-sm" data-job-kind="quality" onclick="triggerSubQualityCheck('${s.id}')" title="强制重新检测此订阅中有效节点的质量与流媒体解锁">解锁质检</button>
         <button class="btn btn-danger btn-sm" onclick="deleteSub('${s.id}')">删除</button>
       </td>
     </tr>`;
   }).join('');
+  applyJobButtonState();
 }
 
 async function adminAddSubscription() {
@@ -995,27 +1092,55 @@ async function refreshSub(id) {
   toast('正在刷新...');
   const d = await api('/api/subscriptions/'+id+'/refresh', {method:'POST'});
   if(d && d.error) { toast('刷新失败: ' + d.error); return; }
-  if(d) toast('刷新完成: 新增 '+d.proxies_added+' 个代理');
+  if(d) toast('刷新完成: 新增 '+d.proxies_added+' 个代理，已提交验活');
   resetProxyCursor();
   refresh();
 }
 
 async function triggerValidation() {
   const d = await api('/api/admin/validate', {method:'POST'});
+  if(!d) return;
   if(d?.message === 'Validation already running') {
     toast('批量验证已在运行');
     return;
   }
-  toast('已启动批量验证');
+  toast('已启动全局验活队列');
+  loadJobStatus();
 }
 
 async function triggerQualityCheck() {
   const d = await api('/api/admin/quality-check', {method:'POST'});
+  if(!d) return;
   if(d?.message === 'Quality check already running') {
-    toast('热池质量检测已在运行');
+    toast('解锁质检已在运行');
     return;
   }
-  toast('已启动热池质量检测');
+  toast('已启动全局到期质检（包含解锁检测）');
+  loadJobStatus();
+}
+
+async function triggerSubValidation(id) {
+  const d = await api('/api/subscriptions/'+id+'/validate', {method:'POST'});
+  if(!d) return;
+  if(d.message === 'Validation already running') {
+    toast('已有验活任务在运行，请等待完成');
+    return;
+  }
+  if(d.error) return toast('启动验活失败: '+d.error);
+  toast('已启动该订阅的强制验活');
+  loadJobStatus();
+}
+
+async function triggerSubQualityCheck(id) {
+  const d = await api('/api/subscriptions/'+id+'/quality-check', {method:'POST'});
+  if(!d) return;
+  if(d.message === 'Quality check already running') {
+    toast('已有解锁质检任务在运行，请等待完成');
+    return;
+  }
+  if(d.error) return toast('启动解锁质检失败: '+d.error);
+  toast('已启动该订阅的强制解锁质检');
+  loadJobStatus();
 }
 
 async function cleanupProxies() {
@@ -1040,7 +1165,7 @@ async function cleanupUselessProxies() {
   refresh();
 }
 
-function refresh() { loadStats(); loadUsers().then(loadProxyAccounts); loadSubscriptions(); loadProxies(); }
+function refresh() { loadStats(); loadUsers().then(loadProxyAccounts); loadSubscriptions(); loadProxies(); loadJobStatus(); }
 
 // Init: check auth
 function updateCommandTime() {
@@ -1052,6 +1177,7 @@ function updateCommandTime() {
 }
 updateCommandTime();
 setInterval(updateCommandTime, 1000);
+setInterval(loadJobStatus, 1500);
 checkAuth();
 </script>
 </body>
