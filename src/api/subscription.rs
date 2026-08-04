@@ -33,6 +33,32 @@ fn default_sub_type() -> String {
     "auto".to_string()
 }
 
+fn subscription_user_agent(sub_type: &str) -> &'static str {
+    match sub_type.to_ascii_lowercase().as_str() {
+        "auto" | "clash" => "Clash.Meta",
+        _ => "v2rayN",
+    }
+}
+
+async fn fetch_subscription_content(url: &str, sub_type: &str) -> Result<String, String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .danger_accept_invalid_certs(true)
+        .user_agent(subscription_user_agent(sub_type))
+        .build()
+        .map_err(|e| format!("Failed to build HTTP client: {e}"))?;
+    let resp = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| format!("Failed to fetch subscription: {e}"))?
+        .error_for_status()
+        .map_err(|e| format!("Subscription server returned an error: {e}"))?;
+    resp.text()
+        .await
+        .map_err(|e| format!("Failed to read subscription response: {e}"))
+}
+
 #[derive(Debug, Clone)]
 pub enum SyncMode {
     Normal,
@@ -110,19 +136,9 @@ pub async fn add_subscription(
 
     // Fetch content from URL or use provided content
     let content = if let Some(ref url) = req.url {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .danger_accept_invalid_certs(true)
-            .build()
-            .map_err(|e| AppError::Internal(e.to_string()))?;
-        let resp = client
-            .get(url)
-            .send()
+        fetch_subscription_content(url, &req.sub_type)
             .await
-            .map_err(|e| AppError::Internal(format!("Failed to fetch subscription: {e}")))?;
-        resp.text()
-            .await
-            .map_err(|e| AppError::Internal(format!("Failed to read response: {e}")))?
+            .map_err(AppError::Internal)?
     } else if let Some(ref content) = req.content {
         content.clone()
     } else {
@@ -323,19 +339,7 @@ pub async fn refresh_subscription_core(
     sub: &Subscription,
 ) -> Result<usize, String> {
     let content = if let Some(ref url) = sub.url {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .danger_accept_invalid_certs(true)
-            .build()
-            .map_err(|e| format!("Failed to build HTTP client: {e}"))?;
-        let resp = client
-            .get(url)
-            .send()
-            .await
-            .map_err(|e| format!("Failed to fetch: {e}"))?;
-        resp.text()
-            .await
-            .map_err(|e| format!("Failed to read: {e}"))?
+        fetch_subscription_content(url, &sub.sub_type).await?
     } else if let Some(ref content) = sub.content {
         content.clone()
     } else {
@@ -1034,7 +1038,10 @@ fn validate_refresh_interval_mins(value: Option<i32>) -> Result<Option<i32>, App
 
 #[cfg(test)]
 mod tests {
-    use super::{deduplicate_parsed_proxies, proxy_row_definition_key, take_matching_proxy};
+    use super::{
+        deduplicate_parsed_proxies, proxy_row_definition_key, subscription_user_agent,
+        take_matching_proxy,
+    };
     use crate::db::ProxyRow;
     use crate::parser::{ProxyConfig, ProxyType};
     use serde_json::json;
@@ -1068,6 +1075,14 @@ mod tests {
         assert_eq!(deduplicated.len(), 2);
         assert_eq!(deduplicated[0].name, "first name");
         assert_eq!(deduplicated[1].name, "different credential");
+    }
+
+    #[test]
+    fn subscription_user_agent_requests_the_selected_format() {
+        assert_eq!(subscription_user_agent("auto"), "Clash.Meta");
+        assert_eq!(subscription_user_agent("clash"), "Clash.Meta");
+        assert_eq!(subscription_user_agent("base64"), "v2rayN");
+        assert_eq!(subscription_user_agent("v2ray"), "v2rayN");
     }
 
     #[test]

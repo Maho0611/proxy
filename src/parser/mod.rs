@@ -58,7 +58,9 @@ pub struct ProxyConfig {
 pub fn parse_subscription(content: &str, sub_type: &str) -> Vec<ProxyConfig> {
     match sub_type {
         "auto" => parse_subscription_auto(content),
-        "v2ray" => v2ray::parse(content),
+        // Most providers label their whole Base64 URI bundle as "v2ray".
+        // The Base64 parser already falls back to raw URI lines when needed.
+        "v2ray" => base64::parse(content),
         "clash" => clash::parse(content),
         "base64" => base64::parse(content),
         "socks5" | "socks4" | "http" | "https" => plain::parse(content, sub_type),
@@ -93,4 +95,22 @@ pub fn parse_subscription_auto(content: &str) -> Vec<ProxyConfig> {
 
     tracing::warn!("Auto-detect: no proxies found with any parser");
     vec![]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_subscription;
+    use base64::Engine;
+
+    #[test]
+    fn explicit_v2ray_type_accepts_base64_uri_bundles() {
+        let content = base64::engine::general_purpose::STANDARD
+            .encode("trojan://secret@example.com:443?security=tls#node");
+
+        let proxies = parse_subscription(&content, "v2ray");
+
+        assert_eq!(proxies.len(), 1);
+        assert_eq!(proxies[0].server, "example.com");
+        assert_eq!(proxies[0].port, 443);
+    }
 }
