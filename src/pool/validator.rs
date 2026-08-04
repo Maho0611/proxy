@@ -162,6 +162,10 @@ pub async fn validate_all(state: Arc<AppState>) -> Result<(), String> {
     let _ = crate::api::subscription::sync_proxy_bindings(&state, SyncMode::Normal).await;
     crate::api::sub_export::invalidate_subscription_export_cache(state.as_ref());
     crate::api::fetch::invalidate_stats_cache(state.as_ref());
+    let reconciled = crate::fixed_proxy::reconcile_all(&state).await;
+    if reconciled > 0 {
+        tracing::info!("Reconciled {reconciled} fixed exits after validation");
+    }
 
     let valid = state.db.count_valid_proxies().unwrap_or(0);
     let total = state.db.count_all_proxies().unwrap_or(0);

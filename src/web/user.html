@@ -78,6 +78,11 @@ tr:hover td { background:rgba(108,99,255,.03); }
 .builder-output-row label { color:var(--text-dim); font-size:12px; }
 .builder-output-row input { min-width:0; width:100%; padding:9px 11px; background:#0a0c10; border:1px solid var(--border); border-radius:6px; color:var(--text); font:12px Consolas,monospace; }
 .access-note { color:var(--text-dim); font-size:12px; line-height:1.7; margin-top:12px; }
+.fixed-summary { display:flex; gap:14px; flex-wrap:wrap; margin-bottom:14px; color:var(--text-dim); font-size:13px; }
+.fixed-summary strong { color:var(--text-bright); }
+.fixed-url { min-width:360px; width:100%; padding:7px 9px; background:#0a0c10; border:1px solid var(--border); border-radius:6px; color:var(--text); font:11px Consolas,monospace; }
+.fixed-subscriptions { display:grid; gap:9px; margin-top:16px; }
+.fixed-table-actions { display:flex; gap:6px; }
 @media(max-width:700px) { .builder-output-row { grid-template-columns:1fr; } }
 
 /* API Key card */
@@ -173,7 +178,7 @@ tr:hover td { background:rgba(108,99,255,.03); }
           <span>基础用户名：<strong id="proxy-access-username">-</strong></span>
           <span>入口：<strong id="proxy-access-gateway">-</strong></span>
           <span>状态：<strong id="proxy-access-status">-</strong></span>
-          <span>换 IP：<strong>每次连接随机 + 定时轮换可同时使用</strong></span>
+          <span>换 IP：<strong>随机 + 定时轮换 + 固定槽位可同时使用</strong></span>
         </div>
         <div class="builder-grid">
           <div class="form-group"><label>连接协议</label><select id="builder-protocol" onchange="buildProxyUrls()"><option value="http">HTTP</option><option value="socks5h">SOCKS5（远程 DNS）</option></select></div>
@@ -215,7 +220,56 @@ tr:hover td { background:rgba(108,99,255,.03); }
             <div class="builder-output-row"><label>环境变量 / JSON</label><input id="builder-timed-env" readonly><button class="btn btn-outline btn-sm" onclick="copyBuilder('builder-timed-env')">复制</button></div>
           </div>
         </div>
-        <div class="access-note">不带 Session 后缀的 URL 保持每个新 TCP 连接随机出口；定时 URL 在间隔内保持同一出口，到期后由下一条新连接触发轮换。两种 URL 可使用同一账号同时运行。已建立的长连接不会在中途换 IP。页面不会把代理密码保存到 localStorage。</div>
+        <div class="access-note">不带 Session 后缀的 URL 保持每个新 TCP 连接随机出口；定时 URL 在间隔内保持同一出口，到期后由下一条新连接触发轮换。下方固定槽位也可使用同一账号同时运行。已建立的长连接不会在中途换 IP。页面不会把代理密码保存到 localStorage。</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Fixed exit slots -->
+  <div class="section">
+    <div class="section-title">固定入口 · 固定出口</div>
+    <div class="card">
+      <div id="fixed-exits-empty" class="empty">正在加载固定出口...</div>
+      <div id="fixed-exits-panel" style="display:none">
+        <div class="fixed-summary">
+          <span>已申请：<strong id="fixed-exits-count">0</strong></span>
+          <span>订阅启用：<strong id="fixed-exits-included">0</strong></span>
+          <span>自动替换：<strong>失效后保持同国家</strong></span>
+        </div>
+        <div class="builder-grid">
+          <div class="form-group"><label>国家 / 地区</label><select id="fixed-country"><option value="">选择国家</option></select></div>
+          <div class="form-group"><label>上游代理类型</label><select id="fixed-type"><option value="">不限类型</option></select></div>
+          <div class="form-group"><label>申请数量</label><input type="number" id="fixed-count" min="1" max="50" value="10"></div>
+          <div class="form-group"><label>连接协议</label><select id="fixed-protocol" onchange="renderFixedExits()"><option value="http">HTTP</option><option value="socks5h">SOCKS5（远程 DNS）</option></select></div>
+        </div>
+        <div class="checkbox-group">
+          <label><input type="checkbox" id="fixed-residential"> 住宅 IP</label>
+          <label><input type="checkbox" id="fixed-chatgpt"> ChatGPT 可用</label>
+          <label><input type="checkbox" id="fixed-google"> Google 可用</label>
+        </div>
+        <div class="apikey-actions">
+          <button class="btn btn-primary btn-sm" onclick="allocateFixedExits()">申请固定出口</button>
+          <button class="btn btn-outline btn-sm" onclick="revealProxyCredential()">显示固定出口密码</button>
+          <button class="btn btn-outline btn-sm" onclick="loadFixedExits()">刷新状态</button>
+          <button class="btn btn-danger btn-sm" onclick="rotateFixedSubscriptionToken()">轮换订阅 Token</button>
+        </div>
+        <div class="fixed-subscriptions">
+          <div class="builder-output-title">订阅链接（仅包含下方勾选的槽位）</div>
+          <div class="builder-output-row"><label>Clash · HTTP</label><input id="fixed-sub-clash-http" readonly><button class="btn btn-outline btn-sm" onclick="copyFixedSubscription('fixed-sub-clash-http')">复制</button></div>
+          <div class="builder-output-row"><label>Clash · SOCKS5</label><input id="fixed-sub-clash-socks5" readonly><button class="btn btn-outline btn-sm" onclick="copyFixedSubscription('fixed-sub-clash-socks5')">复制</button></div>
+          <div class="builder-output-row"><label>HTTP URL 列表</label><input id="fixed-sub-http" readonly><button class="btn btn-outline btn-sm" onclick="copyFixedSubscription('fixed-sub-http')">复制</button></div>
+          <div class="builder-output-row"><label>SOCKS5 URL 列表</label><input id="fixed-sub-socks5" readonly><button class="btn btn-outline btn-sm" onclick="copyFixedSubscription('fixed-sub-socks5')">复制</button></div>
+        </div>
+        <div style="overflow-x:auto;margin-top:16px">
+          <table>
+            <thead><tr>
+              <th>订阅</th><th>名称</th><th>状态</th><th>国家</th><th>当前出口 IP</th><th>类型</th><th>固定连接 URL</th><th>已替换</th><th>操作</th>
+            </tr></thead>
+            <tbody id="fixed-exits-table"></tbody>
+          </table>
+        </div>
+        <div id="fixed-exits-table-empty" class="empty">尚未申请固定出口；也可以在“代理质量”列表中手动固定某个出口。</div>
+        <div class="access-note">每个槽位的入口、用户名和订阅地址保持不变。当前出口失效、被上游订阅移除或国家发生变化时，新连接会自动选择同国家的新出口；没有同国家候选时不会跨区回退。订阅勾选只控制导出内容，不会停用已复制的槽位 URL。</div>
       </div>
     </div>
   </div>
@@ -256,6 +310,7 @@ tr:hover td { background:rgba(108,99,255,.03); }
           <th>Google</th>
           <th>住宅</th>
           <th>质检状态</th>
+          <th>固定出口</th>
         </tr></thead>
         <tbody id="proxy-table"></tbody>
       </table>
@@ -324,6 +379,7 @@ let proxyLoadSequence = 0;
 let proxyAccess = null;
 let proxyPassword = null;
 let proxyBuilderReady = { connection: false, timed: false };
+let fixedAccess = null;
 
 function toast(msg) {
   const t = document.createElement('div');
@@ -424,6 +480,8 @@ async function loadProxyAccess() {
     document.getElementById('proxy-access-status').textContent = d.account.enabled ? '启用' : '已禁用';
     fillBuilderSelect('builder-country', d.filters?.countries || [], '随机国家');
     fillBuilderSelect('builder-type', d.filters?.proxy_types || [], '随机类型');
+    fillBuilderSelect('fixed-country', d.filters?.countries || [], '选择国家');
+    fillBuilderSelect('fixed-type', d.filters?.proxy_types || [], '不限类型');
     ensureRotationSessionId();
     buildProxyUrls();
   } catch (e) {
@@ -532,6 +590,7 @@ async function revealProxyCredential() {
     proxyAccess.gateway = d.gateway;
     proxyPassword = d.password;
     buildProxyUrls();
+    renderFixedExits();
     toast('完整连接信息已生成');
   } catch (e) { toast('显示失败：' + e.message); }
 }
@@ -539,6 +598,7 @@ async function revealProxyCredential() {
 function hideProxyCredential() {
   proxyPassword = null;
   buildProxyUrls();
+  renderFixedExits();
   toast('代理密码已从页面内存隐藏');
 }
 
@@ -552,6 +612,7 @@ async function rotateProxyCredential() {
     proxyAccess.gateway = d.gateway;
     proxyPassword = d.password;
     buildProxyUrls();
+    renderFixedExits();
     toast('代理密码已轮换，完整连接信息已更新');
   } catch (e) { toast('轮换失败：' + e.message); }
 }
@@ -562,6 +623,176 @@ function copyBuilder(id) {
   if (!proxyPassword) return toast('请先显示完整连接信息');
   if (!proxyBuilderReady[mode]) return toast(mode === 'timed' ? '请先修正 Session 标识或轮换间隔' : '连接信息尚未就绪');
   navigator.clipboard.writeText(value).then(() => toast('已复制到剪贴板'));
+}
+
+async function loadFixedExits() {
+  if (!currentUser) return;
+  const empty = document.getElementById('fixed-exits-empty');
+  const panel = document.getElementById('fixed-exits-panel');
+  try {
+    const r = await fetch('/api/fixed-exits', { cache:'no-store' });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
+    fixedAccess = d;
+    empty.style.display = 'none';
+    panel.style.display = '';
+    document.getElementById('fixed-count').max = d.max_slots || 50;
+    renderFixedExits();
+  } catch (e) {
+    panel.style.display = 'none';
+    empty.style.display = '';
+    empty.textContent = '固定出口加载失败：' + e.message;
+  }
+}
+
+function fixedSlotUrl(slot) {
+  if (!fixedAccess?.gateway) return '';
+  const protocol = document.getElementById('fixed-protocol').value;
+  const rawHost = fixedAccess.gateway.host || '';
+  const host = rawHost.includes(':') && !rawHost.startsWith('[') ? `[${rawHost}]` : rawHost;
+  const port = fixedAccess.gateway.port || '';
+  if (!host || !port) return '公网代理入口尚未配置';
+  if (!proxyPassword) return '点击“显示固定出口密码”生成完整 URL';
+  return `${protocol}://${encodeURIComponent(slot.username)}:${encodeURIComponent(proxyPassword)}@${host}:${port}`;
+}
+
+function fixedReasonLabel(reason) {
+  const labels = {
+    proxy_missing:'原出口已删除', proxy_invalid:'原出口已失效',
+    proxy_removed_by_subscription:'已被订阅更新移除', proxy_type_changed:'代理类型已变化',
+    quality_missing:'等待质量数据', exit_ip_missing:'等待出口 IP', country_missing:'等待国家数据',
+    country_changed:'出口国家已变化', exit_ip_changed:'出口 IP 已变化',
+    quality_filter_changed:'不再满足筛选条件', database_lookup_failed:'数据库暂时不可用',
+    connect_failed:'连接失败', manual:'手动更换'
+  };
+  return labels[reason] || reason || '';
+}
+
+function renderFixedExits() {
+  if (!fixedAccess) return;
+  const slots = fixedAccess.slots || [];
+  document.getElementById('fixed-exits-count').textContent = `${slots.length} / ${fixedAccess.max_slots || 50}`;
+  document.getElementById('fixed-exits-included').textContent = slots.filter(slot => slot.included_in_subscription).length;
+  const subscriptions = fixedAccess.subscriptions || {};
+  const subscriptionFields = {
+    'fixed-sub-clash-http': subscriptions.clash_http,
+    'fixed-sub-clash-socks5': subscriptions.clash_socks5,
+    'fixed-sub-http': subscriptions.http_urls,
+    'fixed-sub-socks5': subscriptions.socks5_urls,
+  };
+  for (const [id, path] of Object.entries(subscriptionFields)) {
+    document.getElementById(id).value = path ? new URL(path, location.origin).href : '';
+  }
+
+  const table = document.getElementById('fixed-exits-table');
+  const empty = document.getElementById('fixed-exits-table-empty');
+  if (!slots.length) {
+    table.innerHTML = '';
+    empty.style.display = '';
+    return;
+  }
+  empty.style.display = 'none';
+  table.innerHTML = slots.map(slot => {
+    const active = slot.status === 'active';
+    const status = active
+      ? '<span class="badge badge-valid">可用</span>'
+      : `<span class="badge badge-invalid" title="${esc(fixedReasonLabel(slot.status_reason))}">待替换</span>`;
+    const type = slot.current_type || slot.replacement_filters?.type || '-';
+    const lastReason = fixedReasonLabel(slot.last_replacement_reason);
+    const replacement = `${slot.replacement_count || 0}${lastReason ? ` · ${esc(lastReason)}` : ''}`;
+    const url = fixedSlotUrl(slot);
+    return `<tr>
+      <td><input type="checkbox" ${slot.included_in_subscription?'checked':''} onchange="setFixedSubscription('${slot.id}',this.checked)" aria-label="加入订阅"></td>
+      <td>${esc(slot.label)}</td>
+      <td>${status}</td>
+      <td>${esc(slot.country)}</td>
+      <td>${esc(slot.exit_ip || '-')}</td>
+      <td><span class="badge badge-type">${esc(type)}</span></td>
+      <td><div style="display:flex;gap:6px"><input class="fixed-url" id="fixed-slot-url-${slot.id}" value="${esc(url)}" readonly><button class="btn btn-outline btn-sm" onclick="copyFixedSlot('${slot.id}')">复制</button></div></td>
+      <td>${replacement}</td>
+      <td><div class="fixed-table-actions"><button class="btn btn-outline btn-sm" onclick="replaceFixedExit('${slot.id}')">同区更换</button><button class="btn btn-danger btn-sm" onclick="deleteFixedExit('${slot.id}')">删除</button></div></td>
+    </tr>`;
+  }).join('');
+}
+
+async function fixedMutation(url, options, successMessage) {
+  const r = await fetch(url, { cache:'no-store', ...options });
+  const d = await r.json();
+  if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
+  fixedAccess = d;
+  renderFixedExits();
+  if (successMessage) toast(successMessage);
+}
+
+async function allocateFixedExits() {
+  const country = document.getElementById('fixed-country').value;
+  const count = Number(document.getElementById('fixed-count').value);
+  if (!country) return toast('请先选择固定出口国家');
+  if (!Number.isInteger(count) || count < 1) return toast('申请数量无效');
+  const body = {
+    country,
+    count,
+    type: document.getElementById('fixed-type').value || null,
+    residential: document.getElementById('fixed-residential').checked,
+    chatgpt: document.getElementById('fixed-chatgpt').checked,
+    google: document.getElementById('fixed-google').checked,
+  };
+  try {
+    await fixedMutation('/api/fixed-exits', {
+      method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)
+    }, `已申请 ${count} 个 ${country} 固定出口`);
+  } catch (e) { toast('申请失败：' + e.message); }
+}
+
+async function pinFixedProxy(proxyId) {
+  try {
+    await fixedMutation('/api/fixed-exits/pin', {
+      method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({proxy_ids:[proxyId]})
+    }, '已加入固定出口');
+  } catch (e) { toast('固定失败：' + e.message); }
+}
+
+async function setFixedSubscription(id, included) {
+  try {
+    await fixedMutation(`/api/fixed-exits/${encodeURIComponent(id)}`, {
+      method:'PATCH', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({included_in_subscription:included})
+    }, included ? '已加入订阅' : '已从订阅移除');
+  } catch (e) { toast('更新失败：' + e.message); loadFixedExits(); }
+}
+
+async function replaceFixedExit(id) {
+  if (!confirm('确定把这个槽位更换为同国家的另一个出口？槽位用户名和订阅链接不会变化。')) return;
+  try {
+    await fixedMutation(`/api/fixed-exits/${encodeURIComponent(id)}/replace`, { method:'POST' }, '固定出口已更换');
+  } catch (e) { toast('更换失败：' + e.message); }
+}
+
+async function deleteFixedExit(id) {
+  if (!confirm('确定删除这个固定出口槽位？已经复制的槽位 URL 将立即失效。')) return;
+  try {
+    await fixedMutation(`/api/fixed-exits/${encodeURIComponent(id)}`, { method:'DELETE' }, '固定出口已删除');
+  } catch (e) { toast('删除失败：' + e.message); }
+}
+
+async function rotateFixedSubscriptionToken() {
+  if (!confirm('确定轮换订阅 Token？旧订阅链接会立即失效，但固定出口 URL 不受影响。')) return;
+  try {
+    await fixedMutation('/api/fixed-exits/subscription/rotate-token', { method:'POST' }, '订阅 Token 已轮换');
+  } catch (e) { toast('轮换失败：' + e.message); }
+}
+
+function copyFixedSlot(id) {
+  if (!proxyPassword) return toast('请先显示固定出口密码');
+  const input = document.getElementById(`fixed-slot-url-${id}`);
+  if (!input) return;
+  navigator.clipboard.writeText(input.value).then(() => toast('固定出口 URL 已复制'));
+}
+
+function copyFixedSubscription(id) {
+  const value = document.getElementById(id).value;
+  if (!value) return toast('订阅链接尚未就绪');
+  navigator.clipboard.writeText(value).then(() => toast('订阅链接已复制'));
 }
 
 // --- Proxy data ---
@@ -639,6 +870,7 @@ function renderProxies() {
       <td>${q ? (q.google ? yes : no) : na}</td>
       <td>${q ? (q.is_residential ? yes : no) : na}</td>
       <td>${q ? (q.stale ? '<span class="badge badge-invalid">已过期</span>' : '<span class="badge badge-valid">最新</span>') : na}</td>
+      <td>${p.status==='valid' && q && q.ip_address && q.country ? `<button class="btn btn-outline btn-sm" onclick="pinFixedProxy('${p.id}')">固定此出口</button>` : '-'}</td>
     </tr>`;
   }).join('');
 
@@ -757,7 +989,7 @@ async function doRelay() {
   }
 }
 
-function refresh() { loadProxyAccess(); loadProxies(); }
+function refresh() { loadProxyAccess(); loadFixedExits(); loadProxies(); }
 checkAuth();
 </script>
 </body>

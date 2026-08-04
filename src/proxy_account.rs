@@ -27,6 +27,28 @@ pub fn verify_password(secret: &str, account: &ProxyAccount, password: &str) -> 
     mac.verify_slice(&provided).is_ok()
 }
 
+pub fn derive_fixed_subscription_token(secret: &str, account_id: &str, version: i32) -> String {
+    let mut mac =
+        HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC accepts keys of any length");
+    mac.update(format!("fixed-subscription:{account_id}:{version}").as_bytes());
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
+}
+
+pub fn verify_fixed_subscription_token(
+    secret: &str,
+    account_id: &str,
+    version: i32,
+    token: &str,
+) -> bool {
+    let Ok(provided) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(token) else {
+        return false;
+    };
+    let mut mac =
+        HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC accepts keys of any length");
+    mac.update(format!("fixed-subscription:{account_id}:{version}").as_bytes());
+    mac.verify_slice(&provided).is_ok()
+}
+
 fn credential_bytes(secret: &str, account_id: &str, credential_version: i32) -> Vec<u8> {
     let mut mac =
         HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC accepts keys of any length");
@@ -74,5 +96,29 @@ mod tests {
         let new = derive_password(secret, "account-id", 2);
         assert_ne!(old, new);
         assert!(verify_password(secret, &account(2), &new));
+    }
+
+    #[test]
+    fn fixed_subscription_token_is_scoped_and_rotatable() {
+        let secret = "01234567890123456789012345678901";
+        let token = derive_fixed_subscription_token(secret, "account-id", 1);
+        assert!(verify_fixed_subscription_token(
+            secret,
+            "account-id",
+            1,
+            &token
+        ));
+        assert!(!verify_fixed_subscription_token(
+            secret,
+            "other-account",
+            1,
+            &token
+        ));
+        assert!(!verify_fixed_subscription_token(
+            secret,
+            "account-id",
+            2,
+            &token
+        ));
     }
 }

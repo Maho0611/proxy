@@ -118,6 +118,10 @@ pub async fn check_all(state: Arc<AppState>) -> Result<usize, String> {
     if total_checked > 0 {
         crate::api::fetch::invalidate_stats_cache(state.as_ref());
         crate::api::sub_export::invalidate_subscription_export_cache(state.as_ref());
+        let reconciled = crate::fixed_proxy::reconcile_all(&state).await;
+        if reconciled > 0 {
+            tracing::info!("Reconciled {reconciled} fixed exits after quality checks");
+        }
         tracing::info!("Quality check complete: {total_checked} proxies checked in this run");
     }
 

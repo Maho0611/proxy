@@ -1,4 +1,4 @@
-# 固定入口、动态出口模式维护文档
+# 固定入口、动态/固定出口模式维护文档
 
 > 最后更新：2026-08-04
 >
@@ -22,7 +22,7 @@
   → 目标网站
 ```
 
-业务程序只需要保存一个固定的代理地址。每次建立新的 TCP 连接时，ZenProxy 从符合条件的有效节点中选择出口。
+业务程序只需要保存一个固定的代理地址。随机和定时模式会按 URL 策略选择出口；固定槽位模式会持续使用已分配出口，并在失效后自动补充同国家的新出口。
 
 这种模式最适合：
 
@@ -129,6 +129,7 @@ USER:PASSWORD@SERVER_IP:50089
 | `-google` | 只选择 Google 可用出口 | `USER-google` |
 | `-type-TYPE` | 指定上游代理协议 | `USER-type-vless` |
 | `-session-ID-rotate-SECONDS` | 按 Session 在指定秒数内固定出口，到期轮换 | `USER-session-crawler_01-rotate-300` |
+| `-fixed-SLOT` | 使用当前数据库账号拥有的固定出口槽位 | `zp_xxx-fixed-f123abc` |
 
 后缀可以组合：
 
@@ -141,15 +142,15 @@ USER-country-US-session-crawler_01-rotate-300
 
 `session` 和 `rotate` 必须成对出现。Session ID 限制为 1～32 个字母、数字或下划线，轮换间隔为 1～86400 秒。
 
-网关模式目前不能通过用户名筛选：
+网关模式目前不能通过普通筛选后缀指定：
 
 - 风险评分。
 - 城市、州、省。
 - ASN。
 - ISP 或运营商。
 - 延迟。
-- 指定 `proxy_id`。
-- 指定一个具体出口 IP。
+- 任意未分配的 `proxy_id`。
+- 任意未分配的具体出口 IP。
 
 这些能力中的一部分已存在于 Relay API，但尚未接入 Listener 用户名语法。
 
@@ -184,10 +185,11 @@ USER-country-US-session-crawler_01-rotate-300
 
 ## 7. 轮换粒度与长连接
 
-出口是在新 TCP 连接建立时选择的，不是在每个 HTTP 请求时选择。当前有两种可同时使用的 URL 级别模式：
+出口是在新 TCP 连接建立时选择的，不是在每个 HTTP 请求时选择。当前有三种可同时使用的 URL 级别模式：
 
 - 不带 `session/rotate` 后缀：每个新 TCP 连接随机出口。
 - 带 `-session-ID-rotate-SECONDS`：同一账号、Session、间隔和筛选条件在到期前使用同一出口。
+- 带 `-fixed-SLOT`：持续使用持久化槽位当前分配的出口。
 
 客户端不复用连接时：
 
@@ -215,6 +217,29 @@ HTTP CONNECT 和 SOCKS5 隧道不能在连接中途无感更换 IP。强制切�
 - 没有其他可用出口时，允许以上一个出口作为最后可用性回退。
 - 服务重启会清空内存中的定时 Session，下一条连接会重新选择出口。
 
+### 7.1 固定出口槽位
+
+固定出口使用数据库账号拥有的持久化槽位，旧静态共享账号不能访问。槽位保存稳定的 `slot_key`、目标国家和可选质量条件，对外用户名形如：
+
+```text
+zp_xxx-fixed-f123abc
+```
+
+固定槽位遵循以下规则：
+
+- 健康期间持续使用当前已测出口 IP。
+- 出口无效、被订阅刷新标记为孤立或删除、出口 IP/国家变化时进入替换流程。
+- 替换只选择槽位原国家，并继续满足申请时选择的类型、住宅、ChatGPT、Google 条件。
+- 同一账号的不同槽位按出口 IP 去重。
+- 请求时连接失败会立即尝试最多 3 个同国家候选；并发请求通过每槽位锁收敛到一个结果。
+- 后台每 60 秒、验活后和质量检查后也会修复异常槽位。
+- 同国家没有候选时保持不可用并返回失败，不跨区回退。
+- 服务重启不会清空槽位，已建立的长连接仍然使用建立时的旧出口直到关闭。
+
+用户页面支持按条件批量申请（默认 10 个）、从质量列表手动固定、手动同区更换、订阅勾选和删除。订阅勾选只控制导出内容，不会停用已经复制的槽位 URL。
+
+固定订阅提供 Clash HTTP、Clash SOCKS5、HTTP URL 列表和 SOCKS5 URL 列表。链接使用账号独立、可轮换的 HMAC Token；内容只包含统一入口和槽位凭据，不泄露上游节点配置。
+
 旧项目需要“尽量每请求换 IP”时，应：
 
 - 关闭 HTTP Keep-Alive。
@@ -233,6 +258,7 @@ Listener 基于 Tokio 异步处理，可以：
 - 接受多台机器同时连接。
 - 接受同一账号的多个并发连接。
 - 按 URL 策略为每条新连接随机选点，或复用定时 Session 出口。
+- 并发使用持久化固定槽位，并在故障时收敛到同国家的新出口。
 - 共享已经创建的 sing-box 动态绑定。
 - 在连接传输期间保护绑定不被空闲清理。
 
@@ -278,7 +304,7 @@ Listener 基于 Tokio 异步处理，可以：
 - sing-box 最大动态绑定预算。
 - 大量短连接带来的绑定创建压力。
 - 同一热门出口被大量连接复用时的上游并发限制。
-- Listener 连接失败目前不会像 Relay 一样立即回写失败状态。
+- 普通随机 Listener 连接失败不会像 Relay 一样立即回写失败状态；固定槽位会立即更换槽位映射，但节点全局有效性仍由验活任务维护。
 
 ## 10. 配置
 
@@ -412,6 +438,7 @@ done
 | 外网无法连接、localhost 正常 | UFW、云厂商安全组或运营商端口限制 |
 | 域名连接失败、IP 正常 | 域名经过 Cloudflare；非标准 TCP 端口需 DNS-only |
 | 节点失败但后台仍显示 Valid | Listener 失败尚未回写节点状态，等待后台验活 |
+| 固定槽位显示待替换 | 同国家暂无满足原筛选条件的有效出口，等待订阅刷新或质检 |
 | 大量连接后端口不足 | 动态绑定预算或文件描述符上限不足 |
 
 ## 14. 目标体验与当前差距
@@ -441,6 +468,9 @@ USER_C:PASSWORD_C ─┘
 | Session 固定 IP | 已实现 | 保持 |
 | Session 指定间隔到期换 IP | 已实现 | 保持 |
 | 定时轮换优先避免上一个 IP | 已实现 | 保持 |
+| 固定槽位持续使用一个出口 | 已实现 | 保持 |
+| 失效后自动补充同国家出口 | 已实现 | 保持 |
+| 用户选择订阅槽位及导出链接 | 已实现 | 保持 |
 | 严格每请求换 IP | 未实现 | 不作为账号改造前置条件 |
 
 明确不在范围内：
@@ -459,6 +489,7 @@ USER_C:PASSWORD_C ─┘
 - 每个账号密码由服务端 HMAC-SHA256 主密钥、账号 ID 和凭据版本派生，不能使用简单人工密码。
 - 数据库不保存明文密码或密码摘要，只保存 `credential_version`；主密钥仅保存在服务端环境变量中。
 - 查看凭据接口必须返回 `Cache-Control: no-store`，前端不得把代理密码写入 localStorage。
+- 固定订阅 Token 与代理密码独立派生和轮换；订阅响应使用 `Cache-Control: no-store`，完整链接按凭据管理。
 - 日志不得记录密码、`Proxy-Authorization` 或完整代理 URL。
 - 管理账号 API 只允许管理员访问。
 - 如果使用者来源 IP 固定，仍建议通过 UFW 收紧 `50089` 和 Docker routed 规则。
@@ -626,6 +657,47 @@ ZENPROXY_PUBLIC_PROXY_PORT=50089
 - 每日流量统计报表。
 - 专属池、独享 IP 和复杂权限。
 - 公开注册和用户自助购买。
+
+## 17. 固定出口实现维护
+
+### 17.1 持久化结构
+
+`fixed_proxy_slots` 保存账号拥有的槽位、稳定 `slot_key`、原国家、替换筛选条件、当前 `proxy_id`/出口 IP、订阅勾选及最近替换信息。`proxy_id` 故意不建立外键：上游订阅或验活流程可以正常删除代理行，槽位巡检随后检测缺失并同区补位。
+
+同一账号通过 `(account_id, exit_ip)` 唯一约束避免多个槽位指向同一真实出口。账号删除时槽位通过 `account_id` 外键级联删除。
+
+`fixed_proxy_subscriptions` 只保存账号的 Token 版本，不保存明文 Token。Token 使用主密钥、账号 ID 和版本通过 HMAC-SHA256 派生，轮换版本即可让旧链接失效。
+
+### 17.2 用户 API
+
+管理接口支持 Discord Session 或 API Key Bearer，且始终根据认证用户解析自己的代理账号：
+
+```text
+GET    /api/fixed-exits
+POST   /api/fixed-exits
+POST   /api/fixed-exits/pin
+PATCH  /api/fixed-exits/:id
+POST   /api/fixed-exits/:id/replace
+DELETE /api/fixed-exits/:id
+POST   /api/fixed-exits/subscription/rotate-token
+```
+
+固定订阅是持有 Token 即可访问的只读端点：
+
+```text
+/fixed-sub/{account_id}/{token}/clash-http.yaml
+/fixed-sub/{account_id}/{token}/clash-socks5.yaml
+/fixed-sub/{account_id}/{token}/http.txt
+/fixed-sub/{account_id}/{token}/socks5.txt
+```
+
+所有固定订阅响应均使用 `Cache-Control: no-store`。代理密码轮换不会修改订阅链接，但客户端需要刷新订阅以取得新密码；订阅 Token 轮换不影响固定槽位 URL。
+
+### 17.3 自动替换并发语义
+
+请求首先尝试槽位当前出口。需要替换时以槽位 ID 获取 Tokio 锁，并在持锁后重新读取数据库；如果其他请求或后台任务已经完成替换，就直接复用新映射。否则从同国家且满足原条件的唯一出口中选择候选，真实连接成功后才更新槽位。
+
+后台巡检和请求时切换共用相同槽位锁。后台可以根据已有验活/质量结果提前修复；请求路径负责最后一道真实连接故障切换。替换只影响随后建立的新连接，不中断旧连接。
 
 ### 16.10 验收标准
 

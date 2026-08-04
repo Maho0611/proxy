@@ -354,6 +354,7 @@ password = "mypassword"
 | `-google` | Google 可访问 | `myuser-google` |
 | `-type-TYPE` | 指定代理类型 | `myuser-type-vmess` |
 | `-session-ID-rotate-SECONDS` | 指定时间内固定出口，到期轮换 | `myuser-session-crawler_01-rotate-300` |
+| `-fixed-SLOT` | 使用已申请的固定出口槽位 | `zp_xxx-fixed-f123abc` |
 
 后缀可自由组合：`myuser-country-US-residential-chatgpt`
 
@@ -372,6 +373,9 @@ curl -x http://myuser-chatgpt:mypass@proxy.example.com:1080 https://httpbin.org/
 # HTTP CONNECT — crawler_01 在 5 分钟内固定出口，到期后换 IP
 curl -x http://myuser-session-crawler_01-rotate-300:mypass@proxy.example.com:1080 https://httpbin.org/ip
 
+# HTTP CONNECT — 使用数据库账号已申请的固定出口槽位
+curl -x http://zp_xxx-fixed-f123abc:mypass@proxy.example.com:1080 https://httpbin.org/ip
+
 # 多次请求验证 IP 轮换
 for i in $(seq 1 5); do
   curl -s -x socks5://myuser:mypass@proxy.example.com:1080 https://httpbin.org/ip
@@ -380,9 +384,36 @@ done
 
 Session ID 限制为 1～32 个字母、数字或下划线，间隔支持 1～86400 秒。不带定时后缀的 URL 仍按每个新 TCP 连接随机出口；同一账号可以同时使用普通随机 URL 和多个独立的定时 Session URL。已建立的长连接不会在中途切换 IP。
 
+固定出口槽位由登录用户在仪表盘自行申请，旧静态 Listener 账号不能伪造或使用数据库槽位。槽位正常时持续使用同一个已测出口 IP；出口失效、被上游订阅移除、出口 IP 或国家变化时，系统只从槽位原国家选择替代出口。槽位用户名保持不变，且不会跨国家回退。
+
 > **重试机制：** 连接失败时自动重试最多 3 个不同的代理节点。
 
 > **Docker 部署：** `compose.yml` 已包含代理端口映射。在 `.env` 中设置 `ZENPROXY_PROXY_PORT`（远程客户端连接的宿主机端口）和 `ZENPROXY_PROXY_LISTENER=user:strong-password@0.0.0.0:1080` 即可。容器内端口固定为 1080，避免与宿主机上其他服务的端口冲突。
+
+#### 固定出口管理与订阅
+
+固定出口管理接口接受登录会话或 `Authorization: Bearer {api_key}`，每个账号最多保存 50 个槽位（技术安全上限，不涉及计费或额度）：
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| `GET /api/fixed-exits` | 查看自己的槽位和订阅链接 |
+| `POST /api/fixed-exits` | 按国家、类型和质量条件批量申请 |
+| `POST /api/fixed-exits/pin` | 把指定 `proxy_id` 加入固定槽位 |
+| `PATCH /api/fixed-exits/:id` | 修改名称或是否加入订阅 |
+| `POST /api/fixed-exits/:id/replace` | 手动更换同国家出口 |
+| `DELETE /api/fixed-exits/:id` | 删除槽位 |
+| `POST /api/fixed-exits/subscription/rotate-token` | 轮换固定订阅 Token |
+
+批量申请示例：
+
+```bash
+curl -X POST https://proxy.mui.moe/api/fixed-exits \
+  -H "Authorization: Bearer <api_key>" \
+  -H "Content-Type: application/json" \
+  -d '{"count":10,"country":"US","residential":false}'
+```
+
+每个账号会生成四种独立订阅地址：Clash HTTP、Clash SOCKS5、HTTP URL 列表和 SOCKS5 URL 列表。订阅只包含用户勾选的槽位，只暴露统一网关及槽位凭据，不包含真实上游节点配置。订阅 Token 可以单独轮换；代理密码轮换后，重新刷新原订阅链接即可获得新密码。
 
 #### 代理列表（/api/proxies）
 

@@ -2,6 +2,7 @@ pub mod admin;
 pub mod auth;
 pub mod client_fetch;
 pub mod fetch;
+pub mod fixed_proxy;
 pub mod proxy_access;
 pub mod relay;
 pub mod sub_export;
@@ -38,6 +39,23 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(
             "/api/proxy-access/rotate-password",
             post(proxy_access::rotate_user_credential),
+        )
+        .route(
+            "/api/fixed-exits",
+            get(fixed_proxy::get_fixed_exits).post(fixed_proxy::allocate_fixed_exits),
+        )
+        .route("/api/fixed-exits/pin", post(fixed_proxy::pin_fixed_exits))
+        .route(
+            "/api/fixed-exits/subscription/rotate-token",
+            post(fixed_proxy::rotate_fixed_subscription_token),
+        )
+        .route(
+            "/api/fixed-exits/:id",
+            patch(fixed_proxy::update_fixed_exit).delete(fixed_proxy::delete_fixed_exit),
+        )
+        .route(
+            "/api/fixed-exits/:id/replace",
+            post(fixed_proxy::replace_fixed_exit),
         );
 
     // Admin routes — protected by admin password
@@ -109,6 +127,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(
             "/sub/:token/:selector/clash.yaml",
             get(sub_export::export_subscription_clash),
+        )
+        .route(
+            "/fixed-sub/:account_id/:token/:format",
+            get(fixed_proxy::export_fixed_subscription),
         );
 
     // Page routes — no auth

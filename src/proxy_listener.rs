@@ -356,6 +356,9 @@ async fn connect_through_pool(
     target_host: &str,
     target_port: u16,
 ) -> Result<(TcpStream, BindingUseGuard), String> {
+    if let Some(fixed) = routing.fixed.as_ref() {
+        return connect_through_fixed_exit(state, fixed, target_host, target_port).await;
+    }
     if let Some(rotation) = routing.rotation.as_ref() {
         return connect_through_timed_rotation(
             state,
@@ -373,6 +376,100 @@ async fn connect_through_pool(
     let (upstream, guard, _) =
         connect_candidates(state, &candidates, target_host, target_port).await?;
     Ok((upstream, guard))
+}
+
+async fn connect_through_fixed_exit(
+    state: &Arc<AppState>,
+    fixed: &FixedExitRouting,
+    target_host: &str,
+    target_port: u16,
+) -> Result<(TcpStream, BindingUseGuard), String> {
+    let initial = state
+        .db
+        .get_fixed_proxy_slot_by_key(&fixed.account_id, &fixed.slot_key)
+        .map_err(|error| format!("Failed to load fixed exit: {error}"))?
+        .ok_or_else(|| "Fixed exit slot not found".to_string())?;
+    let (mut replacement_reason, mut force_different) =
+        match crate::fixed_proxy::current_slot_proxy(state, &initial) {
+            Ok(proxy) => {
+                match connect_candidates(state, &[proxy], target_host, target_port).await {
+                    Ok((upstream, guard, _)) => return Ok((upstream, guard)),
+                    Err(error) => {
+                        tracing::debug!(
+                            slot_id = initial.id,
+                            proxy_id = initial.proxy_id,
+                            "Fixed exit failed and will be replaced: {error}"
+                        );
+                        ("connect_failed".to_string(), true)
+                    }
+                }
+            }
+            Err(reason) => (reason, false),
+        };
+
+    let lock = crate::fixed_proxy::slot_lock(state, &initial.id);
+    let _guard = lock.lock().await;
+    let slot = state
+        .db
+        .get_fixed_proxy_slot_by_id(&fixed.account_id, &initial.id)
+        .map_err(|error| format!("Failed to reload fixed exit: {error}"))?
+        .ok_or_else(|| "Fixed exit slot no longer exists".to_string())?;
+
+    // Another connection or the periodic reconciler may have repaired the
+    // slot while this request waited for its lock. Reuse that winner first.
+    if slot.proxy_id != initial.proxy_id || slot.exit_ip != initial.exit_ip {
+        if let Ok(proxy) = crate::fixed_proxy::current_slot_proxy(state, &slot) {
+            if let Ok((upstream, guard, _)) =
+                connect_candidates(state, &[proxy], target_host, target_port).await
+            {
+                return Ok((upstream, guard));
+            }
+            replacement_reason = "connect_failed".into();
+            force_different = true;
+        }
+    }
+
+    let mut candidates = crate::fixed_proxy::replacement_candidates(state, &slot, force_different)?;
+    candidates.truncate(MAX_CONNECT_ATTEMPTS);
+    let mut last_error = "No same-country replacement candidates".to_string();
+    for candidate in candidates {
+        match connect_candidates(
+            state,
+            std::slice::from_ref(&candidate),
+            target_host,
+            target_port,
+        )
+        .await
+        {
+            Ok((upstream, guard, selected)) => {
+                match crate::fixed_proxy::update_assignment(
+                    state,
+                    &slot,
+                    &selected,
+                    &replacement_reason,
+                ) {
+                    Ok(updated) => {
+                        tracing::info!(
+                            slot_id = updated.id,
+                            account_id = updated.account_id,
+                            country = updated.country,
+                            exit_ip = updated.exit_ip,
+                            reason = replacement_reason,
+                            "Fixed exit slot replaced during connection"
+                        );
+                        return Ok((upstream, guard));
+                    }
+                    Err(error) if error.contains("already assigned") => {
+                        last_error = error;
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            Err(error) => last_error = error,
+        }
+    }
+    Err(format!("Fixed exit replacement failed: {last_error}"))
 }
 
 async fn connect_through_timed_rotation(
@@ -698,6 +795,12 @@ struct ProxyAuthentication {
 struct ProxyRouting {
     filter: ProxyFilter,
     rotation: Option<TimedRotation>,
+    fixed: Option<FixedExitRouting>,
+}
+
+struct FixedExitRouting {
+    account_id: String,
+    slot_key: String,
 }
 
 struct TimedRotation {
@@ -710,6 +813,7 @@ struct TimedRotation {
 struct ParsedUsernameOptions {
     filter: ProxyFilter,
     rotation: Option<RotationDirective>,
+    fixed_slot_key: Option<String>,
 }
 
 struct RotationDirective {
@@ -778,7 +882,13 @@ fn authenticate_static_and_parse(
     if !suffix.starts_with('-') {
         return None;
     }
-    parse_username_suffix(&suffix[1..])
+    let parsed = parse_username_suffix(&suffix[1..])?;
+    // Fixed slots are database-owned resources and are intentionally not
+    // exposed through the legacy static listener credential.
+    if parsed.fixed_slot_key.is_some() {
+        return None;
+    }
+    Some(parsed)
 }
 
 fn build_proxy_authentication(
@@ -797,10 +907,17 @@ fn build_proxy_authentication(
         session_id: directive.session_id,
         interval_secs: directive.interval_secs,
     });
+    let fixed = parsed.fixed_slot_key.map(|slot_key| FixedExitRouting {
+        account_id: account_id
+            .clone()
+            .expect("fixed slots are rejected for static listener accounts"),
+        slot_key,
+    });
     ProxyAuthentication {
         routing: ProxyRouting {
             filter: parsed.filter,
             rotation,
+            fixed,
         },
         account_id,
     }
@@ -836,6 +953,9 @@ fn parse_username_suffix(suffix: &str) -> Option<ParsedUsernameOptions> {
     let mut filter = ProxyFilter::default();
     let mut session_id = None;
     let mut interval_secs = None;
+    let mut fixed_slot_key = None;
+    let mut saw_filter = false;
+    let mut saw_unknown = false;
     let parts: Vec<&str> = suffix.split('-').collect();
     let mut i = 0;
     while i < parts.len() {
@@ -843,6 +963,7 @@ fn parse_username_suffix(suffix: &str) -> Option<ParsedUsernameOptions> {
             "country" => {
                 if i + 1 < parts.len() {
                     filter.country = Some(parts[i + 1].to_uppercase());
+                    saw_filter = true;
                     i += 2;
                 } else {
                     i += 1;
@@ -851,6 +972,7 @@ fn parse_username_suffix(suffix: &str) -> Option<ParsedUsernameOptions> {
             "type" => {
                 if i + 1 < parts.len() {
                     filter.proxy_type = Some(parts[i + 1].to_string());
+                    saw_filter = true;
                     i += 2;
                 } else {
                     i += 1;
@@ -858,14 +980,17 @@ fn parse_username_suffix(suffix: &str) -> Option<ParsedUsernameOptions> {
             }
             "residential" => {
                 filter.residential = true;
+                saw_filter = true;
                 i += 1;
             }
             "chatgpt" => {
                 filter.chatgpt = true;
+                saw_filter = true;
                 i += 1;
             }
             "google" => {
                 filter.google = true;
+                saw_filter = true;
                 i += 1;
             }
             "session" => {
@@ -888,8 +1013,19 @@ fn parse_username_suffix(suffix: &str) -> Option<ParsedUsernameOptions> {
                 interval_secs = Some(value);
                 i += 2;
             }
+            "fixed" => {
+                let value = parts.get(i + 1).copied()?;
+                if fixed_slot_key.is_some() || !crate::fixed_proxy::valid_slot_key(value) {
+                    return None;
+                }
+                fixed_slot_key = Some(value.to_string());
+                i += 2;
+            }
             _ => {
                 // Unknown token, skip
+                if !parts[i].is_empty() {
+                    saw_unknown = true;
+                }
                 i += 1;
             }
         }
@@ -904,7 +1040,15 @@ fn parse_username_suffix(suffix: &str) -> Option<ParsedUsernameOptions> {
         _ => return None,
     };
 
-    Some(ParsedUsernameOptions { filter, rotation })
+    if fixed_slot_key.is_some() && (rotation.is_some() || saw_filter || saw_unknown) {
+        return None;
+    }
+
+    Some(ParsedUsernameOptions {
+        filter,
+        rotation,
+        fixed_slot_key,
+    })
 }
 
 fn rotation_key(
@@ -1104,6 +1248,31 @@ mod tests {
         assert!(parse_username_suffix("session-good-rotate-0").is_none());
         assert!(parse_username_suffix("session-good-rotate-86401").is_none());
         assert!(parse_username_suffix("session-a-session-b-rotate-30").is_none());
+    }
+
+    #[test]
+    fn fixed_exit_suffix_is_exclusive_and_strict() {
+        let parsed = parse_username_suffix("fixed-f123_abc").unwrap();
+        assert_eq!(parsed.fixed_slot_key.as_deref(), Some("f123_abc"));
+        assert!(parsed.rotation.is_none());
+        assert!(parsed.filter.country.is_none());
+
+        assert!(parse_username_suffix("fixed-bad$key").is_none());
+        assert!(parse_username_suffix("fixed-one-fixed-two").is_none());
+        assert!(parse_username_suffix("fixed-one-country-US").is_none());
+        assert!(parse_username_suffix("fixed-one-session-app-rotate-60").is_none());
+        assert!(parse_username_suffix("fixed-one-unknown").is_none());
+    }
+
+    #[test]
+    fn static_credentials_cannot_claim_database_fixed_slots() {
+        let cfg = crate::config::ProxyListenerConfig {
+            name: "test".into(),
+            listen: "0.0.0.0:1080".into(),
+            username: "admin".into(),
+            password: "secret".into(),
+        };
+        assert!(authenticate_static_and_parse(&cfg, "admin-fixed-f123_abc", "secret").is_none());
     }
 
     #[test]

@@ -54,6 +54,12 @@ pub async fn get_user_access(
                 "min_interval_secs": crate::proxy_rotation::MIN_INTERVAL_SECS,
                 "max_interval_secs": crate::proxy_rotation::MAX_INTERVAL_SECS,
                 "max_session_id_length": crate::proxy_rotation::MAX_SESSION_ID_LEN,
+            },
+            "fixed": {
+                "enabled": true,
+                "username_suffix": "fixed-{slot_key}",
+                "max_slots_per_account": crate::fixed_proxy::MAX_SLOTS_PER_ACCOUNT,
+                "replacement_scope": "country",
             }
         },
     })))
@@ -225,7 +231,7 @@ pub async fn rotate_admin_credential(
     Ok(no_store_credential_response(&state, &account))
 }
 
-fn ensure_credentials_configured(state: &AppState) -> Result<(), AppError> {
+pub(crate) fn ensure_credentials_configured(state: &AppState) -> Result<(), AppError> {
     if state.config.proxy_access.credential_secret.as_bytes().len() < 32 {
         return Err(AppError::BadRequest(
             "Proxy account credentials are not configured".into(),
@@ -234,7 +240,10 @@ fn ensure_credentials_configured(state: &AppState) -> Result<(), AppError> {
     Ok(())
 }
 
-fn get_or_create_user_account(state: &AppState, user: &User) -> Result<ProxyAccount, AppError> {
+pub(crate) fn get_or_create_user_account(
+    state: &AppState,
+    user: &User,
+) -> Result<ProxyAccount, AppError> {
     if !state.config.proxy_access.accounts_enabled() {
         return Err(AppError::BadRequest(
             "Independent proxy accounts are not enabled".into(),
@@ -251,7 +260,12 @@ fn get_or_create_user_account(state: &AppState, user: &User) -> Result<ProxyAcco
         label: automatic_account_label(user),
         username: format!(
             "zp_{}",
-            uuid::Uuid::new_v4().simple().to_string().chars().take(12).collect::<String>()
+            uuid::Uuid::new_v4()
+                .simple()
+                .to_string()
+                .chars()
+                .take(12)
+                .collect::<String>()
         ),
         owner_user_id: Some(user.id.clone()),
         enabled: true,
@@ -357,7 +371,7 @@ fn no_store_credential_response(state: &AppState, account: &ProxyAccount) -> Res
     response
 }
 
-fn gateway_json(state: &AppState) -> Value {
+pub(crate) fn gateway_json(state: &AppState) -> Value {
     json!({
         "host": state.config.proxy_access.public_host,
         "port": state.config.proxy_access.public_port,
