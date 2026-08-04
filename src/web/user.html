@@ -102,6 +102,40 @@ tr:hover td { background:rgba(108,99,255,.03); }
 .pagination button.active { background:var(--primary); border-color:var(--primary); color:#fff; }
 .pagination button:disabled { opacity:.4; cursor:default; }
 .pagination .page-info { font-size:13px; color:var(--text-dim); margin:0 8px; }
+.proxy-card { padding:8px 12px 14px; overflow-x:hidden; }
+.proxy-table { table-layout:fixed; }
+.proxy-table th, .proxy-table td { padding:10px 8px; vertical-align:middle; }
+.proxy-table th { white-space:nowrap; }
+.proxy-table td { white-space:normal; overflow-wrap:anywhere; line-height:1.35; }
+.proxy-table .cell-primary { color:var(--text-bright); font-weight:600; }
+.proxy-table .cell-meta { color:var(--text-dim); font-size:10px; margin-top:4px; }
+.proxy-table .proxy-node-cell .badge { margin-top:5px; }
+.proxy-table .proxy-endpoint { font-family:Consolas,"Courier New",monospace; font-size:11px; word-break:break-all; }
+.proxy-table .proxy-owner-cell { font-size:11px; }
+.proxy-table .proxy-owner-cell .cell-primary { font-weight:500; }
+.proxy-table .unlock-summary { display:flex; flex-wrap:wrap; align-items:center; gap:5px 8px; }
+.proxy-table .unlock-item { display:inline-flex; align-items:center; gap:4px; color:var(--text-dim); font-size:10px; white-space:nowrap; }
+.proxy-table .unlock-item .badge { padding:2px 5px; }
+.proxy-table .unlock-toggle { flex-basis:100%; width:max-content; display:inline-flex; align-items:center; gap:4px; padding:1px 0; border:0; background:transparent; color:var(--primary); font:10px Consolas,monospace; cursor:pointer; }
+.proxy-table .unlock-toggle::before { content:"▸"; display:inline-block; transition:transform .16s ease; }
+.proxy-table .unlock-toggle[aria-expanded="true"]::before { transform:rotate(90deg); }
+.proxy-table .unlock-toggle:hover { color:var(--primary-hover); }
+.proxy-table .unlock-detail-row td { padding:0 8px 12px; background:rgba(108,99,255,.018); }
+.proxy-table .unlock-detail-row:hover td { background:rgba(108,99,255,.018); }
+.proxy-table .unlock-detail-panel { padding:12px 14px 14px; border:1px solid var(--border); border-left:2px solid var(--primary); background:rgba(15,17,23,.78); }
+.proxy-table .unlock-detail-header { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:10px; color:var(--text-bright); font-size:11px; }
+.proxy-table .unlock-detail-header span { color:var(--success); font:10px Consolas,monospace; }
+.proxy-table .unlock-detail-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:6px 12px; }
+.proxy-table .unlock-detail-item { min-width:0; display:flex; align-items:center; justify-content:space-between; gap:12px; padding:6px 8px; border:1px solid var(--border); background:rgba(26,29,39,.9); font-size:10px; }
+.proxy-table .unlock-detail-name { overflow:hidden; color:var(--text); text-overflow:ellipsis; white-space:nowrap; }
+.proxy-table .unlock-detail-state { flex:none; font-family:Consolas,monospace; white-space:nowrap; }
+.proxy-table .unlock-detail-state.is-available { color:var(--success); }
+.proxy-table .unlock-detail-state.is-unavailable { color:var(--danger); }
+.proxy-table .unlock-detail-state.is-error { color:var(--text-dim); }
+.proxy-table .proxy-check-cell { font-size:10px; }
+.proxy-table .proxy-check-cell .badge { margin-top:4px; }
+.proxy-table .proxy-action-cell { text-align:right; }
+@media(max-width:1100px) { .proxy-card { overflow-x:auto; } .proxy-table { min-width:1040px; } }
 </style>
 </head>
 <body>
@@ -287,6 +321,14 @@ tr:hover td { background:rgba(108,99,255,.03); }
         <option value="invalid">无效</option>
         <option value="untested">待检测</option>
       </select>
+      <select id="f-type" onchange="resetProxyCursor();loadProxies()">
+        <option value="">全部类型</option>
+        <option value="vmess">VMess</option>
+        <option value="vless">VLESS</option>
+        <option value="trojan">Trojan</option>
+        <option value="shadowsocks">Shadowsocks</option>
+        <option value="hysteria2">Hysteria2</option>
+      </select>
       <select id="f-quality" onchange="resetProxyCursor();loadProxies()">
         <option value="">全部质量</option>
         <option value="chatgpt">ChatGPT 可用</option>
@@ -295,23 +337,22 @@ tr:hover td { background:rgba(108,99,255,.03); }
         <option value="unchecked">未质检</option>
       </select>
     </div>
-    <div class="card">
-      <table>
+    <div class="card proxy-card">
+      <table class="proxy-table">
+        <colgroup>
+          <col style="width:15%"><col style="width:14%"><col style="width:8%">
+          <col style="width:12%"><col style="width:17%"><col style="width:7%">
+          <col style="width:11%"><col style="width:7%"><col style="width:9%">
+        </colgroup>
         <thead><tr>
-          <th onclick="sortBy('name')">名称</th>
-          <th onclick="sortBy('type')">类型</th>
-          <th onclick="sortBy('server')">服务器</th>
-          <th onclick="sortBy('is_valid')">状态</th>
-          <th>IP</th>
-          <th onclick="sortBy('country')">国家</th>
-          <th>IP类型</th>
+          <th onclick="sortBy('name')">节点</th>
+          <th onclick="sortBy('server')">服务端 / 接入</th>
+          <th onclick="sortBy('is_valid')">运行状态</th>
+          <th onclick="sortBy('country')">IP 概况</th>
           <th>ASN / 机构</th>
           <th onclick="sortBy('risk')">风险</th>
-          <th>ChatGPT</th>
-          <th>Google</th>
-          <th>更多解锁</th>
-          <th>住宅</th>
-          <th>质检状态</th>
+          <th>流媒体解锁</th>
+          <th>质检时间</th>
           <th>固定出口</th>
         </tr></thead>
         <tbody id="proxy-table"></tbody>
@@ -391,6 +432,7 @@ function toast(msg) {
 }
 
 function esc(s) { if (!s) return ''; const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+function fmtDate(s) { return s ? new Date(s).toLocaleString() : '-'; }
 
 function maskKey(key) {
   if (!key || key.length < 12) return key;
@@ -810,9 +852,11 @@ async function loadProxies() {
     });
     const search = document.getElementById('f-search').value.trim();
     const status = document.getElementById('f-status').value;
+    const type = document.getElementById('f-type').value;
     const quality = document.getElementById('f-quality').value;
     if (search) params.set('search', search);
     if (status) params.set('status', status);
+    if (type) params.set('type', type);
     if (quality) params.set('quality', quality);
     if (proxyCursor) {
       params.set('cursor', proxyCursor);
@@ -849,7 +893,7 @@ function renderProxies() {
   if (!currentProxies.length) { tb.innerHTML = ''; empty.style.display = ''; renderPagination(0, 0); return; }
   empty.style.display = 'none';
 
-  tb.innerHTML = currentProxies.map(p => {
+  tb.innerHTML = currentProxies.map((p, index) => {
     const q = p.quality;
     const yes = '<span class="badge badge-valid">Yes</span>';
     const no = '<span class="badge badge-invalid">No</span>';
@@ -861,23 +905,24 @@ function renderProxies() {
     }
     const ipOwner = renderIpOwner(q);
     const unlockDetails = renderUnlockDetails(q);
+    const unlockDetailId = `user-unlock-detail-${index}`;
+    const ipMeta = q
+      ? [q.country, q.ip_type, q.is_residential ? '住宅' : '非住宅'].filter(Boolean).map(esc).join(' · ')
+      : '-';
+    const fixedAction = p.status === 'valid' && q && q.ip_address && q.country
+      ? `<button class="btn btn-outline btn-sm" onclick="pinFixedProxy('${p.id}')">固定此出口</button>`
+      : '<span class="cell-meta">需有效 IP/国家</span>';
     return `<tr>
-      <td>${esc(p.name)}</td>
-      <td><span class="badge badge-type">${esc(p.type)}</span></td>
-      <td>${esc(p.server)}:${p.port}</td>
-      <td>${p.status==='valid'?'<span class="badge badge-valid">有效</span>':p.status==='untested'?'<span class="badge badge-untested">待检测</span>':'<span class="badge badge-invalid">无效</span>'}</td>
-      <td>${q && q.ip_address ? esc(q.ip_address) : '-'}</td>
-      <td>${q && q.country ? esc(q.country) : '-'}</td>
-      <td>${q && q.ip_type ? esc(q.ip_type) : '-'}</td>
-      <td>${ipOwner}</td>
+      <td class="proxy-node-cell"><div class="cell-primary">${esc(p.name)}</div><span class="badge badge-type">${esc(p.type)}</span></td>
+      <td><div class="cell-primary proxy-endpoint">${esc(p.server)}:${p.port}</div><div class="cell-meta">接入端口 ${p.local_port || '未分配'}</div></td>
+      <td>${p.status==='valid'?'<span class="badge badge-valid">有效</span>':p.status==='untested'?'<span class="badge badge-untested">待检测</span>':'<span class="badge badge-invalid">无效</span>'}<div class="cell-meta">错误 ${p.error_count ?? 0}</div></td>
+      <td><div class="cell-primary">${q && q.ip_address ? esc(q.ip_address) : '-'}</div><div class="cell-meta">${ipMeta}</div></td>
+      <td class="proxy-owner-cell">${ipOwner}</td>
       <td>${riskBadge}</td>
-      <td>${q ? (q.chatgpt ? yes : no) : na}</td>
-      <td>${q ? (q.google ? yes : no) : na}</td>
-      <td>${unlockDetails}</td>
-      <td>${q ? (q.is_residential ? yes : no) : na}</td>
-      <td>${q ? (q.stale ? '<span class="badge badge-invalid">已过期</span>' : '<span class="badge badge-valid">最新</span>') : na}</td>
-      <td>${p.status==='valid' && q && q.ip_address && q.country ? `<button class="btn btn-outline btn-sm" onclick="pinFixedProxy('${p.id}')">固定此出口</button>` : '-'}</td>
-    </tr>`;
+      <td><div class="unlock-summary"><span class="unlock-item">GPT ${q ? (q.chatgpt ? yes : no) : na}</span><span class="unlock-item">Google ${q ? (q.google ? yes : no) : na}</span>${unlockDetails.panel ? `<button type="button" class="unlock-toggle" aria-expanded="false" aria-controls="${unlockDetailId}" onclick="toggleUnlockRow(this)">${unlockDetails.summary}</button>` : '<span class="cell-meta">无详细检测</span>'}</div></td>
+      <td class="proxy-check-cell">${q && q.checked_at ? `${fmtDate(q.checked_at)}${q.stale ? ' <br><span class="badge badge-invalid">已过期</span>' : ''}` : '-'}</td>
+      <td class="proxy-action-cell">${fixedAction}</td>
+    </tr>${unlockDetails.panel ? `<tr class="unlock-detail-row" id="${unlockDetailId}" hidden><td colspan="9">${unlockDetails.panel}</td></tr>` : ''}`;
   }).join('');
 
   renderPagination(proxyFiltered, proxyTotalPages);
@@ -901,21 +946,33 @@ function renderIpOwner(q) {
   else if (ip.is_residential === true) flags.push('住宅');
   const location = [ip.city, ip.region, ip.country].filter(Boolean).join(', ');
   if (!asn && !org && !flags.length) return '-';
-  return `<div title="${esc(location)}">${esc([asn, org].filter(Boolean).join(' · '))}${flags.length?`<br><span style="color:var(--text-dim);font-size:11px">${esc(flags.join(' · '))}</span>`:''}</div>`;
+  return `<div title="${esc(location)}"><div class="cell-primary">${esc([asn, org].filter(Boolean).join(' · '))}</div>${flags.length ? `<div class="cell-meta">${esc(flags.join(' · '))}</div>` : ''}</div>`;
 }
 
 function renderUnlockDetails(q) {
   const checks = q?.details?.unlock;
-  if (!checks || typeof checks !== 'object') return '-';
+  if (!checks || typeof checks !== 'object') return {summary:'-', panel:''};
   const entries = Object.entries(checks);
+  if (!entries.length) return {summary:'-', panel:''};
   const passed = entries.filter(([, item]) => item?.available === true).length;
   const rows = entries.map(([key, item]) => {
     const state = item?.available === true ? 'Yes' : item?.available === false ? 'No' : 'Error';
-    const color = item?.available === true ? 'var(--success)' : item?.available === false ? 'var(--danger)' : 'var(--text-dim)';
+    const stateClass = item?.available === true ? 'is-available' : item?.available === false ? 'is-unavailable' : 'is-error';
     const region = item?.region ? ` (${item.region})` : '';
-    return `<div title="${esc(item?.detail || '')}" style="display:flex;justify-content:space-between;gap:12px"><span>${esc(unlockLabels[key] || key)}</span><span style="color:${color}">${esc(state + region)}</span></div>`;
+    return `<div class="unlock-detail-item" title="${esc(item?.detail || '')}"><span class="unlock-detail-name">${esc(unlockLabels[key] || key)}</span><span class="unlock-detail-state ${stateClass}">${esc(state + region)}</span></div>`;
   }).join('');
-  return `<details><summary style="cursor:pointer;white-space:nowrap">${passed}/${entries.length} 通过</summary><div style="min-width:210px;display:grid;gap:3px;margin-top:6px">${rows}</div></details>`;
+  return {
+    summary:`${passed}/${entries.length} 通过`,
+    panel:`<div class="unlock-detail-panel"><div class="unlock-detail-header">解锁检测详情 <span>${passed}/${entries.length} 通过</span></div><div class="unlock-detail-grid">${rows}</div></div>`
+  };
+}
+
+function toggleUnlockRow(button) {
+  const detailRow = button.closest('tr')?.nextElementSibling;
+  if (!detailRow?.classList.contains('unlock-detail-row')) return;
+  const expanded = button.getAttribute('aria-expanded') !== 'true';
+  button.setAttribute('aria-expanded', String(expanded));
+  detailRow.hidden = !expanded;
 }
 
 function renderPagination(total, totalPages) {
