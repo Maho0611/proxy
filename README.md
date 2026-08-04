@@ -539,7 +539,7 @@ docker compose up -d --build
 ```bash
 # sing-box（修改版）
 cd sing-box-zenproxy
-GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o sing-box -tags with_clash_api ./cmd/sing-box
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o sing-box -tags "with_clash_api with_utls with_quic" ./cmd/sing-box
 
 # Proxy Server
 cargo zigbuild --release --target x86_64-unknown-linux-gnu
@@ -899,7 +899,7 @@ curl -X POST http://127.0.0.1:9090/fetch \
 
 ```bash
 cd sing-box-zenproxy
-GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o sing-box -tags with_clash_api ./cmd/sing-box
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o sing-box -tags "with_clash_api with_utls with_quic" ./cmd/sing-box
 ```
 
 ### 客户端配置

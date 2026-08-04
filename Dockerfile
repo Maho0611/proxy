@@ -11,7 +11,7 @@ WORKDIR /src/sing-box-zenproxy
 COPY sing-box-zenproxy/go.mod sing-box-zenproxy/go.sum ./
 RUN go mod download
 COPY sing-box-zenproxy ./
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -tags "with_clash_api with_utls" -o /out/sing-box ./cmd/sing-box
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -tags "with_clash_api with_utls with_quic" -o /out/sing-box ./cmd/sing-box
 
 FROM debian:bookworm-slim
 RUN apt-get update \
