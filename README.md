@@ -307,8 +307,6 @@ curl -X POST "https://proxy.mui.moe/api/relay?api_key=xxx&url=https://api.exampl
 
 #### 代理池监听端口（Proxy Pool Listener）
 
-> 维护文档：[固定入口、动态出口模式](docs/fixed-entry-dynamic-exit.md)
-
 zenproxy 可以作为标准的 SOCKS5 / HTTP 代理服务器使用，每个新 TCP 连接自动从代理池随机选择一个节点。单个端口同时支持 SOCKS5 和 HTTP CONNECT（自动检测），并可让多个独立账号自然并发使用同一个共享代理池。
 
 迁移期推荐保留静态共享账号并同时启用独立账号：
@@ -317,7 +315,7 @@ zenproxy 可以作为标准的 SOCKS5 / HTTP 代理服务器使用，每个新 T
 ZENPROXY_PROXY_AUTH_MODE=hybrid
 ZENPROXY_PROXY_CREDENTIAL_SECRET=<openssl rand -hex 32>
 ZENPROXY_PUBLIC_PROXY_HOST=<服务器公网 IP 或 DNS-only 域名>
-ZENPROXY_PUBLIC_PROXY_PORT=50089
+ZENPROXY_PUBLIC_PROXY_PORT=1080
 ```
 
 每个 Discord 用户首次打开仪表盘时会自动获得独立代理账号，无需管理员分配。用户可直接选择协议、国家、上游类型和能力标签并复制多种格式的代理 URL；管理员只需在 `/admin` 处理启停、轮换和排障。数据库不保存代理明文密码。
@@ -388,7 +386,7 @@ Session ID 限制为 1～32 个字母、数字或下划线，间隔支持 1～86
 
 > **重试机制：** 连接失败时自动重试最多 3 个不同的代理节点。
 
-> **Docker 部署：** `compose.yml` 已包含代理端口映射。在 `.env` 中设置 `ZENPROXY_PROXY_PORT`（远程客户端连接的宿主机端口）和 `ZENPROXY_PROXY_LISTENER=user:strong-password@0.0.0.0:1080` 即可。容器内端口固定为 1080，避免与宿主机上其他服务的端口冲突。
+> **Docker 部署：** `docker-compose.yml` 已包含代理端口映射。在 `.env` 中设置 `ZENPROXY_PROXY_PORT`（远程客户端连接的宿主机端口）和 `ZENPROXY_PROXY_LISTENER=user:strong-password@0.0.0.0:1080` 即可。容器内端口固定为 1080。
 
 #### 固定出口管理与订阅
 
@@ -407,7 +405,7 @@ Session ID 限制为 1～32 个字母、数字或下划线，间隔支持 1～86
 批量申请示例：
 
 ```bash
-curl -X POST https://proxy.mui.moe/api/fixed-exits \
+curl -X POST https://proxy.example.com/api/fixed-exits \
   -H "Authorization: Bearer <api_key>" \
   -H "Content-Type: application/json" \
   -d '{"count":10,"country":"US","residential":false}'
@@ -518,11 +516,11 @@ https://proxy.mui.moe/sub/{subscription_password}/trojan/clash.yaml
 
 #### Docker Compose
 
-Compose 内置 PostgreSQL，并将 ZenProxy Web API 仅发布到宿主机回环地址，供宿主机 Nginx 提供 HTTPS。标准 SOCKS5/HTTP 代理端口按 `.env` 中的 `ZENPROXY_PROXY_PORT` 单独发布；PostgreSQL 不向宿主机发布端口。
+Compose 内置 Caddy 反代和 PostgreSQL。宿主机发布 Caddy 的 `80/443` 端口，并按 `.env` 中的 `ZENPROXY_PROXY_PORT` 发布标准 SOCKS5/HTTP 代理入口；PostgreSQL 不向宿主机发布端口。
 
 ```bash
 cp .env.example .env
-# 编辑 .env：设置 ZENPROXY_HOST_PORT、强代理密码和公开代理端口
+# 编辑 .env：设置站点地址、强代理密码和公开代理端口
 # 将 ZENPROXY_OAUTH_REDIRECT_URI 改为 https://proxy.example.com/api/auth/callback
 docker compose up -d --build
 ```

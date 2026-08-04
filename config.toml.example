@@ -57,7 +57,7 @@ auth_mode = "static"
 credential_secret = "replace-with-at-least-32-random-bytes"
 # 必须是远程客户端实际连接的公网 IP 或 DNS-only 域名，不能从网页域名推断。
 public_host = "SERVER_IP"
-public_port = 50089
+public_port = 1080
 
 [subscription]
 password = "change-subscription-password"

@@ -1,4 +1,24 @@
 services:
+  caddy:
+    image: caddy:2-alpine
+    container_name: zenproxy-caddy
+    restart: unless-stopped
+    depends_on:
+      - zenproxy
+    environment:
+      CADDY_SITE_ADDRESS: "${CADDY_SITE_ADDRESS:-http://localhost}"
+    ports:
+      - "${HTTP_PORT:-80}:80"
+      - "${HTTPS_PORT:-443}:443"
+      - "${HTTPS_PORT:-443}:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      - ingress
+      - backend
+
   zenproxy:
     build:
       context: .
@@ -25,11 +45,10 @@ services:
       ZENPROXY_PUBLIC_PROXY_HOST: "${ZENPROXY_PUBLIC_PROXY_HOST:-}"
       ZENPROXY_PUBLIC_PROXY_PORT: "${ZENPROXY_PUBLIC_PROXY_PORT:-0}"
     ports:
-      # 只允许宿主机上的 Nginx 访问，不向公网直接暴露 ZenProxy。
-      - "127.0.0.1:${ZENPROXY_HOST_PORT:?请在 .env 中设置 ZENPROXY_HOST_PORT}:3000"
       # 对外提供带账号密码认证的 SOCKS5 + HTTP 混合代理入口。
-      # 容器内监听端口固定为 1080，宿主机端口通过 .env 单独配置。
-      - "${ZENPROXY_PROXY_BIND_IP:-0.0.0.0}:${ZENPROXY_PROXY_PORT:?请在 .env 中设置 ZENPROXY_PROXY_PORT}:1080"
+      - "${ZENPROXY_PROXY_BIND_IP:-0.0.0.0}:${ZENPROXY_PROXY_PORT:-1080}:1080"
+    expose:
+      - "3000"
     volumes:
       - zenproxy_data:/app/data
     networks:
@@ -55,10 +74,13 @@ services:
       - backend
 
 networks:
+  ingress:
   backend:
     internal: true
   egress:
 
 volumes:
+  caddy_data:
+  caddy_config:
   postgres_data:
   zenproxy_data:
