@@ -1,6 +1,7 @@
 pub mod v2ray;
 pub mod clash;
 pub mod base64;
+pub mod freeproxy;
 pub mod plain;
 
 use serde::{Deserialize, Serialize};
@@ -63,6 +64,7 @@ pub fn parse_subscription(content: &str, sub_type: &str) -> Vec<ProxyConfig> {
         "v2ray" => base64::parse(content),
         "clash" => clash::parse(content),
         "base64" => base64::parse(content),
+        "freeproxy" => freeproxy::parse(content),
         "socks5" | "socks4" | "http" | "https" => plain::parse(content, sub_type),
         _ => {
             tracing::warn!("Unknown subscription type: {sub_type}, falling back to auto-detect");
@@ -72,6 +74,16 @@ pub fn parse_subscription(content: &str, sub_type: &str) -> Vec<ProxyConfig> {
 }
 
 pub fn parse_subscription_auto(content: &str) -> Vec<ProxyConfig> {
+    // FreeProxy's public feed and package exports are JSON documents.
+    let freeproxy_result = freeproxy::parse(content);
+    if !freeproxy_result.is_empty() {
+        tracing::info!(
+            "Auto-detect: parsed {} proxies as FreeProxy JSON",
+            freeproxy_result.len()
+        );
+        return freeproxy_result;
+    }
+
     // Try clash first (cheapest check: YAML with `proxies:` key)
     let clash_result = clash::parse(content);
     if !clash_result.is_empty() {
@@ -112,5 +124,21 @@ mod tests {
         assert_eq!(proxies.len(), 1);
         assert_eq!(proxies[0].server, "example.com");
         assert_eq!(proxies[0].port, 443);
+    }
+
+    #[test]
+    fn auto_detects_freeproxy_json() {
+        let content = r#"{
+          "updated_at": "2026-08-04 14:27:51 UTC",
+          "count": 1,
+          "data": [
+            {"ip":"192.0.2.1","port":8080,"protocol":"Http","country":"US"}
+          ]
+        }"#;
+
+        let proxies = parse_subscription(content, "auto");
+
+        assert_eq!(proxies.len(), 1);
+        assert_eq!(proxies[0].name, "[HTTP/US] 192.0.2.1:8080");
     }
 }

@@ -25,6 +25,16 @@ pub struct UpdateSubscriptionRequest {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct EditSubscriptionRequest {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub sub_type: String,
+    pub url: Option<String>,
+    pub content: Option<String>,
+    pub refresh_interval_mins: Option<i32>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct UpdateSubscriptionDefaultsRequest {
     pub refresh_interval_mins: i32,
 }
@@ -36,6 +46,7 @@ fn default_sub_type() -> String {
 fn subscription_user_agent(sub_type: &str) -> &'static str {
     match sub_type.to_ascii_lowercase().as_str() {
         "auto" | "clash" => "Clash.Meta",
+        "freeproxy" => "ZenProxy/1.0",
         _ => "v2rayN",
     }
 }
@@ -299,6 +310,85 @@ pub async fn update_subscription(
     Ok(Json(json!({
         "message": "Subscription settings updated",
         "refresh_interval_mins": req.refresh_interval_mins,
+    })))
+}
+
+pub async fn edit_subscription(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<EditSubscriptionRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let mut subscription = state
+        .db
+        .get_subscription(&id)?
+        .ok_or_else(|| AppError::NotFound("Subscription not found".into()))?;
+
+    let name = req.name.trim();
+    if name.is_empty() {
+        return Err(AppError::BadRequest("Subscription name is required".into()));
+    }
+
+    let sub_type = req.sub_type.trim().to_ascii_lowercase();
+    if !matches!(
+        sub_type.as_str(),
+        "auto"
+            | "v2ray"
+            | "clash"
+            | "base64"
+            | "freeproxy"
+            | "socks5"
+            | "socks4"
+            | "http"
+            | "https"
+    ) {
+        return Err(AppError::BadRequest(format!(
+            "Unsupported subscription type: {sub_type}"
+        )));
+    }
+
+    let url = req
+        .url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    let content = req
+        .content
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    if url.is_none() && content.is_none() {
+        return Err(AppError::BadRequest(
+            "Either 'url' or 'content' must be provided".into(),
+        ));
+    }
+
+    let refresh_interval_mins = validate_refresh_interval_mins(req.refresh_interval_mins)?;
+    if url.is_none() && refresh_interval_mins.unwrap_or(0) > 0 {
+        return Err(AppError::BadRequest(
+            "Auto-refresh requires a subscription URL".into(),
+        ));
+    }
+
+    subscription.name = name.to_owned();
+    subscription.sub_type = sub_type;
+    subscription.url = url;
+    subscription.content = if subscription.url.is_some() {
+        None
+    } else {
+        content
+    };
+    subscription.refresh_interval_mins = refresh_interval_mins;
+    subscription.updated_at = chrono::Utc::now().to_rfc3339();
+
+    state.db.update_subscription_settings(&subscription)?;
+    crate::api::sub_export::invalidate_subscription_export_cache(state.as_ref());
+    crate::api::fetch::invalidate_stats_cache(state.as_ref());
+
+    Ok(Json(json!({
+        "message": "Subscription updated",
+        "subscription": subscription,
     })))
 }
 
@@ -1081,6 +1171,7 @@ mod tests {
     fn subscription_user_agent_requests_the_selected_format() {
         assert_eq!(subscription_user_agent("auto"), "Clash.Meta");
         assert_eq!(subscription_user_agent("clash"), "Clash.Meta");
+        assert_eq!(subscription_user_agent("freeproxy"), "ZenProxy/1.0");
         assert_eq!(subscription_user_agent("base64"), "v2rayN");
         assert_eq!(subscription_user_agent("v2ray"), "v2rayN");
     }

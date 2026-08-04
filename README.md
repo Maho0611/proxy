@@ -48,10 +48,11 @@ Proxy 是一个代理池管理与转发服务，由两部分组成：
 
 | 类型 | 说明 |
 |------|------|
-| `auto` | 自动检测（默认），依次尝试 Clash YAML → Base64 V2Ray → 原始 V2Ray URI |
+| `auto` | 自动检测（默认），依次尝试 FreeProxy JSON → Clash YAML → Base64 V2Ray → 原始 V2Ray URI |
 | `clash` | Clash YAML 格式（`proxies:` 字段） |
 | `v2ray` | V2Ray URI 格式，每行一个 `vmess://`、`vless://`、`trojan://`、`socks5://`、`http://` 等 |
 | `base64` | Base64 编码的 V2Ray URI 列表 |
+| `freeproxy` | FreeProxy `proxies.json` 或按来源分组的 JSON，可拆分 HTTP/HTTPS/SOCKS4/SOCKS5 多协议字段 |
 | `socks5` | 纯文本 SOCKS5 代理列表，每行 `host:port` 或 `user:pass@host:port` |
 | `socks4` | 纯文本 SOCKS4 代理列表，格式同上 |
 | `http` | 纯文本 HTTP 代理列表，格式同上 |
