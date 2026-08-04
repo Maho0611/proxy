@@ -418,7 +418,10 @@ mod tests {
     #[test]
     fn old_config_falls_back_to_admin_password() {
         let source = include_str!("../config.toml.example")
-            .replace("password = \"change-subscription-password\"\n", "");
+            .lines()
+            .filter(|line| line.trim() != "password = \"change-subscription-password\"")
+            .collect::<Vec<_>>()
+            .join("\n");
         let config: AppConfig = toml::from_str(&source).unwrap();
 
         assert_eq!(config.subscription_password(), "change-me");

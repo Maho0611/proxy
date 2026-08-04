@@ -1,10 +1,11 @@
-use crate::api::fetch::{find_proxy_snapshot, list_query_to_db, proxy_list_item_to_json, ListProxyQuery};
+use crate::api::fetch::{
+    find_proxy_snapshot, list_query_to_db, proxy_list_item_to_json, ListProxyQuery,
+};
 use crate::error::AppError;
 use crate::AppState;
 use axum::extract::{Path, Query, State};
 use axum::Json;
 use serde_json::json;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 pub async fn list_proxies(
@@ -87,18 +88,11 @@ pub async fn cleanup_proxies(
 pub async fn trigger_validation(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    if state.validation_running.load(Ordering::Acquire) {
+    if !crate::pool::validator::start_validation(state) {
         return Ok(Json(json!({
             "message": "Validation already running"
         })));
     }
-
-    let state_clone = state.clone();
-    tokio::spawn(async move {
-        if let Err(e) = crate::pool::validator::validate_all(state_clone).await {
-            tracing::error!("Manual validation failed: {e}");
-        }
-    });
 
     Ok(Json(json!({
         "message": "Validation started in background"
@@ -108,22 +102,22 @@ pub async fn trigger_validation(
 pub async fn trigger_quality_check(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    if state.quality_running.load(Ordering::Acquire) {
+    if !crate::quality::checker::start_quality_check(state) {
         return Ok(Json(json!({
             "message": "Quality check already running"
         })));
     }
 
-    let state_clone = state.clone();
-    tokio::spawn(async move {
-        if let Err(e) = crate::quality::checker::check_all(state_clone).await {
-            tracing::error!("Manual quality check failed: {e}");
-        }
-    });
-
     Ok(Json(json!({
         "message": "Quality check started in background"
     })))
+}
+
+pub async fn get_job_status(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    Json(json!({
+        "validation": state.validation_progress.snapshot(),
+        "quality_check": state.quality_progress.snapshot(),
+    }))
 }
 
 pub async fn get_stats(

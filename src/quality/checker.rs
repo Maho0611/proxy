@@ -4,6 +4,7 @@ use crate::AppState;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::{Mutex, Semaphore};
+use tokio::task::JoinSet;
 use tokio::time::Instant;
 
 /// Incomplete quality data can be retried at most this many times.
@@ -50,6 +51,29 @@ impl RateLimiter {
     }
 }
 
+pub fn start_quality_check(state: Arc<AppState>) -> bool {
+    if state
+        .quality_running
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return false;
+    }
+    state
+        .quality_progress
+        .begin(None, None, None, "waiting-for-bindings");
+    tokio::spawn(async move {
+        let _running = RunningGuard {
+            flag: &state.quality_running,
+        };
+        if let Err(error) = run_quality_check(state.clone()).await {
+            state.quality_progress.fail(&error);
+            tracing::error!("Manual quality check failed: {error}");
+        }
+    });
+    true
+}
+
 /// Returns the number of proxies actually checked.
 pub async fn check_all(state: Arc<AppState>) -> Result<usize, String> {
     let _running = match acquire_running_guard(&state.quality_running) {
@@ -60,30 +84,48 @@ pub async fn check_all(state: Arc<AppState>) -> Result<usize, String> {
         }
     };
 
+    run_quality_check(state.clone()).await
+}
+
+async fn run_quality_check(state: Arc<AppState>) -> Result<usize, String> {
+    state
+        .quality_progress
+        .begin(None, None, None, "waiting-for-bindings");
+
     let now = chrono::Utc::now();
     let mut total_checked = 0usize;
     let rate_limiter = Arc::new(RateLimiter::new(40));
     let stale_hours = state.config.quality.stale_hours.max(1);
     let max_checks = state.config.quality.max_checks_per_run.max(1);
 
-    // Hold lock only for short binding-selection work.
+    // Keep maintenance binding assignments stable until all checks finish.
+    let _lock = state.validation_lock.lock().await;
     let to_check = {
-        let _lock = state.validation_lock.lock().await;
+        state.quality_progress.set_phase("preparing");
         let stale_before = (now - chrono::Duration::hours(stale_hours as i64)).to_rfc3339();
-        let due = state
-            .db
-            .get_due_quality_proxy_records(
-                max_checks,
-                &stale_before,
-                MAX_INCOMPLETE_RETRIES,
-                QUALITY_SCHEMA_VERSION,
-            )
-            .map_err(|e| format!("Failed to load quality-check candidates: {e}"))?;
+        let due = match state.db.get_due_quality_proxy_records(
+            max_checks,
+            &stale_before,
+            MAX_INCOMPLETE_RETRIES,
+            QUALITY_SCHEMA_VERSION,
+        ) {
+            Ok(due) => due,
+            Err(error) => {
+                let message = format!("读取质检候选失败: {error}");
+                state.quality_progress.fail(&message);
+                return Err(message);
+            }
+        };
 
         if due.is_empty() {
+            state.quality_progress.set_total(0);
+            state
+                .quality_progress
+                .finish("没有待质检或已过期的有效代理");
             return Ok(0);
         }
 
+        state.quality_progress.set_phase("binding");
         let sync_result = crate::api::subscription::sync_proxy_bindings(
             &state,
             crate::api::subscription::SyncMode::QualityCheck,
@@ -100,6 +142,7 @@ pub async fn check_all(state: Arc<AppState>) -> Result<usize, String> {
             .take(max_checks)
             .collect::<Vec<PoolProxy>>()
     };
+    state.quality_progress.set_total(to_check.len());
 
     if !to_check.is_empty() {
         tracing::info!(
@@ -107,6 +150,8 @@ pub async fn check_all(state: Arc<AppState>) -> Result<usize, String> {
             to_check.len(),
             stale_hours,
         );
+        state.quality_progress.set_round(1);
+        state.quality_progress.set_phase("checking-unlock");
         total_checked += check_batch(&to_check, &state, &rate_limiter).await;
     } else {
         tracing::info!(
@@ -114,7 +159,6 @@ pub async fn check_all(state: Arc<AppState>) -> Result<usize, String> {
         );
     }
 
-    let _lock = state.validation_lock.lock().await;
     let _ = crate::api::subscription::sync_proxy_bindings(
         &state,
         crate::api::subscription::SyncMode::Normal,
@@ -131,6 +175,131 @@ pub async fn check_all(state: Arc<AppState>) -> Result<usize, String> {
         tracing::info!("Quality check complete: {total_checked} proxies checked in this run");
     }
 
+    let progress = state.quality_progress.snapshot();
+    state.quality_progress.finish(format!(
+        "质检完成：检查 {total_checked} 条线路，成功 {}，失败 {}（解锁检测已包含）",
+        progress.succeeded, progress.failed
+    ));
+
+    Ok(total_checked)
+}
+
+/// Force IP intelligence and unlock checks for the valid proxy definitions in
+/// one subscription, even when their existing quality result is still fresh.
+pub fn start_subscription_quality_check(
+    state: Arc<AppState>,
+    subscription_id: String,
+    subscription_name: String,
+) -> bool {
+    if state
+        .quality_running
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return false;
+    }
+    state.quality_progress.begin(
+        Some(&subscription_id),
+        Some(&subscription_name),
+        None,
+        "waiting-for-bindings",
+    );
+    tokio::spawn(async move {
+        let _running = RunningGuard {
+            flag: &state.quality_running,
+        };
+        if let Err(error) =
+            run_subscription_quality_check(state.clone(), subscription_id, subscription_name).await
+        {
+            state.quality_progress.fail(&error);
+            tracing::error!("Manual subscription quality check failed: {error}");
+        }
+    });
+    true
+}
+
+async fn run_subscription_quality_check(
+    state: Arc<AppState>,
+    subscription_id: String,
+    subscription_name: String,
+) -> Result<usize, String> {
+    state.quality_progress.begin(
+        Some(&subscription_id),
+        Some(&subscription_name),
+        None,
+        "waiting-for-bindings",
+    );
+    let _lock = state.validation_lock.lock().await;
+    state.quality_progress.set_phase("preparing");
+    let rows = match state.db.get_proxies_by_subscription(&subscription_id) {
+        Ok(rows) => rows,
+        Err(error) => {
+            let message = format!("读取订阅代理失败: {error}");
+            state.quality_progress.fail(&message);
+            return Err(message);
+        }
+    };
+    let mut seen_definitions = std::collections::HashSet::new();
+    let target_ids: Vec<String> = rows
+        .into_iter()
+        .filter(|proxy| proxy.orphaned_at.is_none() && proxy.is_valid)
+        .filter(|proxy| {
+            seen_definitions.insert(crate::api::subscription::proxy_row_definition_key(proxy))
+        })
+        .map(|proxy| proxy.id)
+        .collect();
+    state.quality_progress.set_total(target_ids.len());
+    if target_ids.is_empty() {
+        state
+            .quality_progress
+            .finish("该订阅没有已通过验活、可执行解锁质检的代理");
+        return Ok(0);
+    }
+
+    let rate_limiter = Arc::new(RateLimiter::new(40));
+    let batch_size = state.config.validation.batch_size.max(1);
+    let mut total_checked = 0usize;
+    for (index, target_batch) in target_ids.chunks(batch_size).enumerate() {
+        state.quality_progress.set_round(index + 1);
+        state.quality_progress.set_phase("binding");
+        let sync_result = crate::api::subscription::sync_proxy_bindings(
+            &state,
+            crate::api::subscription::SyncMode::Targeted(target_batch.to_vec()),
+        )
+        .await;
+        let to_check = sync_result
+            .work_ids
+            .iter()
+            .filter_map(|id| state.pool.get(id))
+            .filter(|proxy| proxy.status == crate::pool::manager::ProxyStatus::Valid)
+            .filter(|proxy| proxy.local_port.is_some())
+            .collect::<Vec<PoolProxy>>();
+        for _ in 0..target_batch.len().saturating_sub(to_check.len()) {
+            state.quality_progress.advance(false);
+        }
+        state.quality_progress.set_phase("checking-unlock");
+        total_checked += check_batch(&to_check, &state, &rate_limiter).await;
+    }
+
+    let _ = crate::api::subscription::sync_proxy_bindings(
+        &state,
+        crate::api::subscription::SyncMode::Normal,
+    )
+    .await;
+
+    if total_checked > 0 {
+        crate::api::fetch::invalidate_stats_cache(state.as_ref());
+        crate::api::sub_export::invalidate_subscription_export_cache(state.as_ref());
+        let reconciled = crate::fixed_proxy::reconcile_all(&state).await;
+        if reconciled > 0 {
+            tracing::info!("Reconciled {reconciled} fixed exits after subscription quality checks");
+        }
+    }
+    let progress = state.quality_progress.snapshot();
+    state.quality_progress.finish(format!(
+        "订阅“{subscription_name}”解锁质检完成：检查 {total_checked} 条线路，成功 {}，失败 {}",
+        progress.succeeded, progress.failed
+    ));
     Ok(total_checked)
 }
 
@@ -141,14 +310,14 @@ async fn check_batch(
     rate_limiter: &Arc<RateLimiter>,
 ) -> usize {
     let semaphore = Arc::new(Semaphore::new(state.config.quality.concurrency));
-    let mut handles = Vec::new();
+    let mut handles = JoinSet::new();
 
     for proxy in proxies.iter().cloned() {
         let sem = semaphore.clone();
         let state = state.clone();
         let rl = rate_limiter.clone();
 
-        let handle = tokio::spawn(async move {
+        handles.spawn(async move {
             let _permit = sem.acquire().await.unwrap();
 
             let local_port = match proxy.local_port {
@@ -229,14 +398,15 @@ async fn check_batch(
                 }
             }
         });
-        handles.push(handle);
     }
 
     let mut count = 0;
-    for handle in handles {
-        if matches!(handle.await, Ok(true)) {
+    while let Some(result) = handles.join_next().await {
+        let succeeded = matches!(result, Ok(true));
+        if succeeded {
             count += 1;
         }
+        state.quality_progress.advance(succeeded);
     }
     count
 }
