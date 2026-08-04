@@ -109,6 +109,14 @@ tr:hover td { background:rgba(70,220,255,.035); }
 .metric-pair { display:flex; align-items:baseline; gap:5px; }
 .metric-pair strong { color:var(--text-bright); font:700 14px Consolas,monospace; }
 .metric-pair small { color:var(--text-dim); font-size:10px; }
+.subscription-card { padding:10px 16px 16px; }
+.subscription-table { min-width:1476px; table-layout:fixed; }
+.subscription-table th, .subscription-table td { padding:10px 9px; vertical-align:middle; }
+.subscription-table .subscription-url { overflow:hidden; text-overflow:ellipsis; }
+.subscription-table .subscription-refresh { display:flex; align-items:center; gap:6px; }
+.subscription-table .subscription-refresh input { width:84px; min-width:0; }
+.subscription-table .subscription-actions { display:flex; align-items:center; gap:6px; min-width:max-content; white-space:nowrap; }
+.subscription-table .subscription-actions .btn { flex:none; padding:6px 10px; white-space:nowrap; }
 .credential-preview { display:none; margin-top:14px; padding:13px; border:1px solid var(--warn); background:rgba(255,200,87,.06); color:var(--text); font:12px/1.7 Consolas,monospace; white-space:pre-wrap; word-break:break-all; }
 .account-create-grid { display:grid; grid-template-columns:1fr 1fr 1fr auto; gap:12px; align-items:end; }
 .action-help { margin-top:10px; color:var(--text-dim); font-size:11px; line-height:1.7; }
@@ -333,8 +341,13 @@ tr:hover td { background:rgba(70,220,255,.035); }
         <span style="color:var(--text-dim);font-size:12px">仅对“跟随全局默认值”的 URL 订阅生效，0 表示关闭</span>
       </div>
     </div>
-    <div class="card">
-      <table>
+    <div class="card subscription-card">
+      <table class="subscription-table">
+        <colgroup>
+          <col style="width:110px"><col style="width:76px"><col style="width:200px">
+          <col style="width:140px"><col style="width:250px"><col style="width:170px">
+          <col style="width:125px"><col style="width:125px"><col style="width:280px">
+        </colgroup>
         <thead><tr><th>名称</th><th>类型</th><th>URL</th><th>节点 / 重复</th><th>订阅重合关系</th><th>自动更新(分)</th><th>更新时间</th><th>创建时间</th><th>操作</th></tr></thead>
         <tbody id="sub-table"></tbody>
       </table>
@@ -800,8 +813,8 @@ async function loadSubscriptions() {
   tb.innerHTML = d.subscriptions.map(s => {
     const effectiveInterval = s.refresh_interval_mins == null ? defaultSubRefreshInterval : s.refresh_interval_mins;
     const refreshCell = s.url
-      ? `<div style="display:flex;gap:8px;align-items:center">
-          <input id="sub-refresh-${s.id}" type="number" min="0" step="1" value="${effectiveInterval}" style="width:88px">
+      ? `<div class="subscription-refresh">
+          <input id="sub-refresh-${s.id}" type="number" min="0" step="1" value="${effectiveInterval}">
           <button class="btn btn-sm" onclick="saveSubRefresh('${s.id}')">保存</button>
         </div>${s.refresh_interval_mins == null ? '<div style="margin-top:4px;color:var(--text-dim);font-size:12px">当前跟随全局默认值</div>' : ''}`
       : '<span style="color:var(--text-dim)">仅 URL 可定时更新</span>';
@@ -831,18 +844,18 @@ async function loadSubscriptions() {
     return `<tr>
       <td>${esc(s.name)}</td>
       <td><span class="badge badge-type">${esc(s.sub_type)}</span></td>
-      <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis">${esc(s.url||'(内容)')}</td>
+      <td class="subscription-url">${esc(s.url||'(内容)')}</td>
       <td>${inventoryCell}</td>
       <td>${overlapCell}</td>
       <td>${refreshCell}</td>
       <td>${fmtDate(s.last_refresh_at || s.updated_at)}</td>
       <td>${fmtDate(s.created_at)}</td>
-      <td class="btn-group">
+      <td><div class="subscription-actions">
         <button class="btn btn-primary btn-sm" onclick="refreshSub('${s.id}')">刷新节点</button>
         <button class="btn btn-success btn-sm" data-job-kind="validation" onclick="triggerSubValidation('${s.id}')" title="强制重新验活此订阅的全部节点">验活</button>
         <button class="btn btn-primary btn-sm" data-job-kind="quality" onclick="triggerSubQualityCheck('${s.id}')" title="强制重新检测此订阅中有效节点的质量与流媒体解锁">解锁质检</button>
         <button class="btn btn-danger btn-sm" onclick="deleteSub('${s.id}')">删除</button>
-      </td>
+      </div></td>
     </tr>`;
   }).join('');
   applyJobButtonState();
