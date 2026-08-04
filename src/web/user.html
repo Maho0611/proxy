@@ -70,6 +70,10 @@ tr:hover td { background:rgba(108,99,255,.03); }
 .builder-meta { display:flex; gap:14px; flex-wrap:wrap; margin-bottom:16px; color:var(--text-dim); font-size:13px; }
 .builder-meta strong { color:var(--text-bright); }
 .builder-output { display:grid; gap:9px; margin-top:16px; }
+.builder-output-group { display:grid; gap:9px; padding:16px; border:1px solid var(--border); border-radius:10px; }
+.builder-output-group + .builder-output-group { margin-top:8px; }
+.builder-output-title { color:var(--text-bright); font-size:14px; font-weight:600; }
+.builder-output-hint { color:var(--text-dim); font-size:12px; line-height:1.6; margin-top:-4px; }
 .builder-output-row { display:grid; grid-template-columns:150px 1fr auto; gap:8px; align-items:center; }
 .builder-output-row label { color:var(--text-dim); font-size:12px; }
 .builder-output-row input { min-width:0; width:100%; padding:9px 11px; background:#0a0c10; border:1px solid var(--border); border-radius:6px; color:var(--text); font:12px Consolas,monospace; }
@@ -169,12 +173,17 @@ tr:hover td { background:rgba(108,99,255,.03); }
           <span>基础用户名：<strong id="proxy-access-username">-</strong></span>
           <span>入口：<strong id="proxy-access-gateway">-</strong></span>
           <span>状态：<strong id="proxy-access-status">-</strong></span>
-          <span>换 IP：<strong>每个新 TCP 连接随机出口</strong></span>
+          <span>换 IP：<strong>每次连接随机 + 定时轮换可同时使用</strong></span>
         </div>
         <div class="builder-grid">
           <div class="form-group"><label>连接协议</label><select id="builder-protocol" onchange="buildProxyUrls()"><option value="http">HTTP</option><option value="socks5h">SOCKS5（远程 DNS）</option></select></div>
           <div class="form-group"><label>国家 / 地区</label><select id="builder-country" onchange="buildProxyUrls()"><option value="">随机国家</option></select></div>
           <div class="form-group"><label>上游代理类型</label><select id="builder-type" onchange="buildProxyUrls()"><option value="">随机类型</option></select></div>
+        </div>
+        <div class="builder-grid" style="margin-top:12px">
+          <div class="form-group"><label>轮换间隔（秒）</label><input type="number" id="builder-rotation-seconds" min="1" max="86400" value="300" oninput="buildProxyUrls()"></div>
+          <div class="form-group"><label>Session 标识（字母、数字、下划线）</label><input id="builder-session-id" maxlength="32" placeholder="例如 crawler_01" oninput="buildProxyUrls()"></div>
+          <div class="form-group" style="justify-content:flex-end"><label>&nbsp;</label><button class="btn btn-outline" onclick="generateRotationSessionId()">重新生成 Session</button></div>
         </div>
         <div class="checkbox-group">
           <label><input type="checkbox" id="builder-residential" onchange="buildProxyUrls()"> 住宅 IP</label>
@@ -187,13 +196,26 @@ tr:hover td { background:rgba(108,99,255,.03); }
           <button class="btn btn-danger btn-sm" onclick="rotateProxyCredential()">轮换代理密码</button>
         </div>
         <div class="builder-output">
-          <div class="builder-output-row"><label>完整代理 URL</label><input id="builder-url" readonly><button class="btn btn-outline btn-sm" onclick="copyBuilder('builder-url')">复制</button></div>
-          <div class="builder-output-row"><label>HOST:PORT:USER:PASS</label><input id="builder-host-first" readonly><button class="btn btn-outline btn-sm" onclick="copyBuilder('builder-host-first')">复制</button></div>
-          <div class="builder-output-row"><label>USER:PASS@HOST:PORT</label><input id="builder-user-first" readonly><button class="btn btn-outline btn-sm" onclick="copyBuilder('builder-user-first')">复制</button></div>
-          <div class="builder-output-row"><label>curl</label><input id="builder-curl" readonly><button class="btn btn-outline btn-sm" onclick="copyBuilder('builder-curl')">复制</button></div>
-          <div class="builder-output-row"><label>环境变量 / JSON</label><input id="builder-env" readonly><button class="btn btn-outline btn-sm" onclick="copyBuilder('builder-env')">复制</button></div>
+          <div class="builder-output-group">
+            <div class="builder-output-title">每个新连接随机出口</div>
+            <div class="builder-output-hint">每条新 TCP 连接重新随机选择出口，不使用 Session。</div>
+            <div class="builder-output-row"><label>完整代理 URL</label><input id="builder-connection-url" readonly><button class="btn btn-outline btn-sm" onclick="copyBuilder('builder-connection-url')">复制</button></div>
+            <div class="builder-output-row"><label>HOST:PORT:USER:PASS</label><input id="builder-connection-host-first" readonly><button class="btn btn-outline btn-sm" onclick="copyBuilder('builder-connection-host-first')">复制</button></div>
+            <div class="builder-output-row"><label>USER:PASS@HOST:PORT</label><input id="builder-connection-user-first" readonly><button class="btn btn-outline btn-sm" onclick="copyBuilder('builder-connection-user-first')">复制</button></div>
+            <div class="builder-output-row"><label>curl</label><input id="builder-connection-curl" readonly><button class="btn btn-outline btn-sm" onclick="copyBuilder('builder-connection-curl')">复制</button></div>
+            <div class="builder-output-row"><label>环境变量 / JSON</label><input id="builder-connection-env" readonly><button class="btn btn-outline btn-sm" onclick="copyBuilder('builder-connection-env')">复制</button></div>
+          </div>
+          <div class="builder-output-group">
+            <div class="builder-output-title">按指定时间间隔轮换出口</div>
+            <div class="builder-output-hint">同一 Session 在间隔内保持出口，到期后由下一条新连接触发轮换。</div>
+            <div class="builder-output-row"><label>完整代理 URL</label><input id="builder-timed-url" readonly><button class="btn btn-outline btn-sm" onclick="copyBuilder('builder-timed-url')">复制</button></div>
+            <div class="builder-output-row"><label>HOST:PORT:USER:PASS</label><input id="builder-timed-host-first" readonly><button class="btn btn-outline btn-sm" onclick="copyBuilder('builder-timed-host-first')">复制</button></div>
+            <div class="builder-output-row"><label>USER:PASS@HOST:PORT</label><input id="builder-timed-user-first" readonly><button class="btn btn-outline btn-sm" onclick="copyBuilder('builder-timed-user-first')">复制</button></div>
+            <div class="builder-output-row"><label>curl</label><input id="builder-timed-curl" readonly><button class="btn btn-outline btn-sm" onclick="copyBuilder('builder-timed-curl')">复制</button></div>
+            <div class="builder-output-row"><label>环境变量 / JSON</label><input id="builder-timed-env" readonly><button class="btn btn-outline btn-sm" onclick="copyBuilder('builder-timed-env')">复制</button></div>
+          </div>
         </div>
-        <div class="access-note">筛选条件会编码进用户名，不影响账号密码。页面不会把代理密码保存到 localStorage；刷新或点击“隐藏密码”后需要重新显示。HTTP/SOCKS5 认证握手本身不加密，请仅在可信网络或受控机器间使用。</div>
+        <div class="access-note">不带 Session 后缀的 URL 保持每个新 TCP 连接随机出口；定时 URL 在间隔内保持同一出口，到期后由下一条新连接触发轮换。两种 URL 可使用同一账号同时运行。已建立的长连接不会在中途换 IP。页面不会把代理密码保存到 localStorage。</div>
       </div>
     </div>
   </div>
@@ -301,6 +323,7 @@ let proxyFilterTimer = null;
 let proxyLoadSequence = 0;
 let proxyAccess = null;
 let proxyPassword = null;
+let proxyBuilderReady = { connection: false, timed: false };
 
 function toast(msg) {
   const t = document.createElement('div');
@@ -401,6 +424,7 @@ async function loadProxyAccess() {
     document.getElementById('proxy-access-status').textContent = d.account.enabled ? '启用' : '已禁用';
     fillBuilderSelect('builder-country', d.filters?.countries || [], '随机国家');
     fillBuilderSelect('builder-type', d.filters?.proxy_types || [], '随机类型');
+    ensureRotationSessionId();
     buildProxyUrls();
   } catch (e) {
     const empty = document.getElementById('proxy-access-empty');
@@ -417,7 +441,7 @@ function fillBuilderSelect(id, values, emptyLabel) {
   if (values.includes(previous)) select.value = previous;
 }
 
-function selectedProxyUsername() {
+function selectedProxyUsername(rotationMode) {
   if (!proxyAccess?.account) return '';
   let username = proxyAccess.account.username;
   const country = document.getElementById('builder-country').value;
@@ -427,7 +451,50 @@ function selectedProxyUsername() {
   if (document.getElementById('builder-chatgpt').checked) username += '-chatgpt';
   if (document.getElementById('builder-google').checked) username += '-google';
   if (type) username += '-type-' + type;
+  if (rotationMode === 'timed') {
+    const metadata = proxyAccess.rotation_modes?.timed || {};
+    const min = Number(metadata.min_interval_secs || 1);
+    const max = Number(metadata.max_interval_secs || 86400);
+    const sessionId = document.getElementById('builder-session-id').value.trim();
+    const interval = Number(document.getElementById('builder-rotation-seconds').value);
+    if (!/^[A-Za-z0-9_]{1,32}$/.test(sessionId)) return '';
+    if (!Number.isInteger(interval) || interval < min || interval > max) return '';
+    username += `-session-${sessionId}-rotate-${interval}`;
+  }
   return username;
+}
+
+function ensureRotationSessionId() {
+  const input = document.getElementById('builder-session-id');
+  if (input && !input.value) generateRotationSessionId(false);
+}
+
+function generateRotationSessionId(showToast = true) {
+  const bytes = new Uint8Array(6);
+  crypto.getRandomValues(bytes);
+  document.getElementById('builder-session-id').value = 's' + [...bytes].map(value => value.toString(16).padStart(2, '0')).join('');
+  buildProxyUrls();
+  if (showToast) toast('Session 标识已重新生成');
+}
+
+function builderOutputIds(mode) {
+  return ['url', 'host-first', 'user-first', 'curl', 'env'].map(name => `builder-${mode}-${name}`);
+}
+
+function setBuilderOutput(mode, value) {
+  for (const id of builderOutputIds(mode)) document.getElementById(id).value = value;
+}
+
+function renderBuilderOutput(mode, protocol, rawHost, host, port, username, password) {
+  const encodedUser = encodeURIComponent(username);
+  const encodedPassword = encodeURIComponent(password);
+  const proxyUrl = `${protocol}://${encodedUser}:${encodedPassword}@${host}:${port}`;
+  document.getElementById(`builder-${mode}-url`).value = proxyUrl;
+  document.getElementById(`builder-${mode}-host-first`).value = `${rawHost}:${port}:${username}:${password}`;
+  document.getElementById(`builder-${mode}-user-first`).value = `${username}:${password}@${host}:${port}`;
+  document.getElementById(`builder-${mode}-curl`).value = `curl -x '${proxyUrl}' https://api.ipify.org`;
+  document.getElementById(`builder-${mode}-env`).value = `HTTPS_PROXY='${proxyUrl}'  {"proxy":"${proxyUrl}"}`;
+  proxyBuilderReady[mode] = true;
 }
 
 function buildProxyUrls() {
@@ -436,23 +503,24 @@ function buildProxyUrls() {
   const rawHost = proxyAccess.gateway?.host || '';
   const host = rawHost.includes(':') && !rawHost.startsWith('[') ? `[${rawHost}]` : rawHost;
   const port = proxyAccess.gateway?.port || '';
-  const username = selectedProxyUsername();
   const password = proxyPassword;
-  const hidden = '点击上方按钮显示密码';
+  proxyBuilderReady = { connection: false, timed: false };
   if (!host || !port || !password) {
-    for (const id of ['builder-url','builder-host-first','builder-user-first','builder-curl','builder-env']) {
-      document.getElementById(id).value = !host || !port ? '公网代理入口尚未配置' : hidden;
-    }
+    const message = !host || !port ? '公网代理入口尚未配置' : '点击上方按钮显示密码';
+    setBuilderOutput('connection', message);
+    setBuilderOutput('timed', message);
     return;
   }
-  const encodedUser = encodeURIComponent(username);
-  const encodedPassword = encodeURIComponent(password);
-  const proxyUrl = `${protocol}://${encodedUser}:${encodedPassword}@${host}:${port}`;
-  document.getElementById('builder-url').value = proxyUrl;
-  document.getElementById('builder-host-first').value = `${rawHost}:${port}:${username}:${password}`;
-  document.getElementById('builder-user-first').value = `${username}:${password}@${host}:${port}`;
-  document.getElementById('builder-curl').value = `curl -x '${proxyUrl}' https://api.ipify.org`;
-  document.getElementById('builder-env').value = `HTTPS_PROXY='${proxyUrl}'  {"proxy":"${proxyUrl}"}`;
+
+  const connectionUsername = selectedProxyUsername('connection');
+  renderBuilderOutput('connection', protocol, rawHost, host, port, connectionUsername, password);
+
+  const timedUsername = selectedProxyUsername('timed');
+  if (!timedUsername) {
+    setBuilderOutput('timed', 'Session 标识或轮换间隔无效');
+    return;
+  }
+  renderBuilderOutput('timed', protocol, rawHost, host, port, timedUsername, password);
 }
 
 async function revealProxyCredential() {
@@ -490,7 +558,9 @@ async function rotateProxyCredential() {
 
 function copyBuilder(id) {
   const value = document.getElementById(id).value;
+  const mode = id.startsWith('builder-timed-') ? 'timed' : 'connection';
   if (!proxyPassword) return toast('请先显示完整连接信息');
+  if (!proxyBuilderReady[mode]) return toast(mode === 'timed' ? '请先修正 Session 标识或轮换间隔' : '连接信息尚未就绪');
   navigator.clipboard.writeText(value).then(() => toast('已复制到剪贴板'));
 }
 

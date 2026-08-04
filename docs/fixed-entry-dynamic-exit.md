@@ -128,6 +128,7 @@ USER:PASSWORD@SERVER_IP:50089
 | `-chatgpt` | 只选择 ChatGPT 可用出口 | `USER-chatgpt` |
 | `-google` | 只选择 Google 可用出口 | `USER-google` |
 | `-type-TYPE` | 指定上游代理协议 | `USER-type-vless` |
+| `-session-ID-rotate-SECONDS` | 按 Session 在指定秒数内固定出口，到期轮换 | `USER-session-crawler_01-rotate-300` |
 
 后缀可以组合：
 
@@ -135,7 +136,10 @@ USER:PASSWORD@SERVER_IP:50089
 USER-country-US-residential
 USER-country-JP-chatgpt
 USER-country-US-residential-google-type-vless
+USER-country-US-session-crawler_01-rotate-300
 ```
+
+`session` 和 `rotate` 必须成对出现。Session ID 限制为 1～32 个字母、数字或下划线，轮换间隔为 1～86400 秒。
 
 网关模式目前不能通过用户名筛选：
 
@@ -161,7 +165,7 @@ USER-country-US-residential-google-type-vless
 - 同等优先级内随机排序。
 - 最近发生错误的节点优先级较低。
 
-同一连接获得的最多 3 个候选出口不会重复，但不同连接之间没有历史排除状态。
+普通随机模式中，同一连接获得的最多 3 个候选出口不会重复，但不同连接之间没有历史排除状态。
 
 因此当前语义是：
 
@@ -171,7 +175,7 @@ USER-country-US-residential-google-type-vless
 新连接 3 → 随机出口 C，也可能再次为 A 或 B
 ```
 
-当前不保证：
+普通随机模式不保证：
 
 - 与上一次连接使用不同 IP。
 - 按顺序轮询所有 IP。
@@ -180,7 +184,10 @@ USER-country-US-residential-google-type-vless
 
 ## 7. 轮换粒度与长连接
 
-当前出口是在新 TCP 连接建立时选择的，不是在每个 HTTP 请求时选择。
+出口是在新 TCP 连接建立时选择的，不是在每个 HTTP 请求时选择。当前有两种可同时使用的 URL 级别模式：
+
+- 不带 `session/rotate` 后缀：每个新 TCP 连接随机出口。
+- 带 `-session-ID-rotate-SECONDS`：同一账号、Session、间隔和筛选条件在到期前使用同一出口。
 
 客户端不复用连接时：
 
@@ -200,6 +207,14 @@ USER-country-US-residential-google-type-vless
 
 HTTP CONNECT 和 SOCKS5 隧道不能在连接中途无感更换 IP。强制切换只能关闭旧连接并建立新连接。
 
+定时模式的周期从该 Session 首次成功建立上游连接时开始，不会因为周期内继续使用而延长。到期后的第一条新连接触发换点：
+
+- 优先排除上一个已测出口 IP。
+- 并发到期连接通过每 Session 锁收敛到同一个新出口。
+- 新出口不可用时会继续尝试其他出口。
+- 没有其他可用出口时，允许以上一个出口作为最后可用性回退。
+- 服务重启会清空内存中的定时 Session，下一条连接会重新选择出口。
+
 旧项目需要“尽量每请求换 IP”时，应：
 
 - 关闭 HTTP Keep-Alive。
@@ -207,7 +222,7 @@ HTTP CONNECT 和 SOCKS5 隧道不能在连接中途无感更换 IP。强制切�
 - 每次请求完成后主动关闭代理连接。
 - 接受随机选择仍可能连续重复 IP。
 
-严格不重复轮换需要新增服务端历史状态和排除逻辑。
+普通随机模式仍不保证与上一次不同；定时模式会记录上一个出口并优先排除，但在没有其他可用 IP 时仍会回退。
 
 ## 8. 并发与多用户现状
 
@@ -217,7 +232,7 @@ Listener 基于 Tokio 异步处理，可以：
 
 - 接受多台机器同时连接。
 - 接受同一账号的多个并发连接。
-- 为每条连接独立选择出口。
+- 按 URL 策略为每条新连接随机选点，或复用定时 Session 出口。
 - 共享已经创建的 sing-box 动态绑定。
 - 在连接传输期间保护绑定不被空闲清理。
 
@@ -423,9 +438,9 @@ USER_C:PASSWORD_C ─┘
 | 账号修改无需重启 | 已实现 | 保持 |
 | 登录用户查看自己的账号 | 已实现 | 保持 |
 | 参数选择与 URL 生成器 | 已实现 | 保持 |
-| Session 固定 IP | 未实现 | 后续可选 |
-| Session TTL 到期换 IP | 未实现 | 后续可选 |
-| 避免连续重复 IP | 未实现 | 后续可选 |
+| Session 固定 IP | 已实现 | 保持 |
+| Session 指定间隔到期换 IP | 已实现 | 保持 |
+| 定时轮换优先避免上一个 IP | 已实现 | 保持 |
 | 严格每请求换 IP | 未实现 | 不作为账号改造前置条件 |
 
 明确不在范围内：
@@ -586,6 +601,8 @@ ZENPROXY_PUBLIC_PROXY_PORT=50089
 - 随机国家或指定国家。
 - 随机上游类型或指定类型。
 - Residential、ChatGPT、Google 能力组合。
+- 每个新连接随机，或按 1～86400 秒的 Session 间隔轮换。
+- 随机生成或自定义 Session ID，让同一账号的多个业务独立轮换。
 - 完整 URL、`HOST:PORT:USER:PASS`、`USER:PASS@HOST:PORT`、curl 和环境变量/JSON 格式。
 
 用户名和密码在 URL 中使用 `encodeURIComponent` 编码。页面初始不读取密码，用户主动点击显示后才请求 `reveal`；刷新或点击隐藏后密码从页面变量中移除。
@@ -594,10 +611,9 @@ ZENPROXY_PUBLIC_PROXY_PORT=50089
 
 账号功能稳定后再考虑：
 
-1. `session` 和 TTL 固定出口。
-2. 尽量避免同一账号连续选择相同出口。
-3. Listener 连接失败回写节点状态。
-4. 更清晰的连接和握手超时。
+1. 把定时 Session 持久化，使服务重启后仍延续原周期。
+2. Listener 连接失败回写节点状态。
+3. 更清晰的连接和握手超时。
 
 这些能力与独立账号解耦，不阻塞多账号上线。
 
@@ -623,6 +639,8 @@ ZENPROXY_PUBLIC_PROXY_PORT=50089
 - 旧共享账号在 `hybrid` 迁移阶段仍然可用。
 - 数据库、日志和 API 列表不出现明文密码；只有显式 reveal/create/rotate 响应包含当前密码且禁止缓存。
 - 用户生成器使用显式配置的公网地址，不从 Cloudflare Web 域名推断入口。
+- 同一账号的普通随机 URL 和定时轮换 URL 可以同时使用，状态互不干扰。
+- 定时 Session 在到期前的多条新连接使用同一出口，到期后优先切换到不同 IP。
 - 不增加流量额度、计费或复杂用户权限逻辑。
 
 ## 17. 相关代码
@@ -631,6 +649,7 @@ ZENPROXY_PUBLIC_PROXY_PORT=50089
 |---|---|
 | `src/proxy_listener.rs` | HTTP/SOCKS5 入口、认证、筛选、连接转发 |
 | `src/proxy_account.rs` | 用户名校验、HMAC 密码派生与常量时间验证 |
+| `src/proxy_rotation.rs` | 定时 Session 状态、并发锁、闲置清理和安全边界 |
 | `src/api/proxy_access.rs` | 用户/管理员代理账号 API 与公网入口元数据 |
 | `src/web/user.html` | 用户参数选择与多格式 URL 生成器 |
 | `src/web/admin.html` | 代理账号创建、绑定、启停、查看和轮换 |

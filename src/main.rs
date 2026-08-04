@@ -7,6 +7,7 @@ mod parser;
 mod pool;
 mod proxy_account;
 mod proxy_listener;
+mod proxy_rotation;
 mod quality;
 mod singbox;
 
@@ -39,6 +40,8 @@ pub struct AppState {
     pub proxy_accounts: DashMap<String, ProxyAccount>,
     /// Throttles best-effort last_used_at writes for busy accounts.
     pub proxy_account_last_used: DashMap<String, tokio::time::Instant>,
+    /// Timed-rotation sessions keyed by account, session ID, interval and filters.
+    pub proxy_rotation_sessions: DashMap<String, Arc<proxy_rotation::RotationSession>>,
     /// Serializes binding changes during validation/quality work.
     pub validation_lock: Mutex<()>,
     /// Prevents duplicate validation runs from being queued/spawned.
@@ -155,6 +158,7 @@ async fn main() {
         auth_cache: DashMap::new(),
         proxy_accounts,
         proxy_account_last_used: DashMap::new(),
+        proxy_rotation_sessions: DashMap::new(),
         validation_lock: Mutex::new(()),
         validation_running: AtomicBool::new(false),
         quality_running: AtomicBool::new(false),
@@ -273,6 +277,19 @@ async fn start_background_tasks(state: Arc<AppState>) {
             state_clone
                 .auth_cache
                 .retain(|_, (_, expires)| now < *expires);
+        }
+    });
+
+    let state_clone = state.clone();
+    // Periodic cleanup for inactive timed proxy-rotation sessions.
+    tokio::spawn(async move {
+        let interval = std::time::Duration::from_secs(60);
+        loop {
+            tokio::time::sleep(interval).await;
+            let count = proxy_rotation::cleanup_idle_sessions(&state_clone).await;
+            if count > 0 {
+                tracing::info!("Cleaned up {count} idle timed-rotation sessions");
+            }
         }
     });
 

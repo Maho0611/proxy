@@ -353,6 +353,7 @@ password = "mypassword"
 | `-chatgpt` | ChatGPT 可访问 | `myuser-chatgpt` |
 | `-google` | Google 可访问 | `myuser-google` |
 | `-type-TYPE` | 指定代理类型 | `myuser-type-vmess` |
+| `-session-ID-rotate-SECONDS` | 指定时间内固定出口，到期轮换 | `myuser-session-crawler_01-rotate-300` |
 
 后缀可自由组合：`myuser-country-US-residential-chatgpt`
 
@@ -368,11 +369,16 @@ curl -x socks5://myuser-country-US-residential:mypass@proxy.example.com:1080 htt
 # HTTP CONNECT — ChatGPT 可用代理
 curl -x http://myuser-chatgpt:mypass@proxy.example.com:1080 https://httpbin.org/ip
 
+# HTTP CONNECT — crawler_01 在 5 分钟内固定出口，到期后换 IP
+curl -x http://myuser-session-crawler_01-rotate-300:mypass@proxy.example.com:1080 https://httpbin.org/ip
+
 # 多次请求验证 IP 轮换
 for i in $(seq 1 5); do
   curl -s -x socks5://myuser:mypass@proxy.example.com:1080 https://httpbin.org/ip
 done
 ```
+
+Session ID 限制为 1～32 个字母、数字或下划线，间隔支持 1～86400 秒。不带定时后缀的 URL 仍按每个新 TCP 连接随机出口；同一账号可以同时使用普通随机 URL 和多个独立的定时 Session URL。已建立的长连接不会在中途切换 IP。
 
 > **重试机制：** 连接失败时自动重试最多 3 个不同的代理节点。
 

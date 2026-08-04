@@ -17,11 +17,13 @@
 //! First byte `0x05` → SOCKS5; ASCII → HTTP proxy.
 
 use crate::bindings::BindingUseGuard;
-use crate::pool::manager::ProxyFilter;
+use crate::pool::manager::{PoolProxy, ProxyFilter, ProxyStatus};
+use crate::proxy_rotation::RotationSelection;
 use crate::AppState;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::time::{Duration, Instant};
 
 // ---------------------------------------------------------------------------
 // Public entry point
@@ -139,7 +141,7 @@ async fn handle_socks5(
         }
     };
     mark_account_used(&state, auth.account_id.as_deref());
-    let filter = auth.filter;
+    let routing = auth.routing;
     write_all(&mut stream, &[0x01, 0x00]).await?;
 
     // --- CONNECT request ---
@@ -155,7 +157,7 @@ async fn handle_socks5(
     let (target_host, target_port) = read_socks5_address(&mut stream, req[3]).await?;
 
     // --- Connect through proxy pool ---
-    match connect_through_pool(&state, &filter, &target_host, target_port).await {
+    match connect_through_pool(&state, &routing, &target_host, target_port).await {
         Ok((mut upstream, _guard)) => {
             write_all(&mut stream, &[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await?;
             tokio::io::copy_bidirectional(&mut stream, &mut upstream)
@@ -271,7 +273,7 @@ async fn handle_http_proxy(
         }
     };
     mark_account_used(&state, auth.account_id.as_deref());
-    let filter = auth.filter;
+    let routing = auth.routing;
 
     let parts: Vec<&str> = first_line.split_whitespace().collect();
     if parts.len() < 3 {
@@ -281,7 +283,7 @@ async fn handle_http_proxy(
     if parts[0].eq_ignore_ascii_case("CONNECT") {
         // --- CONNECT tunnel ---
         let (host, port) = parse_host_port(parts[1], 443)?;
-        match connect_through_pool(&state, &filter, &host, port).await {
+        match connect_through_pool(&state, &routing, &host, port).await {
             Ok((mut upstream, _guard)) => {
                 write_all(&mut stream, b"HTTP/1.1 200 Connection Established\r\n\r\n").await?;
                 // Forward any data after the headers that was already buffered
@@ -309,7 +311,7 @@ async fn handle_http_proxy(
         let url = parts[1];
         let (host, port, path) = parse_absolute_url(url)?;
 
-        match connect_through_pool(&state, &filter, &host, port).await {
+        match connect_through_pool(&state, &routing, &host, port).await {
             Ok((mut upstream, _guard)) => {
                 // Rewrite request: absolute URI → relative, strip proxy headers
                 let rewritten = rewrite_http_request(&header_str, parts[0], &path);
@@ -344,19 +346,168 @@ async fn handle_http_proxy(
 // Proxy pool selection + upstream SOCKS5 client
 // ---------------------------------------------------------------------------
 
-/// Pick a random proxy matching filters, ensure binding, and connect to the
-/// target through sing-box's local SOCKS5 proxy. Returns the connected stream
-/// and a guard that keeps the binding alive.
+const MAX_CONNECT_ATTEMPTS: usize = 3;
+
+/// Select an exit according to the URL-level routing policy, ensure its
+/// sing-box binding, and connect to the target.
 async fn connect_through_pool(
     state: &Arc<AppState>,
-    filter: &ProxyFilter,
+    routing: &ProxyRouting,
     target_host: &str,
     target_port: u16,
 ) -> Result<(TcpStream, BindingUseGuard), String> {
-    let max_attempts = 3;
-    let candidates = crate::api::fetch::pick_random_valid_proxies(state, filter, max_attempts)
-        .map_err(|e| format!("No proxies available: {e}"))?;
+    if let Some(rotation) = routing.rotation.as_ref() {
+        return connect_through_timed_rotation(
+            state,
+            &routing.filter,
+            rotation,
+            target_host,
+            target_port,
+        )
+        .await;
+    }
 
+    let candidates =
+        crate::api::fetch::pick_random_valid_proxies(state, &routing.filter, MAX_CONNECT_ATTEMPTS)
+            .map_err(|e| format!("No proxies available: {e}"))?;
+    let (upstream, guard, _) =
+        connect_candidates(state, &candidates, target_host, target_port).await?;
+    Ok((upstream, guard))
+}
+
+async fn connect_through_timed_rotation(
+    state: &Arc<AppState>,
+    filter: &ProxyFilter,
+    rotation: &TimedRotation,
+    target_host: &str,
+    target_port: u16,
+) -> Result<(TcpStream, BindingUseGuard), String> {
+    let session = crate::proxy_rotation::get_or_create_session(
+        state,
+        &rotation.key,
+        &rotation.principal_id,
+        rotation.interval_secs,
+    )
+    .await?;
+
+    loop {
+        let mut session_state = session.state.lock().await;
+        session_state.touch(rotation.interval_secs);
+        let now = Instant::now();
+
+        if let Some(selection) = session_state.selection.as_ref() {
+            if selection.expires_at > now {
+                let selected_id = selection.proxy_id.clone();
+                let selected_exit_ip = selection.exit_ip.clone();
+                let selected_proxy = selectable_proxy_by_id(state, filter, &selected_id)?
+                    .filter(|proxy| proxy_exit_ip(proxy).as_deref() == Some(&selected_exit_ip));
+
+                if let Some(proxy) = selected_proxy {
+                    drop(session_state);
+                    match connect_candidates(state, &[proxy], target_host, target_port).await {
+                        Ok((upstream, guard, _)) => return Ok((upstream, guard)),
+                        Err(error) => {
+                            let mut current = session.state.lock().await;
+                            let same_selection = current
+                                .selection
+                                .as_ref()
+                                .map(|selection| selection.proxy_id == selected_id)
+                                .unwrap_or(false);
+                            if same_selection {
+                                // Retain the previous exit metadata so the replacement
+                                // selection can prefer a different observed IP.
+                                if let Some(selection) = current.selection.as_mut() {
+                                    selection.expires_at = Instant::now();
+                                }
+                            }
+                            tracing::debug!(
+                                session = rotation.session_id,
+                                proxy_id = selected_id,
+                                "Timed-rotation exit failed before expiry: {error}"
+                            );
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+
+        // The per-session mutex stays held only while a replacement is being
+        // selected and connected. Other sessions and the normal random mode
+        // remain independent, while concurrent connections at this boundary
+        // converge on one successful replacement.
+        let previous_selection = session_state.selection.clone();
+        let candidates = timed_rotation_candidates(state, filter, previous_selection.as_ref())?;
+        match connect_candidates(state, &candidates, target_host, target_port).await {
+            Ok((upstream, guard, proxy)) => {
+                let exit_ip = proxy_exit_ip(&proxy)
+                    .ok_or_else(|| "Selected proxy has no measured exit IP".to_string())?;
+                session_state.selection = Some(RotationSelection {
+                    proxy_id: proxy.id.clone(),
+                    exit_ip: exit_ip.clone(),
+                    expires_at: Instant::now() + Duration::from_secs(rotation.interval_secs),
+                });
+                tracing::debug!(
+                    session = rotation.session_id,
+                    interval_secs = rotation.interval_secs,
+                    proxy_id = proxy.id,
+                    exit_ip,
+                    "Timed-rotation session selected an exit"
+                );
+                drop(session_state);
+                return Ok((upstream, guard));
+            }
+            Err(error) => {
+                drop(session_state);
+                return Err(error);
+            }
+        }
+    }
+}
+
+fn timed_rotation_candidates(
+    state: &AppState,
+    filter: &ProxyFilter,
+    previous: Option<&RotationSelection>,
+) -> Result<Vec<PoolProxy>, String> {
+    let previous_exit = previous.map(|selection| selection.exit_ip.as_str());
+    let mut candidates =
+        crate::api::fetch::pick_random_valid_proxies(state, filter, MAX_CONNECT_ATTEMPTS + 1)
+            .map_err(|e| format!("No proxies available: {e}"))?;
+
+    // At a timed boundary, different measured exits are always attempted
+    // first. The previous proxy is appended as the final availability fallback.
+    candidates.retain(|proxy| proxy_exit_ip(proxy).as_deref() != previous_exit);
+
+    let previous_proxy = if let Some(previous) = previous {
+        if let Some(previous_proxy) = selectable_proxy_by_id(state, filter, &previous.proxy_id)? {
+            let is_same_observed_exit =
+                proxy_exit_ip(&previous_proxy).as_deref() == Some(previous.exit_ip.as_str());
+            is_same_observed_exit.then_some(previous_proxy)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // Reserve the final one of the three normal attempts for the old exit
+    // when it is still healthy; otherwise all attempts can target new exits.
+    let new_exit_limit = MAX_CONNECT_ATTEMPTS - usize::from(previous_proxy.is_some());
+    candidates.truncate(new_exit_limit);
+    if let Some(previous_proxy) = previous_proxy {
+        candidates.push(previous_proxy);
+    }
+
+    Ok(candidates)
+}
+
+async fn connect_candidates(
+    state: &Arc<AppState>,
+    candidates: &[PoolProxy],
+    target_host: &str,
+    target_port: u16,
+) -> Result<(TcpStream, BindingUseGuard, PoolProxy), String> {
     if candidates.is_empty() {
         return Err("No proxies match the given filters".into());
     }
@@ -384,7 +535,7 @@ async fn connect_through_pool(
                     "Listener connected via proxy {} (port {local_port}) to {target_host}:{target_port}",
                     proxy.name
                 );
-                return Ok((upstream, guard));
+                return Ok((upstream, guard, proxy.clone()));
             }
             Err(e) => {
                 tracing::debug!(
@@ -400,8 +551,74 @@ async fn connect_through_pool(
     }
 
     Err(format!(
-        "All {max_attempts} proxy attempts failed: {last_err}"
+        "All {} proxy attempts failed: {last_err}",
+        candidates.len()
     ))
+}
+
+fn selectable_proxy_by_id(
+    state: &AppState,
+    filter: &ProxyFilter,
+    proxy_id: &str,
+) -> Result<Option<PoolProxy>, String> {
+    let proxy = crate::api::fetch::find_proxy_snapshot(state, proxy_id)
+        .map_err(|error| format!("Failed to load timed-rotation proxy: {error}"))?;
+    Ok(proxy.filter(|proxy| selectable_proxy_matches(proxy, filter)))
+}
+
+fn selectable_proxy_matches(proxy: &PoolProxy, filter: &ProxyFilter) -> bool {
+    if proxy.status != ProxyStatus::Valid || proxy_exit_ip(proxy).is_none() {
+        return false;
+    }
+    if filter
+        .proxy_type
+        .as_ref()
+        .map(|proxy_type| proxy.proxy_type != *proxy_type)
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    let Some(quality) = proxy.quality.as_ref() else {
+        return false;
+    };
+    if filter.chatgpt && !quality.chatgpt_accessible
+        || filter.google && !quality.google_accessible
+        || filter.residential && !quality.is_residential
+    {
+        return false;
+    }
+    if filter
+        .risk_max
+        .map(|max| quality.risk_score > max)
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    if filter
+        .country
+        .as_ref()
+        .map(|country| {
+            !quality
+                .country
+                .as_deref()
+                .map(|value| value.eq_ignore_ascii_case(country))
+                .unwrap_or(false)
+        })
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    true
+}
+
+fn proxy_exit_ip(proxy: &PoolProxy) -> Option<String> {
+    proxy
+        .quality
+        .as_ref()
+        .and_then(|quality| quality.ip_address.as_deref())
+        .map(str::trim)
+        .filter(|ip| !ip.is_empty())
+        .map(str::to_string)
 }
 
 /// SOCKS5 client: connect to sing-box's local binding and issue a CONNECT.
@@ -474,8 +691,30 @@ async fn socks5_connect_upstream(
 /// Verify credentials and extract per-connection filters from the username.
 /// Returns `None` if auth fails.
 struct ProxyAuthentication {
-    filter: ProxyFilter,
+    routing: ProxyRouting,
     account_id: Option<String>,
+}
+
+struct ProxyRouting {
+    filter: ProxyFilter,
+    rotation: Option<TimedRotation>,
+}
+
+struct TimedRotation {
+    key: String,
+    principal_id: String,
+    session_id: String,
+    interval_secs: u64,
+}
+
+struct ParsedUsernameOptions {
+    filter: ProxyFilter,
+    rotation: Option<RotationDirective>,
+}
+
+struct RotationDirective {
+    session_id: String,
+    interval_secs: u64,
 }
 
 fn authenticate_and_parse(
@@ -485,11 +724,9 @@ fn authenticate_and_parse(
     password: &str,
 ) -> Option<ProxyAuthentication> {
     if state.config.proxy_access.static_enabled() {
-        if let Some(filter) = authenticate_static_and_parse(cfg, username, password) {
-            return Some(ProxyAuthentication {
-                filter,
-                account_id: None,
-            });
+        if let Some(parsed) = authenticate_static_and_parse(cfg, username, password) {
+            let principal_id = format!("static:{}:{}", cfg.name, cfg.username);
+            return Some(build_proxy_authentication(principal_id, None, parsed));
         }
     }
 
@@ -512,17 +749,20 @@ fn authenticate_and_parse(
         return None;
     }
 
-    Some(ProxyAuthentication {
-        filter: suffix.map(parse_filter_suffix).unwrap_or_default(),
-        account_id: Some(account.id.clone()),
-    })
+    let parsed = parse_username_suffix(suffix.unwrap_or(""))?;
+    let account_id = account.id.clone();
+    Some(build_proxy_authentication(
+        account_id.clone(),
+        Some(account_id),
+        parsed,
+    ))
 }
 
 fn authenticate_static_and_parse(
     cfg: &crate::config::ProxyListenerConfig,
     username: &str,
     password: &str,
-) -> Option<ProxyFilter> {
+) -> Option<ParsedUsernameOptions> {
     if password != cfg.password {
         return None;
     }
@@ -532,13 +772,38 @@ fn authenticate_static_and_parse(
     }
     let suffix = &username[cfg.username.len()..];
     if suffix.is_empty() {
-        return Some(ProxyFilter::default());
+        return parse_username_suffix("");
     }
     // Suffix must start with '-'
     if !suffix.starts_with('-') {
         return None;
     }
-    Some(parse_filter_suffix(&suffix[1..]))
+    parse_username_suffix(&suffix[1..])
+}
+
+fn build_proxy_authentication(
+    principal_id: String,
+    account_id: Option<String>,
+    parsed: ParsedUsernameOptions,
+) -> ProxyAuthentication {
+    let rotation = parsed.rotation.map(|directive| TimedRotation {
+        key: rotation_key(
+            &principal_id,
+            &directive.session_id,
+            directive.interval_secs,
+            &parsed.filter,
+        ),
+        principal_id,
+        session_id: directive.session_id,
+        interval_secs: directive.interval_secs,
+    });
+    ProxyAuthentication {
+        routing: ProxyRouting {
+            filter: parsed.filter,
+            rotation,
+        },
+        account_id,
+    }
 }
 
 fn mark_account_used(state: &AppState, account_id: Option<&str>) {
@@ -565,9 +830,12 @@ fn mark_account_used(state: &AppState, account_id: Option<&str>) {
     }
 }
 
-/// Parse `-country-US-residential-chatgpt-google-type-vmess` into a `ProxyFilter`.
-fn parse_filter_suffix(suffix: &str) -> ProxyFilter {
+/// Parse filters plus the optional `-session-ID-rotate-SECONDS` timed policy.
+/// A timed policy is accepted only when both fields are present and valid.
+fn parse_username_suffix(suffix: &str) -> Option<ParsedUsernameOptions> {
     let mut filter = ProxyFilter::default();
+    let mut session_id = None;
+    let mut interval_secs = None;
     let parts: Vec<&str> = suffix.split('-').collect();
     let mut i = 0;
     while i < parts.len() {
@@ -600,13 +868,68 @@ fn parse_filter_suffix(suffix: &str) -> ProxyFilter {
                 filter.google = true;
                 i += 1;
             }
+            "session" => {
+                let value = parts.get(i + 1).copied()?;
+                if session_id.is_some() || !crate::proxy_rotation::valid_session_id(value) {
+                    return None;
+                }
+                session_id = Some(value.to_string());
+                i += 2;
+            }
+            "rotate" => {
+                let value = parts.get(i + 1)?.parse::<u64>().ok()?;
+                if interval_secs.is_some()
+                    || !(crate::proxy_rotation::MIN_INTERVAL_SECS
+                        ..=crate::proxy_rotation::MAX_INTERVAL_SECS)
+                        .contains(&value)
+                {
+                    return None;
+                }
+                interval_secs = Some(value);
+                i += 2;
+            }
             _ => {
                 // Unknown token, skip
                 i += 1;
             }
         }
     }
-    filter
+
+    let rotation = match (session_id, interval_secs) {
+        (None, None) => None,
+        (Some(session_id), Some(interval_secs)) => Some(RotationDirective {
+            session_id,
+            interval_secs,
+        }),
+        _ => return None,
+    };
+
+    Some(ParsedUsernameOptions { filter, rotation })
+}
+
+fn rotation_key(
+    principal_id: &str,
+    session_id: &str,
+    interval_secs: u64,
+    filter: &ProxyFilter,
+) -> String {
+    let country = filter.country.as_deref().unwrap_or("");
+    let proxy_type = filter.proxy_type.as_deref().unwrap_or("");
+    format!(
+        "p{}:{}|s{}:{}|i{}|c{}:{}|t{}:{}|r{}|g{}|h{}",
+        principal_id.len(),
+        principal_id,
+        session_id.len(),
+        session_id,
+        interval_secs,
+        country.len(),
+        country,
+        proxy_type.len(),
+        proxy_type,
+        u8::from(filter.residential),
+        u8::from(filter.google),
+        u8::from(filter.chatgpt),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -717,7 +1040,9 @@ mod tests {
 
     #[test]
     fn parse_filters_basic() {
-        let f = parse_filter_suffix("country-US-residential");
+        let f = parse_username_suffix("country-US-residential")
+            .unwrap()
+            .filter;
         assert_eq!(f.country, Some("US".into()));
         assert!(f.residential);
         assert!(!f.chatgpt);
@@ -725,7 +1050,9 @@ mod tests {
 
     #[test]
     fn parse_filters_all() {
-        let f = parse_filter_suffix("chatgpt-google-country-JP-residential-type-vmess");
+        let f = parse_username_suffix("chatgpt-google-country-JP-residential-type-vmess")
+            .unwrap()
+            .filter;
         assert!(f.chatgpt);
         assert!(f.google);
         assert!(f.residential);
@@ -735,7 +1062,7 @@ mod tests {
 
     #[test]
     fn parse_filters_empty() {
-        let f = parse_filter_suffix("");
+        let f = parse_username_suffix("").unwrap().filter;
         assert!(!f.chatgpt);
         assert!(!f.residential);
         assert_eq!(f.country, None);
@@ -754,11 +1081,41 @@ mod tests {
         assert!(f.is_some());
         // With filters
         let f = authenticate_static_and_parse(&cfg, "admin-country-US", "secret").unwrap();
-        assert_eq!(f.country, Some("US".into()));
+        assert_eq!(f.filter.country, Some("US".into()));
         // Wrong password
         assert!(authenticate_static_and_parse(&cfg, "admin", "wrong").is_none());
         // Wrong username
         assert!(authenticate_static_and_parse(&cfg, "other", "secret").is_none());
+    }
+
+    #[test]
+    fn timed_rotation_requires_a_complete_valid_pair() {
+        let parsed =
+            parse_username_suffix("country-US-session-crawler_01-rotate-300-residential").unwrap();
+        let rotation = parsed.rotation.unwrap();
+        assert_eq!(rotation.session_id, "crawler_01");
+        assert_eq!(rotation.interval_secs, 300);
+        assert_eq!(parsed.filter.country, Some("US".into()));
+        assert!(parsed.filter.residential);
+
+        assert!(parse_username_suffix("session-crawler_01").is_none());
+        assert!(parse_username_suffix("rotate-300").is_none());
+        assert!(parse_username_suffix("session-bad$id-rotate-300").is_none());
+        assert!(parse_username_suffix("session-good-rotate-0").is_none());
+        assert!(parse_username_suffix("session-good-rotate-86401").is_none());
+        assert!(parse_username_suffix("session-a-session-b-rotate-30").is_none());
+    }
+
+    #[test]
+    fn rotation_key_separates_modes_filters_and_principals() {
+        let us = parse_username_suffix("country-US").unwrap().filter;
+        let jp = parse_username_suffix("country-JP").unwrap().filter;
+        let base = rotation_key("account-a", "app", 300, &us);
+        assert_eq!(base, rotation_key("account-a", "app", 300, &us));
+        assert_ne!(base, rotation_key("account-b", "app", 300, &us));
+        assert_ne!(base, rotation_key("account-a", "other", 300, &us));
+        assert_ne!(base, rotation_key("account-a", "app", 60, &us));
+        assert_ne!(base, rotation_key("account-a", "app", 300, &jp));
     }
 
     #[test]

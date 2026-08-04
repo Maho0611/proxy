@@ -152,6 +152,7 @@ pub async fn delete_user(
         state.db.delete_proxy_account(&account.id)?;
         state.proxy_accounts.remove(&account.username);
         state.proxy_account_last_used.remove(&account.id);
+        crate::proxy_rotation::remove_principal_sessions(&state, &account.id);
     }
     state.db.delete_user(&id)?;
     Ok(Json(json!({ "message": "User deleted" })))
@@ -189,6 +190,9 @@ fn set_owned_proxy_account_enabled(
         .ok_or_else(|| AppError::NotFound("Proxy account not found".into()))?;
     state
         .proxy_accounts
-        .insert(account.username.clone(), account);
+        .insert(account.username.clone(), account.clone());
+    if !enabled {
+        crate::proxy_rotation::remove_principal_sessions(state, &account.id);
+    }
     Ok(())
 }

@@ -43,6 +43,19 @@ pub async fn get_user_access(
         "account": account,
         "filters": filter_metadata(&stats),
         "rotation_mode": "new_tcp_connection",
+        "rotation_modes": {
+            "per_connection": {
+                "enabled": true,
+                "username_suffix": null,
+            },
+            "timed": {
+                "enabled": true,
+                "username_suffix": "session-{id}-rotate-{seconds}",
+                "min_interval_secs": crate::proxy_rotation::MIN_INTERVAL_SECS,
+                "max_interval_secs": crate::proxy_rotation::MAX_INTERVAL_SECS,
+                "max_session_id_length": crate::proxy_rotation::MAX_SESSION_ID_LEN,
+            }
+        },
     })))
 }
 
@@ -162,6 +175,9 @@ pub async fn update_admin_account(
     state
         .proxy_accounts
         .insert(account.username.clone(), account.clone());
+    if !account.enabled {
+        crate::proxy_rotation::remove_principal_sessions(&state, &account.id);
+    }
     Ok(Json(json!({ "account": account })))
 }
 
@@ -178,6 +194,7 @@ pub async fn delete_admin_account(
     }
     state.proxy_accounts.remove(&existing.username);
     state.proxy_account_last_used.remove(&id);
+    crate::proxy_rotation::remove_principal_sessions(&state, &id);
     Ok(Json(json!({ "message": "Proxy account deleted" })))
 }
 
