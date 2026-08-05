@@ -105,10 +105,17 @@ tr:hover td { background:rgba(70,220,255,.035); }
 .pagination button:disabled { opacity:.4; cursor:default; }
 .pagination .page-info { font-size:13px; color:var(--text-dim); margin:0 8px; }
 .overlap-list { display:flex; gap:4px; flex-wrap:wrap; max-width:300px; }
+.overlap-list.is-truncated { cursor:help; border-radius:2px; }
+.overlap-list.is-truncated:focus-visible { outline:1px solid var(--primary); outline-offset:3px; }
 .overlap-chip { color:var(--warn); border:1px solid rgba(255,200,87,.3); background:rgba(255,200,87,.07); padding:3px 6px; font-size:10px; }
+.overlap-more { color:var(--text-dim); white-space:nowrap; }
 .metric-pair { display:flex; align-items:baseline; gap:5px; }
 .metric-pair strong { color:var(--text-bright); font:700 14px Consolas,monospace; }
 .metric-pair small { color:var(--text-dim); font-size:10px; }
+.subscription-section-toggle { display:inline-flex; align-items:center; gap:6px; padding:5px 9px; border:1px solid var(--border); border-radius:2px; color:var(--text-dim); background:rgba(70,220,255,.04); font-size:11px; cursor:pointer; transition:color .2s,border-color .2s,background .2s; }
+.subscription-section-toggle:hover, .subscription-section-toggle:focus-visible { color:var(--primary); border-color:var(--primary); background:rgba(70,220,255,.08); outline:none; }
+.subscription-section-toggle-icon { display:inline-block; color:var(--primary); transition:transform .2s; }
+.subscription-section-toggle[aria-expanded="false"] .subscription-section-toggle-icon { transform:rotate(-90deg); }
 .subscription-card { padding:10px 16px 16px; }
 .subscription-table { min-width:1476px; table-layout:fixed; }
 .subscription-table th, .subscription-table td { padding:10px 9px; vertical-align:middle; }
@@ -346,27 +353,35 @@ body.modal-open { overflow:hidden; }
 
   <!-- Subscriptions -->
   <div class="section">
-    <div class="section-title">订阅源</div>
-    <div class="card" style="margin-bottom:12px">
-      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-        <strong>全局默认自动更新(分)</strong>
-        <input id="default-sub-refresh-interval" type="number" min="0" step="1" value="0" style="width:110px">
-        <button class="btn btn-sm" onclick="saveDefaultSubRefresh()">保存</button>
-        <span style="color:var(--text-dim);font-size:12px">仅对“跟随全局默认值”的 URL 订阅生效，0 表示关闭</span>
-      </div>
+    <div class="section-title">
+      <span>订阅源</span>
+      <button class="subscription-section-toggle" id="subscription-section-toggle" type="button" aria-expanded="true" aria-controls="subscription-section-body" onclick="toggleSubscriptionSection()">
+        <span id="subscription-section-toggle-label">收起</span>
+        <span class="subscription-section-toggle-icon" aria-hidden="true">▼</span>
+      </button>
     </div>
-    <div class="card subscription-card">
-      <table class="subscription-table">
-        <colgroup>
-          <col style="width:110px"><col style="width:76px"><col style="width:200px">
-          <col style="width:140px"><col style="width:250px"><col style="width:170px">
-          <col style="width:125px"><col style="width:125px"><col style="width:280px">
-        </colgroup>
-        <thead><tr><th>名称</th><th>类型</th><th>URL</th><th>节点 / 重复</th><th>订阅重合关系</th><th>自动更新(分)</th><th>更新时间</th><th>创建时间</th><th>操作</th></tr></thead>
-        <tbody id="sub-table"></tbody>
-      </table>
-      <div class="empty" id="sub-empty">暂无订阅源</div>
-      <div class="subscription-edit-hint">双击订阅行可修改名称、类型、URL、订阅内容及自动更新间隔</div>
+    <div id="subscription-section-body">
+      <div class="card" style="margin-bottom:12px">
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <strong>全局默认自动更新(分)</strong>
+          <input id="default-sub-refresh-interval" type="number" min="0" step="1" value="0" style="width:110px">
+          <button class="btn btn-sm" onclick="saveDefaultSubRefresh()">保存</button>
+          <span style="color:var(--text-dim);font-size:12px">仅对“跟随全局默认值”的 URL 订阅生效，0 表示关闭</span>
+        </div>
+      </div>
+      <div class="card subscription-card">
+        <table class="subscription-table">
+          <colgroup>
+            <col style="width:110px"><col style="width:76px"><col style="width:200px">
+            <col style="width:140px"><col style="width:250px"><col style="width:170px">
+            <col style="width:125px"><col style="width:125px"><col style="width:280px">
+          </colgroup>
+          <thead><tr><th>名称</th><th>类型</th><th>URL</th><th>节点 / 重复</th><th>订阅重合关系</th><th>自动更新(分)</th><th>更新时间</th><th>创建时间</th><th>操作</th></tr></thead>
+          <tbody id="sub-table"></tbody>
+        </table>
+        <div class="empty" id="sub-empty">暂无订阅源</div>
+        <div class="subscription-edit-hint">双击订阅行可修改名称、类型、URL、订阅内容及自动更新间隔</div>
+      </div>
     </div>
   </div>
 
@@ -500,6 +515,7 @@ let latestProxyCredential = '';
 let currentJobs = null;
 let jobStatusLoading = false;
 const previousJobStatuses = { validation: 'idle', quality: 'idle' };
+const SUBSCRIPTION_SECTION_STATE_KEY = 'zenproxy_subscription_section_state';
 
 // --- Auth ---
 const STORAGE_KEY = 'zenproxy_admin_password';
@@ -581,7 +597,48 @@ function toast(msg) {
 }
 
 function esc(s) { if(!s) return ''; const d=document.createElement('div'); d.textContent=s; return d.innerHTML; }
+function escAttr(s) { return esc(String(s ?? '')).replace(/"/g, '&quot;').replace(/'/g, '&#39;'); }
 function fmtDate(s) { return s ? new Date(s).toLocaleString() : '-'; }
+
+function setSubscriptionSectionExpanded(expanded, persist = true) {
+  const body = document.getElementById('subscription-section-body');
+  const toggle = document.getElementById('subscription-section-toggle');
+  const label = document.getElementById('subscription-section-toggle-label');
+  if (!body || !toggle || !label) return;
+  body.hidden = !expanded;
+  toggle.setAttribute('aria-expanded', String(expanded));
+  toggle.setAttribute('aria-label', expanded ? '收起订阅源' : '展开订阅源');
+  label.textContent = expanded ? '收起' : '展开';
+  if (persist) localStorage.setItem(SUBSCRIPTION_SECTION_STATE_KEY, expanded ? 'expanded' : 'collapsed');
+}
+
+function toggleSubscriptionSection() {
+  const toggle = document.getElementById('subscription-section-toggle');
+  if (!toggle) return;
+  setSubscriptionSectionExpanded(toggle.getAttribute('aria-expanded') !== 'true');
+}
+
+function restoreSubscriptionSectionState() {
+  setSubscriptionSectionExpanded(localStorage.getItem(SUBSCRIPTION_SECTION_STATE_KEY) !== 'collapsed', false);
+}
+
+function renderOverlapCell(overlapItems) {
+  if (!overlapItems.length) return '<span style="color:var(--text-dim)">无跨订阅重复</span>';
+  const visibleOverlaps = overlapItems.slice(0, 3);
+  const hiddenOverlapCount = overlapItems.length - visibleOverlaps.length;
+  const overlapDetails = overlapItems.map(o => `${o.name}：完全重复 ${o.exact} / 入口 ${o.endpoints} / 出口 ${o.exits}`).join('\n');
+  const fullDetails = `全部 ${overlapItems.length} 项重合关系\n${overlapDetails}`;
+  const tooltipAttributes = hiddenOverlapCount
+    ? ` tabindex="0" title="${escAttr(fullDetails)}" aria-label="${escAttr(fullDetails.replace(/\n/g, '；'))}"`
+    : '';
+  const chips = visibleOverlaps.map((o, index) => {
+    const more = hiddenOverlapCount && index === visibleOverlaps.length - 1
+      ? `<span class="overlap-more"> · 另 ${hiddenOverlapCount} 项</span>`
+      : '';
+    return `<span class="overlap-chip">${esc(o.name)} · 完全重复 ${o.exact} / 入口 ${o.endpoints} / 出口 ${o.exits}${more}</span>`;
+  }).join('');
+  return `<div class="overlap-list${hiddenOverlapCount ? ' is-truncated' : ''}"${tooltipAttributes}>${chips}</div>`;
+}
 
 const jobPhaseLabels = {
   idle:'等待任务', 'waiting-for-bindings':'等待端口资源', preparing:'准备候选节点',
@@ -919,9 +976,7 @@ function renderSubscriptions(d) {
         endpoints: Number(item.shared_endpoints || item.shared_count || item.count || 0)
       };
     }).sort((a, b) => b.exact - a.exact || b.exits - a.exits || b.endpoints - a.endpoints || a.name.localeCompare(b.name, 'zh-CN'));
-    const overlapCell = overlapItems.length
-      ? `<div class="overlap-list">${overlapItems.map(o => `<span class="overlap-chip" title="完整配置完全相同 ${o.exact}，共享入口 ${o.endpoints}，共享出口 IP ${o.exits}">${esc(o.name)} · 完全重复 ${o.exact} / 入口 ${o.endpoints} / 出口 ${o.exits}</span>`).join('')}</div>`
-      : '<span style="color:var(--text-dim)">无跨订阅重复</span>';
+    const overlapCell = renderOverlapCell(overlapItems);
     const inventoryCell = `<div class="metric-pair"><strong>${s.proxy_count ?? 0}</strong><small>/ 原始 ${s.raw_proxy_count ?? s.proxy_count ?? 0}</small></div>
       <div style="margin-top:4px;color:${importDuplicateCount ? 'var(--warn)' : 'var(--text-dim)'};font-size:10px" title="订阅内容中完全相同、导入时直接丢弃且不会进入验活的节点">导入重复 ${importDuplicateCount}（未验活）</div>
       <div style="margin-top:3px;color:${exitDuplicateCount ? 'var(--warn)' : 'var(--text-dim)'};font-size:10px">出口重复 ${exitDuplicateCount}${uniqueCount == null ? '' : ` · 唯一出口 ${uniqueCount}`}</div>`;
@@ -1405,6 +1460,7 @@ function updateCommandTime() {
   }).format(new Date());
 }
 updateCommandTime();
+restoreSubscriptionSectionState();
 setInterval(updateCommandTime, 1000);
 setInterval(loadJobStatus, 1500);
 checkAuth();
