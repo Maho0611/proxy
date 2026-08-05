@@ -22,6 +22,8 @@ memory_restart_mb = 3072
 
 [database]
 url = "postgresql://postgres:change-me@127.0.0.1:5432/zenproxy"
+max_connections = 8
+checkout_timeout_ms = 5000
 
 [validation]
 url = "https://www.gstatic.com/generate_204"

@@ -46,6 +46,7 @@ pub async fn delete_proxy(
     state.binding_usage.remove(&id);
     state.pool.remove(&id);
     state.db.delete_proxy(&id)?;
+    crate::selection::rebuild(state.as_ref())?;
     crate::api::fetch::invalidate_stats_cache(state.as_ref());
     crate::api::sub_export::invalidate_subscription_export_cache(state.as_ref());
     Ok(Json(json!({ "message": "Proxy deleted" })))
@@ -75,6 +76,7 @@ pub async fn cleanup_proxies(
         state.pool.remove(&proxy.id);
     }
     if count > 0 {
+        crate::selection::rebuild(state.as_ref())?;
         crate::api::fetch::invalidate_stats_cache(state.as_ref());
         crate::api::sub_export::invalidate_subscription_export_cache(state.as_ref());
     }
@@ -123,7 +125,13 @@ pub async fn get_job_status(State(state): State<Arc<AppState>>) -> Json<serde_js
 pub async fn get_stats(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let stats = crate::api::fetch::get_cached_stats(state.as_ref())?;
+    let mut stats = crate::api::fetch::get_cached_stats(state.as_ref())?;
+    if let Some(object) = stats.as_object_mut() {
+        object.insert(
+            "database_runtime".into(),
+            serde_json::to_value(state.db.runtime_metrics()).unwrap_or_default(),
+        );
+    }
     Ok(Json(stats))
 }
 

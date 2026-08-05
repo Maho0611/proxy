@@ -149,30 +149,36 @@ pub async fn cleanup_proxy_binding(
     proxy_id: &str,
     local_port: Option<u16>,
 ) {
+    let binding_id = state
+        .db
+        .get_proxy_binding_owner(proxy_id)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| proxy_id.to_string());
     let removed_port = {
         let mut mgr = state.singbox.lock().await;
         match local_port {
-            Some(port) => match mgr.remove_binding(proxy_id, port).await {
+            Some(port) => match mgr.remove_binding(&binding_id, port).await {
                 Ok(()) => Some(port),
                 Err(e) => {
                     tracing::warn!(
-                        "Failed to remove binding {proxy_id} on known port {port}: {e}; retrying by API lookup"
+                        "Failed to remove binding {binding_id} (requested by {proxy_id}) on known port {port}: {e}; retrying by API lookup"
                     );
-                    match mgr.remove_binding_by_id(proxy_id).await {
+                    match mgr.remove_binding_by_id(&binding_id).await {
                         Ok(port) => port,
                         Err(retry_err) => {
                             tracing::warn!(
-                                "Failed to remove binding {proxy_id} by API lookup after direct remove error: {retry_err}"
+                                "Failed to remove binding {binding_id} by API lookup after direct remove error: {retry_err}"
                             );
                             None
                         }
                     }
                 }
             },
-            None => match mgr.remove_binding_by_id(proxy_id).await {
+            None => match mgr.remove_binding_by_id(&binding_id).await {
                 Ok(port) => port,
                 Err(e) => {
-                    tracing::warn!("Failed to remove binding {proxy_id} by API lookup: {e}");
+                    tracing::warn!("Failed to remove binding {binding_id} by API lookup: {e}");
                     None
                 }
             },
@@ -180,17 +186,29 @@ pub async fn cleanup_proxy_binding(
     };
 
     if let Some(port) = local_port {
-        state.relay_clients.remove(&port);
+        state
+            .relay_clients
+            .retain(|(cached_port, _), _| *cached_port != port);
     }
     if let Some(port) = removed_port {
-        state.relay_clients.remove(&port);
+        state
+            .relay_clients
+            .retain(|(cached_port, _), _| *cached_port != port);
     }
     if local_port.is_some() || removed_port.is_some() {
-        state.pool.clear_local_port(proxy_id);
+        let cleared_port = removed_port.or(local_port);
+        let affected_ids: Vec<String> = state
+            .pool
+            .get_all()
+            .into_iter()
+            .filter(|proxy| proxy.id == proxy_id || proxy.local_port == cleared_port)
+            .map(|proxy| proxy.id)
+            .collect();
+        for id in affected_ids {
+            state.pool.clear_local_port(&id);
+            state.binding_usage.remove(&id);
+        }
         state.db.update_proxy_local_port_null(proxy_id).ok();
-    }
-    if removed_port.is_some() {
-        state.binding_usage.remove(proxy_id);
     }
 }
 

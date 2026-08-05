@@ -73,8 +73,6 @@ async fn fetch_subscription_content(url: &str, sub_type: &str) -> Result<String,
 #[derive(Debug, Clone)]
 pub enum SyncMode {
     Normal,
-    Validation,
-    QualityCheck,
     /// Bind this explicit set for a manual subscription-scoped maintenance run.
     Targeted(Vec<String>),
 }
@@ -89,16 +87,10 @@ pub struct SyncBindingsResult {
 pub async fn list_subscriptions(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let subs = state.db.get_subscriptions()?;
-    let (duplicate_stats, overlap_edges) = state.db.get_subscription_duplicate_overview()?;
-    let stats_by_subscription: std::collections::HashMap<_, _> = duplicate_stats
-        .into_iter()
-        .map(|stats| (stats.subscription_id.clone(), stats))
-        .collect();
+    let subs = state.db.get_subscription_summaries()?;
     let subscriptions: Vec<_> = subs
         .into_iter()
         .map(|sub| {
-            let duplicate_stats = stats_by_subscription.get(&sub.id);
             json!({
                 "id": sub.id,
                 "name": sub.name,
@@ -112,7 +104,6 @@ pub async fn list_subscriptions(
                 "last_refresh_at": sub.last_refresh_at,
                 "created_at": sub.created_at,
                 "updated_at": sub.updated_at,
-                "duplicate_stats": duplicate_stats,
             })
         })
         .collect();
@@ -121,9 +112,81 @@ pub async fn list_subscriptions(
     )?;
     Ok(Json(json!({
         "subscriptions": subscriptions,
-        "overlap_edges": overlap_edges,
         "default_refresh_interval_mins": default_refresh_interval_mins,
     })))
+}
+
+pub async fn get_subscription(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let subscription = state
+        .db
+        .get_subscription(&id)?
+        .ok_or_else(|| AppError::NotFound("Subscription not found".into()))?;
+    Ok(Json(json!({ "subscription": subscription })))
+}
+
+pub async fn get_subscription_duplicates(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    const CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+    let now = tokio::time::Instant::now();
+    let generation = state
+        .subscription_duplicate_generation
+        .load(std::sync::atomic::Ordering::Acquire);
+    if let Some(cached) = state.subscription_duplicate_cache.get(&()) {
+        if cached.generation == generation && cached.expires_at > now {
+            return Ok(Json(json!({
+                "duplicate_stats": cached.stats,
+                "overlap_edges": cached.overlaps,
+                "cached": true,
+            })));
+        }
+    }
+
+    let _singleflight = state.subscription_duplicate_cache_fill.lock().await;
+    loop {
+        let generation = state
+            .subscription_duplicate_generation
+            .load(std::sync::atomic::Ordering::Acquire);
+        let now = tokio::time::Instant::now();
+        if let Some(cached) = state.subscription_duplicate_cache.get(&()) {
+            if cached.generation == generation && cached.expires_at > now {
+                return Ok(Json(json!({
+                    "duplicate_stats": cached.stats,
+                    "overlap_edges": cached.overlaps,
+                    "cached": true,
+                })));
+            }
+        }
+
+        let (stats, overlaps) = state.db.get_subscription_duplicate_overview()?;
+        // A mutation can invalidate the cache while the aggregate query is in
+        // flight. Never publish that stale result; recompute under the same
+        // singleflight guard for the new generation instead.
+        if state
+            .subscription_duplicate_generation
+            .load(std::sync::atomic::Ordering::Acquire)
+            != generation
+        {
+            continue;
+        }
+        state.subscription_duplicate_cache.insert(
+            (),
+            crate::SubscriptionDuplicateCacheEntry {
+                stats: stats.clone(),
+                overlaps: overlaps.clone(),
+                expires_at: now + CACHE_TTL,
+                generation,
+            },
+        );
+        return Ok(Json(json!({
+            "duplicate_stats": stats,
+            "overlap_edges": overlaps,
+            "cached": false,
+        })));
+    }
 }
 
 pub async fn add_subscription(
@@ -242,12 +305,6 @@ pub async fn add_subscription(
     {
         return Ok(already_imported_response(existing));
     }
-    state.db.inherit_exact_duplicate_states(
-        &proxy_rows
-            .iter()
-            .map(|proxy| proxy.id.clone())
-            .collect::<Vec<_>>(),
-    )?;
     crate::api::sub_export::invalidate_subscription_export_cache(state.as_ref());
     crate::api::fetch::invalidate_stats_cache(state.as_ref());
 
@@ -298,17 +355,15 @@ pub async fn delete_subscription(
         .into_iter()
         .collect::<Vec<_>>();
     for proxy in &proxies {
-        crate::bindings::cleanup_proxy_binding(
-            &state,
-            &proxy.id,
-            proxy.local_port.map(|port| port as u16),
-        )
-        .await;
+        if let Some(port) = proxy.local_port {
+            crate::bindings::cleanup_proxy_binding(&state, &proxy.id, Some(port as u16)).await;
+        }
         state.binding_usage.remove(&proxy.id);
     }
 
     state.pool.remove_by_subscription(&id);
     state.db.delete_subscription(&id)?;
+    crate::selection::rebuild(state.as_ref())?;
     crate::api::sub_export::invalidate_subscription_export_cache(state.as_ref());
     crate::api::fetch::invalidate_stats_cache(state.as_ref());
 
@@ -536,8 +591,9 @@ pub async fn refresh_subscription_core(
     let now = chrono::Utc::now().to_rfc3339();
     let mut total = 0;
     let mut kept_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut refreshed_proxy_rows = Vec::new();
+    let mut unchanged_pool_updates = Vec::new();
     let mut new_proxy_rows = Vec::new();
-    let mut state_inheritance_ids = Vec::new();
 
     for (pc, exact_old) in parsed.iter().zip(exact_old_matches) {
         let key = (
@@ -555,32 +611,36 @@ pub async fn refresh_subscription_core(
 
             let new_config = serde_json::to_string(&pc.singbox_outbound).unwrap_or_default();
             let old_value = serde_json::from_str::<serde_json::Value>(&old.config_json).ok();
-            let config_changed = old_value.as_ref().map_or(true, |old| {
+            let config_changed = old_value.as_ref().is_none_or(|old| {
                 !outbound_definitions_equal(old, &pc.singbox_outbound)
             });
+            let mut refreshed = old.clone();
+            refreshed.name = pc.name.clone();
+            refreshed.proxy_type = pc.proxy_type.to_string();
+            refreshed.server = pc.server.clone();
+            refreshed.port = i32::from(pc.port);
+            refreshed.config_json = new_config.clone();
+            refreshed.updated_at = now.clone();
+            refreshed.orphaned_at = None;
             if config_changed {
-                crate::bindings::cleanup_proxy_binding(
-                    state,
-                    &old.id,
-                    old.local_port.map(|port| port as u16),
-                )
-                .await;
+                if let Some(port) = old.local_port {
+                    crate::bindings::cleanup_proxy_binding(state, &old.id, Some(port as u16)).await;
+                }
                 state.binding_usage.remove(&old.id);
                 state.pool.remove(&old.id);
-                state
-                    .db
-                    .reset_proxy_after_config_change(&old.id, &pc.name, &new_config)
-                    .map_err(|e| format!("Failed to reset changed proxy config: {e}"))?;
-                state_inheritance_ids.push(old.id.clone());
+                refreshed.is_valid = false;
+                refreshed.local_port = None;
+                refreshed.error_count = 0;
+                refreshed.last_error = None;
+                refreshed.last_validated = None;
             } else {
-                state
-                    .db
-                    .update_proxy_config(&old.id, &pc.name, &new_config)
-                    .map_err(|e| format!("Failed to update proxy config: {e}"))?;
-                state
-                    .pool
-                    .update_proxy_config(&old.id, &pc.name, pc.singbox_outbound.clone());
+                unchanged_pool_updates.push((
+                    old.id.clone(),
+                    pc.name.clone(),
+                    pc.singbox_outbound.clone(),
+                ));
             }
+            refreshed_proxy_rows.push(refreshed);
 
             total += 1;
         } else {
@@ -603,20 +663,21 @@ pub async fn refresh_subscription_core(
                 updated_at: now.clone(),
                 orphaned_at: None,
             });
-            state_inheritance_ids.push(proxy_id);
             total += 1;
         }
     }
 
     state
         .db
-        .insert_proxies_batch(&new_proxy_rows)
-        .map_err(|e| format!("Failed to insert proxies: {e}"))?;
+        .insert_proxies_batch(&refreshed_proxy_rows)
+        .map_err(|e| format!("Failed to update existing proxies as a batch: {e}"))?;
+    for (id, name, outbound) in unchanged_pool_updates {
+        state.pool.update_proxy_config(&id, &name, outbound);
+    }
     state
         .db
-        .inherit_exact_duplicate_states(&state_inheritance_ids)
-        .map_err(|e| format!("Failed to inherit exact-duplicate state: {e}"))?;
-
+        .insert_proxies_batch(&new_proxy_rows)
+        .map_err(|e| format!("Failed to insert proxies: {e}"))?;
     // Handle old proxies that no longer appear in the new list:
     // - explicit invalid: delete immediately
     // - valid: keep as orphaned fallback
@@ -624,26 +685,33 @@ pub async fn refresh_subscription_core(
     let mut removed_invalid = 0usize;
     let mut orphaned_valid = 0usize;
     let mut orphaned_untested = 0usize;
+    let mut orphaned_ids = Vec::new();
+    let mut invalid_ids = Vec::new();
     for old in old_map.values().flatten() {
         if old.is_valid {
-            state.db.mark_proxy_orphaned(&old.id, &now).ok();
+            orphaned_ids.push(old.id.clone());
             orphaned_valid += 1;
         } else if old.last_validated.is_some() {
-            crate::bindings::cleanup_proxy_binding(
-                state,
-                &old.id,
-                old.local_port.map(|port| port as u16),
-            )
-            .await;
+            if let Some(port) = old.local_port {
+                crate::bindings::cleanup_proxy_binding(state, &old.id, Some(port as u16)).await;
+            }
             state.binding_usage.remove(&old.id);
             state.pool.remove(&old.id);
-            state.db.delete_proxy(&old.id).ok();
+            invalid_ids.push(old.id.clone());
             removed_invalid += 1;
         } else {
-            state.db.mark_proxy_orphaned(&old.id, &now).ok();
+            orphaned_ids.push(old.id.clone());
             orphaned_untested += 1;
         }
     }
+    state
+        .db
+        .mark_proxies_orphaned(&orphaned_ids, &now)
+        .map_err(|e| format!("Failed to mark removed proxies as orphaned: {e}"))?;
+    state
+        .db
+        .delete_proxies(&invalid_ids)
+        .map_err(|e| format!("Failed to delete invalid removed proxies: {e}"))?;
 
     state
         .db
@@ -654,6 +722,8 @@ pub async fn refresh_subscription_core(
             duplicate_proxy_count as i32,
         )
         .map_err(|e| format!("Failed to update proxy count: {e}"))?;
+    crate::selection::rebuild(state)
+        .map_err(|error| format!("Failed to rebuild proxy selection index: {error}"))?;
     crate::api::sub_export::invalidate_subscription_export_cache(state.as_ref());
     crate::api::fetch::invalidate_stats_cache(state.as_ref());
 
@@ -806,7 +876,7 @@ pub async fn refresh_subscription(
 
     let added = refresh_subscription_core(&state, &sub)
         .await
-        .map_err(|e| AppError::Internal(e))?;
+        .map_err(AppError::Internal)?;
 
     // Validate in background
     let state2 = state.clone();
@@ -871,7 +941,7 @@ pub async fn quality_check_subscription(
 /// Port pool total = max_proxies + batch_size.
 /// - Normal: keep a smaller prebound hot set ready.
 /// - Validation: keep the hot set plus the current untested validation batch.
-/// - QualityCheck: keep the hot set plus a temporary batch of stale-quality proxies.
+///
 /// Active relay traffic is preserved even if it falls outside the managed hot set.
 pub async fn sync_proxy_bindings(state: &Arc<AppState>, mode: SyncMode) -> SyncBindingsResult {
     let max = state.config.singbox.max_proxies;
@@ -897,6 +967,7 @@ pub async fn sync_proxy_bindings(state: &Arc<AppState>, mode: SyncMode) -> SyncB
     // result is propagated to every source row.
     let mut definition_representatives = std::collections::HashMap::new();
     let mut work_ids = Vec::new();
+    let mut work_id_set = std::collections::HashSet::new();
 
     for (row, quality) in state.db.get_hot_proxy_records(prebound).unwrap_or_default() {
         let definition = proxy_row_definition_key(&row);
@@ -906,96 +977,29 @@ pub async fn sync_proxy_bindings(state: &Arc<AppState>, mode: SyncMode) -> SyncB
             selected.push(crate::pool::manager::ProxyPool::from_db_parts(row, quality));
         }
     }
-    if matches!(&mode, SyncMode::Validation) {
-        let cfg = &state.config.validation;
-        let (new_limit, valid_limit, invalid_limit) = validation_batch_limits(
-            batch,
-            cfg.new_proxy_percent,
-            cfg.valid_recheck_percent,
-            cfg.invalid_retry_percent,
-            cfg.valid_recheck_hours > 0,
-        );
-        let now = chrono::Utc::now();
-        let valid_before =
-            (now - chrono::Duration::hours(cfg.valid_recheck_hours.max(1) as i64)).to_rfc3339();
-        let retry_before = (now - chrono::Duration::minutes(180)).to_rfc3339();
-        let orphaned_before = (now
-            - chrono::Duration::hours(state.config.subscription.orphaned_valid_grace_hours as i64))
-        .to_rfc3339();
-        for (row, quality) in state
-            .db
-            .get_validation_proxy_records(
-                new_limit,
-                valid_limit,
-                invalid_limit.min(cfg.retry_invalid_per_run),
-                &valid_before,
-                &retry_before,
-                &orphaned_before,
-                cfg.error_threshold,
-            )
-            .unwrap_or_default()
-        {
-            let definition = proxy_row_definition_key(&row);
-            if let Some(representative_id) = definition_representatives.get(&definition) {
-                // Validate the one already-bound representative. A successful
-                // round synchronizes every exact source copy, so this legacy
-                // mismatch cannot keep reappearing in later rounds.
-                if !work_ids.contains(representative_id) {
-                    work_ids.push(representative_id.clone());
-                }
-            } else if seen_ids.insert(row.id.clone()) {
-                definition_representatives.insert(definition, row.id.clone());
-                work_ids.push(row.id.clone());
-                selected.push(crate::pool::manager::ProxyPool::from_db_parts(row, quality));
-            }
-        }
-    }
-    let quality_stale_hours = state.config.quality.stale_hours.max(1);
-    if matches!(&mode, SyncMode::QualityCheck) {
-        let stale_before =
-            (chrono::Utc::now() - chrono::Duration::hours(quality_stale_hours as i64)).to_rfc3339();
-        for (row, quality) in state
-            .db
-            .get_due_quality_proxy_records(
-                batch,
-                &stale_before,
-                crate::quality::checker::MAX_INCOMPLETE_RETRIES,
-                crate::quality::checker::QUALITY_SCHEMA_VERSION,
-            )
-            .unwrap_or_default()
-        {
-            let definition = proxy_row_definition_key(&row);
-            if definition_representatives.contains_key(&definition) {
-                // Old databases may contain exact copies whose quality rows
-                // predate shared-result propagation. Reuse the freshest known
-                // copy rather than allocating another sing-box binding.
-                if let Err(error) = state
-                    .db
-                    .inherit_exact_duplicate_states(std::slice::from_ref(&row.id))
-                {
-                    tracing::warn!("Failed to inherit exact-duplicate quality state: {error}");
-                }
-            } else if seen_ids.insert(row.id.clone()) {
-                definition_representatives.insert(definition, row.id.clone());
-                selected.push(crate::pool::manager::ProxyPool::from_db_parts(row, quality));
-            }
-        }
-    }
     if let SyncMode::Targeted(target_ids) = &mode {
-        for target_id in target_ids {
-            let Ok(Some((row, quality))) = state.db.get_proxy_record(target_id) else {
-                continue;
-            };
+        let targeted = match state.db.get_proxy_records(target_ids) {
+            Ok(records) => records,
+            Err(error) => {
+                tracing::warn!(
+                    "Failed to load {} targeted binding records: {error}",
+                    target_ids.len()
+                );
+                Vec::new()
+            }
+        };
+        for (row, quality) in targeted {
             if row.orphaned_at.is_some() {
                 continue;
             }
             let definition = proxy_row_definition_key(&row);
             if let Some(representative_id) = definition_representatives.get(&definition) {
-                if !work_ids.contains(representative_id) {
+                if work_id_set.insert(representative_id.clone()) {
                     work_ids.push(representative_id.clone());
                 }
             } else if seen_ids.insert(row.id.clone()) {
                 definition_representatives.insert(definition, row.id.clone());
+                work_id_set.insert(row.id.clone());
                 work_ids.push(row.id.clone());
                 selected.push(crate::pool::manager::ProxyPool::from_db_parts(row, quality));
             }
@@ -1003,7 +1007,6 @@ pub async fn sync_proxy_bindings(state: &Arc<AppState>, mode: SyncMode) -> SyncB
     }
 
     let mut managed_ids = std::collections::HashSet::new();
-    let now = chrono::Utc::now();
     for proxy in selected
         .iter()
         .filter(|p| p.status == ProxyStatus::Valid)
@@ -1012,24 +1015,6 @@ pub async fn sync_proxy_bindings(state: &Arc<AppState>, mode: SyncMode) -> SyncB
         managed_ids.insert(proxy.id.clone());
     }
     match &mode {
-        SyncMode::Validation => {
-            for id in &work_ids {
-                managed_ids.insert(id.clone());
-            }
-        }
-        SyncMode::QualityCheck => {
-            let mut extra = 0usize;
-            for proxy in selected.iter().filter(|p| p.status == ProxyStatus::Valid) {
-                if extra >= batch {
-                    break;
-                }
-                if crate::quality::checker::needs_quality_check(proxy, &now, quality_stale_hours) {
-                    if managed_ids.insert(proxy.id.clone()) {
-                        extra += 1;
-                    }
-                }
-            }
-        }
         SyncMode::Targeted(_) => {
             for id in &work_ids {
                 managed_ids.insert(id.clone());
@@ -1061,8 +1046,6 @@ pub async fn sync_proxy_bindings(state: &Arc<AppState>, mode: SyncMode) -> SyncB
 
     let mode_str = match &mode {
         SyncMode::Normal => "normal",
-        SyncMode::Validation => "validation",
-        SyncMode::QualityCheck => "quality-check",
         SyncMode::Targeted(_) => "targeted",
     };
     tracing::info!(
@@ -1077,9 +1060,10 @@ pub async fn sync_proxy_bindings(state: &Arc<AppState>, mode: SyncMode) -> SyncB
 
     let selected_id_set: std::collections::HashSet<&str> =
         selected_ids.iter().map(|id| id.as_str()).collect();
+    let mut cleared_ids = std::collections::HashSet::new();
     for p in &current_active {
         if p.local_port.is_some() && !selected_id_set.contains(p.id.as_str()) {
-            state.db.update_proxy_local_port_null(&p.id).ok();
+            cleared_ids.insert(p.id.clone());
         }
     }
 
@@ -1099,16 +1083,25 @@ pub async fn sync_proxy_bindings(state: &Arc<AppState>, mode: SyncMode) -> SyncB
     state.pool.replace_all(selected);
     for (id, port) in &assignments {
         state.pool.set_local_port(id, *port);
-        state.db.update_proxy_local_port(id, *port as i32).ok();
-        state.db.clear_proxy_binding_failures(id).ok();
     }
     let assigned_ids: std::collections::HashSet<&str> =
         assignments.iter().map(|(id, _)| id.as_str()).collect();
     for id in &selected_ids {
         if !assigned_ids.contains(id.as_str()) {
             state.pool.clear_local_port(id);
-            state.db.update_proxy_local_port_null(id).ok();
+            cleared_ids.insert(id.clone());
         }
+    }
+    let assignments_for_db: Vec<_> = assignments
+        .iter()
+        .map(|(id, port)| (id.clone(), *port))
+        .collect();
+    let cleared_ids: Vec<_> = cleared_ids.into_iter().collect();
+    if let Err(error) = state
+        .db
+        .sync_proxy_local_ports(&assignments_for_db, &cleared_ids)
+    {
+        tracing::warn!("Failed to persist reconciled proxy binding state: {error}");
     }
 
     let active_ports: Vec<u16> = assignments.iter().map(|(_, port)| *port).collect();
@@ -1119,54 +1112,6 @@ pub async fn sync_proxy_bindings(state: &Arc<AppState>, mode: SyncMode) -> SyncB
         selected_ids,
         work_ids,
     }
-}
-
-pub(crate) fn validation_batch_limits(
-    batch: usize,
-    new_percent: u8,
-    valid_percent: u8,
-    invalid_percent: u8,
-    valid_enabled: bool,
-) -> (usize, usize, usize) {
-    if batch == 0 {
-        return (0, 0, 0);
-    }
-    let new_percent = new_percent as usize;
-    let valid_percent = if valid_enabled {
-        valid_percent as usize
-    } else {
-        0
-    };
-    let invalid_percent = invalid_percent as usize;
-    let total = new_percent + valid_percent + invalid_percent;
-    if total == 0 {
-        return (batch, 0, 0);
-    }
-
-    let mut new_limit = batch * new_percent / total;
-    let mut valid_limit = batch * valid_percent / total;
-    let mut invalid_limit = batch * invalid_percent / total;
-    if new_percent > 0 {
-        new_limit = new_limit.max(1);
-    }
-    if valid_percent > 0 {
-        valid_limit = valid_limit.max(1);
-    }
-    if invalid_percent > 0 {
-        invalid_limit = invalid_limit.max(1);
-    }
-
-    while new_limit + valid_limit + invalid_limit > batch {
-        if new_limit >= valid_limit && new_limit >= invalid_limit && new_limit > 0 {
-            new_limit -= 1;
-        } else if valid_limit >= invalid_limit && valid_limit > 0 {
-            valid_limit -= 1;
-        } else if invalid_limit > 0 {
-            invalid_limit -= 1;
-        }
-    }
-    new_limit += batch - (new_limit + valid_limit + invalid_limit);
-    (new_limit, valid_limit, invalid_limit)
 }
 
 fn validate_refresh_interval_mins(value: Option<i32>) -> Result<Option<i32>, AppError> {

@@ -99,8 +99,13 @@ pub fn router(state: Arc<AppState>) -> Router {
             patch(subscription::update_subscription_defaults),
         )
         .route(
+            "/api/subscriptions/duplicates",
+            get(subscription::get_subscription_duplicates),
+        )
+        .route(
             "/api/subscriptions/:id",
-            patch(subscription::update_subscription)
+            get(subscription::get_subscription)
+                .patch(subscription::update_subscription)
                 .put(subscription::edit_subscription)
                 .delete(subscription::delete_subscription),
         )

@@ -7,7 +7,6 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
 const EXIT_IP_URL: &str = "https://www.cloudflare.com/cdn-cgi/trace";
-const EXIT_IP_FALLBACK_URL: &str = "https://api.ipify.org";
 
 struct RunningGuard<'a> {
     flag: &'a AtomicBool,
@@ -61,6 +60,8 @@ pub async fn validate_all(state: Arc<AppState>) -> Result<(), String> {
 }
 
 async fn run_validation(state: Arc<AppState>) -> Result<(), String> {
+    let run_started = std::time::Instant::now();
+    let db_calls_before = state.db.runtime_metrics().calls;
     state
         .validation_progress
         .begin(None, None, None, "waiting-for-bindings");
@@ -95,18 +96,42 @@ async fn run_validation(state: Arc<AppState>) -> Result<(), String> {
     let fallback_url = state.config.validation.fallback_url.clone();
     let max_proxies = state.config.singbox.max_proxies;
     let max_rounds = state.config.validation.max_rounds_per_run;
+    let lease_owner = format!("validation-{}", uuid::Uuid::new_v4());
+    let lease_seconds = validation_lease_seconds(
+        state.config.validation.batch_size,
+        concurrency,
+        state.config.validation.timeout_secs,
+    );
 
     let mut round = 0u32;
     let mut total_validated = 0usize;
+    let mut total_exit_ip_unavailable = 0usize;
 
     loop {
         round += 1;
         state.validation_progress.set_round(round as usize);
         state.validation_progress.set_phase("binding");
 
-        // Use validation-mode sorting: Untested get port priority over Valid
-        let sync_result =
-            crate::api::subscription::sync_proxy_bindings(&state, SyncMode::Validation).await;
+        let claimed = state
+            .db
+            .claim_due_validation_proxy_records(
+                state.config.validation.batch_size,
+                &lease_owner,
+                lease_seconds,
+            )
+            .map_err(|error| format!("领取验活任务失败: {error}"))?;
+        if claimed.is_empty() {
+            break;
+        }
+        let claimed_ids: Vec<_> = claimed
+            .into_iter()
+            .map(|(proxy, _)| proxy.id)
+            .collect();
+        let sync_result = crate::api::subscription::sync_proxy_bindings(
+            &state,
+            SyncMode::Targeted(claimed_ids.clone()),
+        )
+        .await;
 
         let selected_work: Vec<_> = sync_result
             .work_ids
@@ -121,8 +146,36 @@ async fn run_validation(state: Arc<AppState>) -> Result<(), String> {
             .cloned()
             .collect();
 
+        let failed_binding_ids: Vec<_> = failed_to_bind
+            .iter()
+            .map(|proxy| proxy.id.clone())
+            .collect();
+        let recorded_binding_failures = match state
+            .db
+            .record_proxy_binding_failures(&failed_binding_ids)
+        {
+            Ok(failures) => failures.into_iter().collect::<std::collections::HashMap<_, _>>(),
+            Err(error) => {
+                tracing::warn!(
+                    "Failed to persist {} binding failures as a batch: {error}",
+                    failed_binding_ids.len()
+                );
+                state
+                    .db
+                    .release_validation_leases(&lease_owner, &failed_binding_ids, 60)
+                    .ok();
+                std::collections::HashMap::new()
+            }
+        };
         for proxy in &failed_to_bind {
-            drop_proxy_after_binding_failure(&state, proxy).await;
+            quarantine_proxy_after_binding_failure(
+                &state,
+                proxy,
+                recorded_binding_failures
+                    .get(&proxy.id)
+                    .copied()
+                    .unwrap_or(0),
+            );
             state.validation_progress.advance(false);
         }
 
@@ -133,18 +186,17 @@ async fn run_validation(state: Arc<AppState>) -> Result<(), String> {
             .cloned()
             .collect();
         if to_validate.is_empty() {
-            let remaining_untested = state.db.count_untested_proxies().unwrap_or(0);
-
+            state
+                .db
+                .release_validation_leases(&lease_owner, &claimed_ids, 60)
+                .ok();
             if selected_work.is_empty() {
-                if remaining_untested > 0 {
-                    tracing::warn!(
-                        "Validation stopped early: no untested proxies received bindings in round {round}, {} untested remain",
-                        remaining_untested
-                    );
-                }
+                tracing::warn!(
+                    "Validation stopped early: {} claimed definitions produced no binding candidates in round {round}",
+                    claimed_ids.len()
+                );
                 break;
             }
-
             continue;
         }
 
@@ -167,8 +219,12 @@ async fn run_validation(state: Arc<AppState>) -> Result<(), String> {
         let round_count = round_summary.completed;
 
         total_validated += round_count;
+        total_exit_ip_unavailable += round_summary.exit_ip_unavailable;
 
-        tracing::info!("Round {round}: {round_count} proxies checked");
+        tracing::info!(
+            "Round {round}: {round_count} proxies checked, {} reachable proxies had no measured exit IP",
+            round_summary.exit_ip_unavailable
+        );
 
         if round as usize >= max_rounds {
             tracing::info!("Validation paused after {round} rounds (limit={max_rounds})");
@@ -176,7 +232,10 @@ async fn run_validation(state: Arc<AppState>) -> Result<(), String> {
         }
     }
 
-    // Cleanup high-error proxies (once, after all rounds)
+    // Quarantine high-error proxies (once, after all rounds). They remain in
+    // the inventory so a transient probe-provider outage cannot create a
+    // delete -> subscription refresh -> revalidate loop. Scheduling already
+    // excludes rows at or above the configured threshold.
     let threshold = state.config.validation.error_threshold;
     let high_error_targets: Vec<_> = state
         .pool
@@ -186,20 +245,22 @@ async fn run_validation(state: Arc<AppState>) -> Result<(), String> {
         .collect();
     for proxy in &high_error_targets {
         crate::bindings::cleanup_proxy_binding(&state, &proxy.id, proxy.local_port).await;
+        state.binding_usage.remove(&proxy.id);
+        state.pool.remove(&proxy.id);
     }
-    match state.db.cleanup_high_error_proxies(threshold) {
-        Ok(count) if count > 0 => {
-            tracing::info!("Cleaned up {count} proxies exceeding error threshold");
-            for proxy in &high_error_targets {
-                state.binding_usage.remove(&proxy.id);
-                state.pool.remove(&proxy.id);
-            }
-        }
-        _ => {}
+    if !high_error_targets.is_empty() {
+        tracing::info!(
+            "Quarantined {} proxies at or above error threshold {}; records were retained",
+            high_error_targets.len(),
+            threshold
+        );
     }
 
     // Final assignment: normal mode (Valid gets priority for serving traffic)
     let _ = crate::api::subscription::sync_proxy_bindings(&state, SyncMode::Normal).await;
+    if let Err(error) = crate::selection::rebuild(state.as_ref()) {
+        tracing::warn!("Failed to rebuild selection snapshot after validation: {error}");
+    }
     crate::api::sub_export::invalidate_subscription_export_cache(state.as_ref());
     crate::api::fetch::invalidate_stats_cache(state.as_ref());
     let reconciled = crate::fixed_proxy::reconcile_all(&state).await;
@@ -209,8 +270,17 @@ async fn run_validation(state: Arc<AppState>) -> Result<(), String> {
 
     let valid = state.db.count_valid_proxies().unwrap_or(0);
     let total = state.db.count_all_proxies().unwrap_or(0);
+    let db_calls = state
+        .db
+        .runtime_metrics()
+        .calls
+        .saturating_sub(db_calls_before);
     tracing::info!(
-        "Validation complete: {total_validated} checked in {round} rounds, {valid}/{total} valid"
+        elapsed_ms = run_started.elapsed().as_secs_f64() * 1000.0,
+        db_calls,
+        rounds = round,
+        total_exit_ip_unavailable,
+        "Validation complete: {total_validated} checked, {valid}/{total} valid"
     );
     state.validation_progress.finish(format!(
         "验活完成：本次检查 {total_validated} 条线路，当前 {valid}/{total} 有效"
@@ -320,8 +390,32 @@ async fn run_subscription_validation(
             .filter(|proxy| proxy.local_port.is_none())
             .cloned()
             .collect();
+        let failed_binding_ids: Vec<_> = failed_to_bind
+            .iter()
+            .map(|proxy| proxy.id.clone())
+            .collect();
+        let recorded_binding_failures = match state
+            .db
+            .record_proxy_binding_failures(&failed_binding_ids)
+        {
+            Ok(failures) => failures.into_iter().collect::<std::collections::HashMap<_, _>>(),
+            Err(error) => {
+                tracing::warn!(
+                    "Failed to persist {} subscription binding failures as a batch: {error}",
+                    failed_binding_ids.len()
+                );
+                std::collections::HashMap::new()
+            }
+        };
         for proxy in &failed_to_bind {
-            drop_proxy_after_binding_failure(&state, proxy).await;
+            quarantine_proxy_after_binding_failure(
+                &state,
+                proxy,
+                recorded_binding_failures
+                    .get(&proxy.id)
+                    .copied()
+                    .unwrap_or(0),
+            );
             state.validation_progress.advance(false);
         }
 
@@ -343,6 +437,11 @@ async fn run_subscription_validation(
     }
 
     let _ = crate::api::subscription::sync_proxy_bindings(&state, SyncMode::Normal).await;
+    if let Err(error) = crate::selection::rebuild(state.as_ref()) {
+        tracing::warn!(
+            "Failed to rebuild selection snapshot after subscription validation: {error}"
+        );
+    }
     crate::api::sub_export::invalidate_subscription_export_cache(state.as_ref());
     crate::api::fetch::invalidate_stats_cache(state.as_ref());
     let reconciled = crate::fixed_proxy::reconcile_all(&state).await;
@@ -358,20 +457,11 @@ async fn run_subscription_validation(
     Ok(())
 }
 
-async fn drop_proxy_after_binding_failure(
+fn quarantine_proxy_after_binding_failure(
     state: &Arc<AppState>,
     proxy: &crate::pool::manager::PoolProxy,
+    failures: u32,
 ) {
-    let failures = match state.db.record_proxy_binding_failure(&proxy.id) {
-        Ok(failures) => failures,
-        Err(error) => {
-            tracing::warn!(
-                "Failed to record binding failure for {}: {error}",
-                proxy.name
-            );
-            return;
-        }
-    };
     let threshold = state.config.validation.binding_failure_threshold.max(1);
     if failures < threshold {
         tracing::warn!(
@@ -381,13 +471,12 @@ async fn drop_proxy_after_binding_failure(
         return;
     }
     tracing::warn!(
-        "Proxy {} failed to get binding {failures} consecutive times; removing it",
+        "Proxy {} failed to get binding {failures} consecutive times; quarantining it while retaining its record",
         proxy.name,
     );
-    crate::bindings::cleanup_proxy_binding(state, &proxy.id, proxy.local_port).await;
+    crate::selection::exclude_definition(state.as_ref(), proxy);
     state.binding_usage.remove(&proxy.id);
     state.pool.remove(&proxy.id);
-    state.db.delete_proxy(&proxy.id).ok();
 }
 
 /// Validate a batch of proxies concurrently, reusing one reqwest::Client per proxy port.
@@ -396,6 +485,51 @@ struct BatchSummary {
     completed: usize,
     succeeded: usize,
     failed: usize,
+    exit_ip_unavailable: usize,
+}
+
+struct CompletedProbe {
+    proxy_id: String,
+    proxy_name: String,
+    outcome: ProxyProbeOutcome,
+}
+
+enum ProxyProbeOutcome {
+    Reachable {
+        exit_ip: Option<String>,
+        exit_ip_error: Option<String>,
+    },
+    Unreachable(String),
+}
+
+fn classify_probe_failure(error: &str) -> &'static str {
+    let error = error.to_ascii_lowercase();
+    if error.contains("deadline") || error.contains("timed out") || error.contains("timeout") {
+        "timeout"
+    } else if error.contains("certificate") || error.contains("tls") {
+        "tls"
+    } else if error.contains("expected http") || error.contains("http ") {
+        "http_status"
+    } else if error.contains("connect") || error.contains("dns") || error.contains("refused") {
+        "connection"
+    } else if error.contains("response") || error.contains("invalid") {
+        "invalid_response"
+    } else {
+        "probe_failure"
+    }
+}
+
+fn reachable_probe_outcome(exit_ip_result: Result<String, String>) -> ProxyProbeOutcome {
+    match exit_ip_result {
+        Ok(exit_ip) => ProxyProbeOutcome::Reachable {
+            exit_ip: Some(exit_ip),
+            exit_ip_error: None,
+        },
+        Err(error) => ProxyProbeOutcome::Reachable {
+            exit_ip: None,
+            exit_ip_error: Some(error),
+        },
+    }
 }
 
 async fn validate_batch(
@@ -406,7 +540,7 @@ async fn validate_batch(
     concurrency: usize,
     state: &Arc<AppState>,
 ) -> BatchSummary {
-    let semaphore = Arc::new(Semaphore::new(concurrency));
+    let semaphore = Arc::new(Semaphore::new(concurrency.max(1)));
     let mut handles = JoinSet::new();
 
     for proxy in proxies {
@@ -416,7 +550,6 @@ async fn validate_batch(
         };
 
         let sem = semaphore.clone();
-        let state = state.clone();
         let url = validation_url.to_string();
         let fallback_url = fallback_url.map(str::to_string);
         let proxy_id = proxy.id.clone();
@@ -426,106 +559,101 @@ async fn validate_batch(
             let _permit = sem.acquire().await.unwrap();
 
             let proxy_addr = format!("http://127.0.0.1:{local_port}");
-            let result =
-                match validate_with_fallback(&proxy_addr, &url, fallback_url.as_deref(), timeout)
-                    .await
-                {
-                    Ok(()) => detect_exit_ip(&proxy_addr, timeout).await,
-                    Err(error) => Err(error),
-                };
-
-            match result {
-                Ok(exit_ip) => {
-                    let duplicate_ids = match state.db.update_exact_duplicate_validation(
-                        &proxy_id,
-                        true,
-                        None,
-                        Some(&exit_ip),
-                    ) {
-                        Ok(ids) => ids,
-                        Err(error) => {
-                            tracing::warn!(
-                                "Proxy {proxy_name} passed validation but duplicate state could not be saved: {error}"
-                            );
-                            state.pool.set_status(&proxy_id, ProxyStatus::Invalid);
-                            state
-                                .db
-                                .update_proxy_validation(
-                                    &proxy_id,
-                                    false,
-                                    Some("Failed to persist detected exit IP"),
-                                )
-                                .ok();
-                            return false;
-                        }
-                    };
-                    let quality = state
-                        .pool
-                        .get(&proxy_id)
-                        .and_then(|p| p.quality)
-                        .map(|mut quality| {
-                            quality.ip_address = Some(exit_ip.clone());
-                            quality
-                        })
-                        .unwrap_or(crate::pool::manager::ProxyQualityInfo {
-                            ip_address: Some(exit_ip),
-                            country: None,
-                            ip_type: None,
-                            is_residential: false,
-                            chatgpt_accessible: false,
-                            google_accessible: false,
-                            risk_score: 1.0,
-                            risk_level: "Unknown".to_string(),
-                            checked_at: None,
-                            details: None,
-                            incomplete_retry_count: 0,
-                        });
-                    for id in duplicate_ids {
-                        state.pool.set_status(&id, ProxyStatus::Valid);
-                        state.pool.set_quality(&id, quality.clone());
-                    }
-                    true
-                }
-                Err(e) => {
-                    tracing::debug!("Proxy {proxy_name} failed validation: {e}");
-                    let duplicate_ids = state
-                        .db
-                        .update_exact_duplicate_validation(&proxy_id, false, Some(&e), None)
-                        .unwrap_or_else(|error| {
-                            tracing::warn!("Failed to sync duplicate validation state: {error}");
-                            vec![proxy_id.clone()]
-                        });
-                    for id in &duplicate_ids {
-                        state.pool.set_status(id, ProxyStatus::Invalid);
-                    }
-                    let orphaned_ids: Vec<_> = duplicate_ids
-                        .iter()
-                        .filter_map(|id| {
-                            state
-                                .db
-                                .delete_proxy_if_orphaned(id)
-                                .unwrap_or(false)
-                                .then(|| id.clone())
-                        })
-                        .collect();
-                    if orphaned_ids.iter().any(|id| id == &proxy_id) {
-                        crate::bindings::cleanup_proxy_binding(&state, &proxy_id, Some(local_port))
-                            .await;
-                    }
-                    for id in orphaned_ids {
-                        state.binding_usage.remove(&id);
-                        state.pool.remove(&id);
-                    }
-                    false
-                }
+            let outcome = probe_proxy(
+                &proxy_addr,
+                &url,
+                fallback_url.as_deref(),
+                timeout,
+            )
+            .await;
+            CompletedProbe {
+                proxy_id,
+                proxy_name,
+                outcome,
             }
         });
     }
 
     let mut summary = BatchSummary::default();
+    let mut completed = Vec::new();
     while let Some(result) = handles.join_next().await {
         summary.completed += 1;
-        let succeeded = matches!(result, Ok(true));
+        match result {
+            Ok(result) => completed.push(result),
+            Err(error) => {
+                tracing::warn!("Validation task failed to join: {error}");
+                summary.failed += 1;
+                state.validation_progress.advance(false);
+            }
+        }
+    }
+
+    let outcomes: Vec<_> = completed
+        .iter()
+        .map(|probe| match &probe.outcome {
+            ProxyProbeOutcome::Reachable {
+                exit_ip,
+                exit_ip_error,
+            } => {
+                crate::db::ProxyValidationOutcome {
+                    source_id: probe.proxy_id.clone(),
+                    is_valid: true,
+                    error: exit_ip_error.clone(),
+                    exit_ip: exit_ip.clone(),
+                    failure_kind: exit_ip_error
+                        .as_ref()
+                        .map(|_| "exit_ip_unavailable".to_string()),
+                }
+            }
+            ProxyProbeOutcome::Unreachable(error) => crate::db::ProxyValidationOutcome {
+                source_id: probe.proxy_id.clone(),
+                is_valid: false,
+                error: Some(error.clone()),
+                exit_ip: None,
+                failure_kind: Some(classify_probe_failure(error).to_string()),
+            },
+        })
+        .collect();
+
+    let applied = match state
+        .db
+        .apply_validation_outcomes(&outcomes, state.config.validation.error_threshold)
+    {
+        Ok(applied) => applied,
+        Err(error) => {
+            tracing::warn!(
+                "Failed to persist validation batch of {} probes: {error}",
+                completed.len()
+            );
+            summary.failed += completed.len();
+            for _ in &completed {
+                state.validation_progress.advance(false);
+            }
+            return summary;
+        }
+    };
+
+    for probe in &completed {
+        let succeeded = matches!(&probe.outcome, ProxyProbeOutcome::Reachable { .. });
+        match &probe.outcome {
+            ProxyProbeOutcome::Reachable {
+                exit_ip: None,
+                exit_ip_error: Some(error),
+            } => {
+                summary.exit_ip_unavailable += 1;
+                tracing::warn!(
+                    "Proxy {} is reachable but exit IP measurement failed: {error}",
+                    probe.proxy_name
+                );
+            }
+            ProxyProbeOutcome::Unreachable(error) => {
+                tracing::debug!("Proxy {} failed validation: {error}", probe.proxy_name);
+                if let Some(proxy) = state.pool.get(&probe.proxy_id) {
+                    crate::selection::exclude_definition(state.as_ref(), &proxy);
+                }
+            }
+            _ => {}
+        }
         if succeeded {
             summary.succeeded += 1;
         } else {
@@ -533,27 +661,109 @@ async fn validate_batch(
         }
         state.validation_progress.advance(succeeded);
     }
+
+    for result in applied {
+        if result.deleted_orphan {
+            if let Some(proxy) = state.pool.get(&result.proxy_id) {
+                crate::bindings::cleanup_proxy_binding(
+                    state,
+                    &result.proxy_id,
+                    proxy.local_port,
+                )
+                .await;
+            }
+            state.binding_usage.remove(&result.proxy_id);
+            state.pool.remove(&result.proxy_id);
+            continue;
+        }
+        if result.is_valid {
+            state.pool.set_status(&result.proxy_id, ProxyStatus::Valid);
+            if let Some(exit_ip) = result.exit_ip {
+                let quality = state
+                    .pool
+                    .get(&result.proxy_id)
+                    .and_then(|proxy| proxy.quality)
+                    .map(|mut quality| {
+                        quality.ip_address = Some(exit_ip.clone());
+                        quality
+                    })
+                    .unwrap_or(crate::pool::manager::ProxyQualityInfo {
+                        ip_address: Some(exit_ip),
+                        country: None,
+                        ip_type: None,
+                        is_residential: false,
+                        chatgpt_accessible: false,
+                        google_accessible: false,
+                        risk_score: 1.0,
+                        risk_level: "Unknown".to_string(),
+                        checked_at: None,
+                        details: None,
+                        incomplete_retry_count: 0,
+                    });
+                state.pool.set_quality(&result.proxy_id, quality);
+            }
+        } else {
+            state.pool.set_status(&result.proxy_id, ProxyStatus::Invalid);
+        }
+    }
     summary
 }
 
-async fn detect_exit_ip(proxy_addr: &str, timeout: std::time::Duration) -> Result<String, String> {
+fn build_probe_client(
+    proxy_addr: &str,
+    timeout: std::time::Duration,
+) -> Result<reqwest::Client, String> {
     let proxy = reqwest::Proxy::all(proxy_addr).map_err(|e| format!("Proxy config error: {e}"))?;
-    let client = reqwest::Client::builder()
+    reqwest::Client::builder()
         .no_proxy()
         .proxy(proxy)
         .timeout(timeout)
-        .pool_max_idle_per_host(0)
         .build()
-        .map_err(|e| format!("Client build error: {e}"))?;
-    match request_exit_ip(&client, EXIT_IP_URL, true).await {
-        Ok(ip) => Ok(ip),
-        Err(primary_error) => request_exit_ip(&client, EXIT_IP_FALLBACK_URL, false)
-            .await
-            .map_err(|fallback_error| {
-                format!(
-                    "Exit IP detection failed: primary ({primary_error}); fallback ({fallback_error})"
-                )
-            }),
+        .map_err(|e| format!("Client build error: {e}"))
+}
+
+async fn probe_proxy(
+    proxy_addr: &str,
+    primary_url: &str,
+    fallback_url: Option<&str>,
+    timeout: std::time::Duration,
+) -> ProxyProbeOutcome {
+    let client = match build_probe_client(proxy_addr, timeout) {
+        Ok(client) => client,
+        Err(error) => return ProxyProbeOutcome::Unreachable(error),
+    };
+    let deadline = tokio::time::Instant::now() + timeout;
+    // A successful trace establishes both reachability and the exit address.
+    // Trace failure is only a measurement failure: reserve most of the total
+    // budget for the independent 204 health probe before judging the proxy.
+    let trace_budget = timeout
+        .checked_div(3)
+        .unwrap_or(timeout)
+        .max(std::time::Duration::from_millis(250))
+        .min(std::time::Duration::from_secs(5))
+        .min(timeout);
+    let trace_result = match tokio::time::timeout(
+        trace_budget,
+        request_exit_ip(&client, EXIT_IP_URL, true),
+    )
+    .await
+    {
+        Ok(Ok(exit_ip)) => return reachable_probe_outcome(Ok(exit_ip)),
+        Ok(Err(error)) => Err(error),
+        Err(_) => Err("Cloudflare trace measurement timed out".to_string()),
+    };
+
+    match tokio::time::timeout_at(
+        deadline,
+        validate_with_fallback(&client, primary_url, fallback_url),
+    )
+    .await
+    {
+        Ok(Ok(())) => reachable_probe_outcome(trace_result),
+        Ok(Err(error)) => ProxyProbeOutcome::Unreachable(error),
+        Err(_) => ProxyProbeOutcome::Unreachable(
+            "primary/fallback health probes exceeded the proxy-level deadline".into(),
+        ),
     }
 }
 
@@ -592,19 +802,9 @@ fn parse_exit_ip_response(body: &str, cloudflare_trace: bool) -> Result<String, 
 }
 
 async fn validate_single(
-    proxy_addr: &str,
+    client: &reqwest::Client,
     target_url: &str,
-    timeout: std::time::Duration,
 ) -> Result<(), String> {
-    let proxy = reqwest::Proxy::all(proxy_addr).map_err(|e| format!("Proxy config error: {e}"))?;
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .proxy(proxy)
-        .timeout(timeout)
-        .pool_max_idle_per_host(0) // don't keep idle connections
-        .build()
-        .map_err(|e| format!("Client build error: {e}"))?;
-
     let resp = client
         .get(target_url)
         .send()
@@ -619,18 +819,17 @@ async fn validate_single(
 }
 
 async fn validate_with_fallback(
-    proxy_addr: &str,
+    client: &reqwest::Client,
     primary_url: &str,
     fallback_url: Option<&str>,
-    timeout: std::time::Duration,
 ) -> Result<(), String> {
-    let primary = validate_single(proxy_addr, primary_url, timeout).await;
+    let primary = validate_single(client, primary_url).await;
     match (
         primary,
         fallback_url.filter(|url| !url.is_empty() && *url != primary_url),
     ) {
         (Ok(()), _) => Ok(()),
-        (Err(primary_error), Some(fallback)) => validate_single(proxy_addr, fallback, timeout)
+        (Err(primary_error), Some(fallback)) => validate_single(client, fallback)
             .await
             .map_err(|fallback_error| {
                 format!(
@@ -641,10 +840,28 @@ async fn validate_with_fallback(
     }
 }
 
+fn validation_lease_seconds(batch_size: usize, concurrency: usize, timeout_secs: u64) -> u64 {
+    let batch_size = batch_size.max(1) as u64;
+    let concurrency = concurrency.max(1) as u64;
+    let waves = batch_size / concurrency + u64::from(batch_size % concurrency != 0);
+    timeout_secs
+        .saturating_mul(waves)
+        .saturating_add(120)
+        .max(180)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::parse_exit_ip_response;
-    use crate::api::subscription::validation_batch_limits;
+    use super::{
+        classify_probe_failure, parse_exit_ip_response, reachable_probe_outcome,
+        validation_lease_seconds, ProxyProbeOutcome,
+    };
+
+    #[test]
+    fn validation_lease_covers_the_queued_batch() {
+        assert_eq!(validation_lease_seconds(200, 10, 10), 320);
+        assert_eq!(validation_lease_seconds(200, 0, 10), 2_120);
+    }
 
     #[test]
     fn expected_status_is_exact() {
@@ -653,12 +870,15 @@ mod tests {
     }
 
     #[test]
-    fn validation_batch_has_non_starving_default_quotas() {
+    fn probe_failures_are_classified_for_health_scheduling() {
+        assert_eq!(classify_probe_failure("request timed out"), "timeout");
+        assert_eq!(classify_probe_failure("TLS certificate rejected"), "tls");
         assert_eq!(
-            validation_batch_limits(300, 70, 20, 10, true),
-            (210, 60, 30)
+            classify_probe_failure("Expected HTTP 204, got 503"),
+            "http_status"
         );
-        assert_eq!(validation_batch_limits(3, 70, 20, 10, true), (1, 1, 1));
+        assert_eq!(classify_probe_failure("connection refused"), "connection");
+        assert_eq!(classify_probe_failure("invalid response body"), "invalid_response");
     }
 
     #[test]
@@ -672,5 +892,17 @@ mod tests {
             "2001:db8::1"
         );
         assert!(parse_exit_ip_response("loc=US\n", true).is_err());
+    }
+
+    #[test]
+    fn exit_ip_failure_does_not_turn_a_reachable_proxy_into_a_health_failure() {
+        let outcome = reachable_probe_outcome(Err("provider unavailable".into()));
+        assert!(matches!(
+            outcome,
+            ProxyProbeOutcome::Reachable {
+                exit_ip: None,
+                exit_ip_error: Some(_)
+            }
+        ));
     }
 }
