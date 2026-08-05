@@ -4719,21 +4719,21 @@ impl Database {
             // expensive once the inventory reaches millions of memberships.
             let proxy_counts = tx.query_one(
                 "SELECT
-                    COALESCE(SUM(counts.active_memberships), 0)::bigint AS total,
-                    COUNT(DISTINCT observed.ip_address) FILTER (
+                    COUNT(*)::bigint AS total,
+                    COUNT(*) FILTER (
                         WHERE health.health_state = 'healthy'
-                    ) AS valid,
-                    COALESCE(SUM(counts.active_memberships) FILTER (
+                    )::bigint AS valid,
+                    COUNT(*) FILTER (
                         WHERE health.health_state = 'untested'
-                    ), 0)::bigint AS untested,
-                    COALESCE(SUM(counts.active_memberships) FILTER (
+                    )::bigint AS untested,
+                    COUNT(*) FILTER (
                         WHERE health.health_state IN ('suspect', 'unhealthy')
-                    ), 0)::bigint AS invalid
+                    )::bigint AS invalid,
+                    COALESCE(SUM(counts.active_memberships), 0)::bigint
+                        AS subscription_proxy_records
                  FROM proxy_definition_membership_counts counts
                  JOIN proxy_health health
                    ON health.definition_id = counts.definition_id
-                 LEFT JOIN proxy_exit observed
-                   ON observed.definition_id = counts.definition_id
                  WHERE counts.active_memberships > 0",
                 &[],
             )?;
@@ -4741,6 +4741,8 @@ impl Database {
             let valid: i64 = proxy_counts.get("valid");
             let untested: i64 = proxy_counts.get("untested");
             let invalid: i64 = proxy_counts.get("invalid");
+            let subscription_proxy_records: i64 = proxy_counts.get("subscription_proxy_records");
+            let duplicate_proxy_references = subscription_proxy_records.saturating_sub(total);
             let subs: i64 = tx
                 .query_one("SELECT COUNT(*) FROM subscriptions", &[])?
                 .get(0);
@@ -4777,7 +4779,7 @@ impl Database {
 
             let by_type_rows = tx.query(
                 "SELECT definition.proxy_type,
-                        SUM(counts.active_memberships)::bigint
+                        COUNT(*)::bigint
                  FROM proxy_definition_membership_counts counts
                  JOIN proxy_definitions definition
                    ON definition.id = counts.definition_id
@@ -4848,6 +4850,8 @@ impl Database {
                 "valid_proxies": valid,
                 "untested_proxies": untested,
                 "invalid_proxies": invalid,
+                "subscription_proxy_records": subscription_proxy_records,
+                "duplicate_proxy_references": duplicate_proxy_references,
                 "subscriptions": subs,
                 "quality_checked": quality_checked,
                 "chatgpt_accessible": chatgpt_accessible,
@@ -7252,6 +7256,24 @@ mod tests {
             .unwrap();
         assert!(typed_materialization_ok);
         let stats = db.get_stats().unwrap();
+        let total = stats["total_proxies"].as_i64().unwrap();
+        let valid = stats["valid_proxies"].as_i64().unwrap();
+        let invalid = stats["invalid_proxies"].as_i64().unwrap();
+        let untested = stats["untested_proxies"].as_i64().unwrap();
+        let subscription_proxy_records = stats["subscription_proxy_records"].as_i64().unwrap();
+        let duplicate_proxy_references = stats["duplicate_proxy_references"].as_i64().unwrap();
+        let type_total: i64 = stats["by_type"]
+            .as_object()
+            .unwrap()
+            .values()
+            .map(|count| count.as_i64().unwrap())
+            .sum();
+        assert_eq!(total, valid + invalid + untested);
+        assert_eq!(type_total, total);
+        assert_eq!(
+            duplicate_proxy_references,
+            subscription_proxy_records - total
+        );
         let integrity = &stats["normalization_integrity"];
         for field in ["health_missing", "runtime_missing", "unreferenced_definitions"] {
             assert_eq!(integrity[field].as_i64(), Some(0), "integrity field {field}");

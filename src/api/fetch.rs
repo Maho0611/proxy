@@ -390,6 +390,8 @@ pub fn empty_dashboard_stats() -> serde_json::Value {
         "valid_proxies": 0,
         "untested_proxies": 0,
         "invalid_proxies": 0,
+        "subscription_proxy_records": 0,
+        "duplicate_proxy_references": 0,
         "subscriptions": 0,
         "quality_checked": 0,
         "chatgpt_accessible": 0,

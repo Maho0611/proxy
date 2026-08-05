@@ -225,28 +225,30 @@ body.modal-open { overflow:hidden; }
 
 <div class="container">
   <div class="command-banner">
-    <div><h2>代理网络总览</h2><p>节点库存、出口质量与订阅关系的统一作战界面</p></div>
+    <div><h2>代理网络总览</h2><p>去重节点、订阅引用、出口质量与订阅关系的统一作战界面</p></div>
     <div class="command-clock"><div id="command-time">--:--:--</div><div>ASIA/SHANGHAI · LIVE TELEMETRY</div></div>
   </div>
   <!-- Stats -->
   <div class="stat-grid" id="stats">
-    <div class="stat-card" data-code="INV-01"><div class="stat-value" id="s-total">-</div><div class="stat-label">当前节点</div></div>
-    <div class="stat-card" data-code="OK-02" data-tone="success"><div class="stat-value" id="s-valid">-</div><div class="stat-label">当前有效</div></div>
-    <div class="stat-card" data-code="ERR-03" data-tone="danger"><div class="stat-value" id="s-invalid">-</div><div class="stat-label">无效</div></div>
-    <div class="stat-card" data-code="WAIT-04" data-tone="warn"><div class="stat-value" id="s-untested">-</div><div class="stat-label">待检测</div></div>
-    <div class="stat-card" data-code="SUB-05" data-tone="violet"><div class="stat-value" id="s-subs">-</div><div class="stat-label">订阅源</div></div>
-    <div class="stat-card" data-code="QA-06"><div class="stat-value" id="s-quality">-</div><div class="stat-label">当前有效已质检</div></div>
-    <div class="stat-card" data-code="AI-07" data-tone="success"><div class="stat-value" id="s-chatgpt">-</div><div class="stat-label">ChatGPT</div></div>
-    <div class="stat-card" data-code="WEB-08" data-tone="success"><div class="stat-value" id="s-google">-</div><div class="stat-label">Google</div></div>
-    <div class="stat-card" data-code="HOME-09" data-tone="violet"><div class="stat-value" id="s-residential">-</div><div class="stat-label">住宅 IP</div></div>
-    <div class="stat-card" data-code="USR-10"><div class="stat-value" id="s-users">-</div><div class="stat-label">注册用户</div></div>
-    <div class="stat-card" data-code="DUP-11" data-tone="warn"><div class="stat-value" id="s-duplicates">-</div><div class="stat-label">源内重复出口</div></div>
-    <div class="stat-card" data-code="EIP-12" data-tone="success"><div class="stat-value" id="s-unique-exits">-</div><div class="stat-label">源内唯一出口</div></div>
+    <div class="stat-card" data-code="INV-01" title="按代理连接定义去重后的活跃节点"><div class="stat-value" id="s-total">-</div><div class="stat-label">去重节点</div></div>
+    <div class="stat-card" data-code="OK-02" data-tone="success" title="健康状态为 healthy 的去重节点"><div class="stat-value" id="s-valid">-</div><div class="stat-label">健康节点</div></div>
+    <div class="stat-card" data-code="ERR-03" data-tone="danger" title="状态为 suspect 或 unhealthy 的去重节点"><div class="stat-value" id="s-invalid">-</div><div class="stat-label">异常节点</div></div>
+    <div class="stat-card" data-code="WAIT-04" data-tone="warn" title="尚未取得健康检测结果的去重节点"><div class="stat-value" id="s-untested">-</div><div class="stat-label">待检测节点</div></div>
+    <div class="stat-card" data-code="REC-05" title="所有订阅中的活跃节点记录，包含跨订阅重复"><div class="stat-value" id="s-records">-</div><div class="stat-label">订阅节点记录</div></div>
+    <div class="stat-card" data-code="REF-06" data-tone="warn" title="订阅节点记录减去按连接定义去重后的节点数"><div class="stat-value" id="s-reference-duplicates">-</div><div class="stat-label">重复节点引用</div></div>
+    <div class="stat-card" data-code="SUB-07" data-tone="violet"><div class="stat-value" id="s-subs">-</div><div class="stat-label">订阅源</div></div>
+    <div class="stat-card" data-code="QA-08"><div class="stat-value" id="s-quality">-</div><div class="stat-label">健康出口已质检</div></div>
+    <div class="stat-card" data-code="AI-09" data-tone="success"><div class="stat-value" id="s-chatgpt">-</div><div class="stat-label">ChatGPT</div></div>
+    <div class="stat-card" data-code="WEB-10" data-tone="success"><div class="stat-value" id="s-google">-</div><div class="stat-label">Google</div></div>
+    <div class="stat-card" data-code="HOME-11" data-tone="violet"><div class="stat-value" id="s-residential">-</div><div class="stat-label">住宅 IP</div></div>
+    <div class="stat-card" data-code="USR-12"><div class="stat-value" id="s-users">-</div><div class="stat-label">注册用户</div></div>
+    <div class="stat-card" data-code="DUP-13" data-tone="warn"><div class="stat-value" id="s-duplicates">-</div><div class="stat-label">源内重复出口</div></div>
+    <div class="stat-card" data-code="EIP-14" data-tone="success"><div class="stat-value" id="s-unique-exits">-</div><div class="stat-label">源内唯一出口</div></div>
   </div>
 
   <!-- Type breakdown -->
   <div class="section">
-    <div class="section-title">类型分布</div>
+    <div class="section-title">去重节点类型分布</div>
     <div class="type-chips" id="type-chips"></div>
   </div>
 
@@ -720,12 +722,16 @@ async function loadStats() {
     return;
   }
   const updateStat = (id, value) => {
-    if (value != null) document.getElementById(id).textContent = value;
+    if (value == null) return;
+    const element = document.getElementById(id);
+    element.textContent = typeof value === 'number' ? value.toLocaleString('zh-CN') : value;
   };
   updateStat('s-total', d.total_proxies);
   updateStat('s-valid', d.valid_proxies);
   updateStat('s-invalid', d.invalid_proxies);
   updateStat('s-untested', d.untested_proxies);
+  updateStat('s-records', d.subscription_proxy_records);
+  updateStat('s-reference-duplicates', d.duplicate_proxy_references);
   updateStat('s-subs', d.subscriptions);
   updateStat('s-quality', d.quality_checked);
   updateStat('s-chatgpt', d.chatgpt_accessible);
@@ -733,7 +739,7 @@ async function loadStats() {
   updateStat('s-residential', d.residential);
   const tc = document.getElementById('type-chips');
   if(d.by_type) {
-    tc.innerHTML = Object.entries(d.by_type).map(([k,v])=>`<span class="type-chip">${esc(k)}: ${v}</span>`).join('');
+    tc.innerHTML = Object.entries(d.by_type).map(([k,v])=>`<span class="type-chip">${esc(k)}: ${Number(v).toLocaleString('zh-CN')}</span>`).join('');
   }
 }
 
