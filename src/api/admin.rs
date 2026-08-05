@@ -122,10 +122,14 @@ pub async fn get_job_status(State(state): State<Arc<AppState>>) -> Json<serde_js
     }))
 }
 
+pub async fn ping() -> Json<serde_json::Value> {
+    Json(json!({ "ok": true }))
+}
+
 pub async fn get_stats(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let mut stats = crate::api::fetch::get_cached_stats(state.as_ref())?;
+    let mut stats = crate::api::fetch::get_cached_stats(state.clone()).await?;
     if let Some(object) = stats.as_object_mut() {
         object.insert(
             "database_runtime".into(),

@@ -65,6 +65,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/admin/proxies/cleanup", post(admin::cleanup_proxies))
         .route("/api/admin/validate", post(admin::trigger_validation))
         .route("/api/admin/jobs", get(admin::get_job_status))
+        .route("/api/admin/ping", get(admin::ping))
         .route(
             "/api/admin/quality-check",
             post(admin::trigger_quality_check),
@@ -120,6 +121,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(
             "/api/subscriptions/:id/quality-check",
             post(subscription::quality_check_subscription),
+        )
+        .route(
+            "/api/subscriptions/:id/duplicates",
+            get(subscription::get_subscription_duplicates_for_id),
         )
         .route_layer(middleware::from_fn_with_state(state.clone(), admin_auth));
 

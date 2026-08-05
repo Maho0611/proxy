@@ -37,7 +37,7 @@ pub async fn get_user_access(
     } else {
         state.db.get_proxy_account_for_owner(&user.id)?
     };
-    let stats = crate::api::fetch::get_cached_stats(state.as_ref())?;
+    let stats = crate::api::fetch::get_cached_stats(state.clone()).await?;
     Ok(Json(json!({
         "gateway": gateway_json(&state),
         "account": account,

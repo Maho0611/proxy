@@ -1998,6 +1998,146 @@ impl Database {
         })
     }
 
+    /// Compute duplicate telemetry for one subscription and only its strongest
+    /// overlaps. Unlike the legacy overview this never builds every pair among
+    /// all subscriptions, so its work is bounded by the selected source plus
+    /// one pass over the active inventory.
+    pub fn get_subscription_duplicate_details(
+        &self,
+        subscription_id: &str,
+        limit: i64,
+    ) -> Result<(SubscriptionDuplicateStats, Vec<SubscriptionOverlap>), postgres::Error> {
+        self.with_conn(|conn| {
+            let row = conn.query_one(
+                "SELECT
+                    $1::text AS subscription_id,
+                    COUNT(membership.source_proxy_id) AS stored_nodes,
+                    COUNT(membership.source_proxy_id) FILTER (
+                        WHERE health.health_state = 'healthy'
+                    ) AS valid_nodes,
+                    COUNT(DISTINCT (
+                        LOWER(definition.server), definition.port, definition.proxy_type
+                    )) AS unique_endpoints,
+                    GREATEST(
+                        COUNT(membership.source_proxy_id) - COUNT(DISTINCT (
+                            LOWER(definition.server), definition.port, definition.proxy_type
+                        )),
+                        0
+                    ) AS duplicate_endpoint_nodes,
+                    COUNT(observed.definition_id) AS measured_exit_nodes,
+                    COUNT(DISTINCT observed.ip_address) AS unique_exit_ips
+                 FROM subscription_proxies membership
+                 JOIN proxy_definitions definition
+                   ON definition.id = membership.definition_id
+                 JOIN proxy_health health
+                   ON health.definition_id = membership.definition_id
+                 LEFT JOIN proxy_exit observed
+                   ON observed.definition_id = membership.definition_id
+                 WHERE membership.subscription_id = $1
+                   AND membership.orphaned_at IS NULL",
+                &[&subscription_id],
+            )?;
+            let measured_exit_nodes: i64 = row.get("measured_exit_nodes");
+            let unique_exit_ips: i64 = row.get("unique_exit_ips");
+            let stats = SubscriptionDuplicateStats {
+                subscription_id: row.get("subscription_id"),
+                stored_nodes: row.get("stored_nodes"),
+                valid_nodes: row.get("valid_nodes"),
+                unique_endpoints: row.get("unique_endpoints"),
+                duplicate_endpoint_nodes: row.get("duplicate_endpoint_nodes"),
+                measured_exit_nodes,
+                unique_exit_ips,
+                duplicate_exit_ip_nodes: (measured_exit_nodes - unique_exit_ips).max(0),
+            };
+
+            let rows = conn.query(
+                "WITH target_definitions AS (
+                    SELECT DISTINCT definition_id
+                    FROM subscription_proxies
+                    WHERE subscription_id = $1 AND orphaned_at IS NULL
+                 ), exact_overlap AS (
+                    SELECT other.subscription_id, COUNT(DISTINCT other.definition_id) AS shared
+                    FROM target_definitions target
+                    JOIN subscription_proxies other
+                      ON other.definition_id = target.definition_id
+                    WHERE other.subscription_id <> $1
+                      AND other.orphaned_at IS NULL
+                    GROUP BY other.subscription_id
+                 ), target_endpoints AS (
+                    SELECT DISTINCT LOWER(definition.server) AS server,
+                           definition.port, definition.proxy_type
+                    FROM target_definitions target
+                    JOIN proxy_definitions definition ON definition.id = target.definition_id
+                 ), other_endpoints AS (
+                    SELECT DISTINCT membership.subscription_id,
+                           LOWER(definition.server) AS server,
+                           definition.port, definition.proxy_type
+                    FROM subscription_proxies membership
+                    JOIN proxy_definitions definition
+                      ON definition.id = membership.definition_id
+                    WHERE membership.subscription_id <> $1
+                      AND membership.orphaned_at IS NULL
+                 ), endpoint_overlap AS (
+                    SELECT other.subscription_id, COUNT(*) AS shared
+                    FROM target_endpoints target
+                    JOIN other_endpoints other
+                      ON other.server = target.server
+                     AND other.port = target.port
+                     AND other.proxy_type = target.proxy_type
+                    GROUP BY other.subscription_id
+                 ), target_exits AS (
+                    SELECT DISTINCT observed.ip_address
+                    FROM target_definitions target
+                    JOIN proxy_exit observed ON observed.definition_id = target.definition_id
+                 ), other_exits AS (
+                    SELECT DISTINCT membership.subscription_id, observed.ip_address
+                    FROM subscription_proxies membership
+                    JOIN proxy_exit observed
+                      ON observed.definition_id = membership.definition_id
+                    WHERE membership.subscription_id <> $1
+                      AND membership.orphaned_at IS NULL
+                 ), exit_overlap AS (
+                    SELECT other.subscription_id, COUNT(*) AS shared
+                    FROM target_exits target
+                    JOIN other_exits other ON other.ip_address = target.ip_address
+                    GROUP BY other.subscription_id
+                 ), overlap_ids AS (
+                    SELECT subscription_id FROM exact_overlap
+                    UNION
+                    SELECT subscription_id FROM endpoint_overlap
+                    UNION
+                    SELECT subscription_id FROM exit_overlap
+                 )
+                 SELECT $1::text AS left_id, overlap_ids.subscription_id AS right_id,
+                        COALESCE(exact.shared, 0) AS shared_exact_nodes,
+                        COALESCE(endpoint.shared, 0) AS shared_endpoints,
+                        COALESCE(exit_data.shared, 0) AS shared_exit_ips
+                 FROM overlap_ids
+                 LEFT JOIN exact_overlap exact USING (subscription_id)
+                 LEFT JOIN endpoint_overlap endpoint USING (subscription_id)
+                 LEFT JOIN exit_overlap exit_data USING (subscription_id)
+                 ORDER BY (
+                    COALESCE(exact.shared, 0)
+                    + COALESCE(endpoint.shared, 0)
+                    + COALESCE(exit_data.shared, 0)
+                 ) DESC, overlap_ids.subscription_id
+                 LIMIT $2",
+                &[&subscription_id, &limit.max(1)],
+            )?;
+            let overlaps = rows
+                .iter()
+                .map(|row| SubscriptionOverlap {
+                    left_subscription_id: row.get("left_id"),
+                    right_subscription_id: row.get("right_id"),
+                    shared_exact_nodes: row.get("shared_exact_nodes"),
+                    shared_endpoints: row.get("shared_endpoints"),
+                    shared_exit_ips: row.get("shared_exit_ips"),
+                })
+                .collect();
+            Ok((stats, overlaps))
+        })
+    }
+
     pub fn get_valid_export_proxies(
         &self,
         proxy_type: Option<&str>,
@@ -3591,25 +3731,26 @@ impl Database {
 
     pub fn get_stats(&self) -> Result<serde_json::Value, postgres::Error> {
         self.with_conn(|conn| {
-            // Keep dashboard statistics aligned with subscription export/listing:
-            // orphaned proxies are internal refresh fallbacks, not current nodes.
+            // Query the normalized base tables directly. The compatibility
+            // views materialize timestamps and join quality per source row;
+            // doing that repeatedly for dashboard counters is prohibitively
+            // expensive once the inventory reaches millions of memberships.
             let proxy_counts = conn.query_one(
                 "SELECT
                     COUNT(*) AS total,
-                    COUNT(DISTINCT q.ip_address) FILTER (
-                        WHERE p.is_valid = TRUE
-                          AND q.ip_address IS NOT NULL
-                          AND BTRIM(q.ip_address) <> ''
+                    COUNT(DISTINCT observed.ip_address) FILTER (
+                        WHERE health.health_state = 'healthy'
                     ) AS valid,
+                    COUNT(*) FILTER (WHERE health.health_state = 'untested') AS untested,
                     COUNT(*) FILTER (
-                        WHERE p.is_valid = FALSE AND p.last_validated IS NULL
-                    ) AS untested,
-                    COUNT(*) FILTER (
-                        WHERE p.is_valid = FALSE AND p.last_validated IS NOT NULL
+                        WHERE health.health_state IN ('suspect', 'unhealthy')
                     ) AS invalid
-                 FROM normalized_proxies p
-                 LEFT JOIN normalized_proxy_quality q ON q.proxy_id = p.id
-                 WHERE p.orphaned_at IS NULL",
+                 FROM subscription_proxies membership
+                 JOIN proxy_health health
+                   ON health.definition_id = membership.definition_id
+                 LEFT JOIN proxy_exit observed
+                   ON observed.definition_id = membership.definition_id
+                 WHERE membership.orphaned_at IS NULL",
                 &[],
             )?;
             let total: i64 = proxy_counts.get("total");
@@ -3620,23 +3761,32 @@ impl Database {
                 .query_one("SELECT COUNT(*) FROM subscriptions", &[])?
                 .get(0);
             let quality_counts = conn.query_one(
-                "SELECT
-                    COUNT(DISTINCT q.ip_address) AS quality_checked,
-                    COUNT(DISTINCT q.ip_address) FILTER (
-                        WHERE q.chatgpt_accessible = TRUE
+                "WITH active_healthy_exits AS (
+                    SELECT DISTINCT observed.ip_address
+                    FROM proxy_exit observed
+                    JOIN proxy_health health
+                      ON health.definition_id = observed.definition_id
+                    WHERE health.health_state = 'healthy'
+                      AND EXISTS (
+                          SELECT 1
+                          FROM subscription_proxies membership
+                          WHERE membership.definition_id = observed.definition_id
+                            AND membership.orphaned_at IS NULL
+                      )
+                 )
+                 SELECT
+                    COUNT(*) AS quality_checked,
+                    COUNT(*) FILTER (
+                        WHERE quality.chatgpt_accessible = TRUE
                     ) AS chatgpt_accessible,
-                    COUNT(DISTINCT q.ip_address) FILTER (
-                        WHERE q.google_accessible = TRUE
+                    COUNT(*) FILTER (
+                        WHERE quality.google_accessible = TRUE
                     ) AS google_accessible,
-                    COUNT(DISTINCT q.ip_address) FILTER (
-                        WHERE q.is_residential = TRUE
+                    COUNT(*) FILTER (
+                        WHERE quality.is_residential = TRUE
                     ) AS residential
-                 FROM normalized_proxy_quality q
-                 JOIN normalized_proxies p ON p.id = q.proxy_id
-                 WHERE p.is_valid = TRUE
-                   AND p.orphaned_at IS NULL
-                   AND q.ip_address IS NOT NULL
-                   AND BTRIM(q.ip_address) <> ''",
+                 FROM active_healthy_exits active
+                 JOIN exit_quality quality ON quality.ip_address = active.ip_address",
                 &[],
             )?;
             let quality_checked: i64 = quality_counts.get("quality_checked");
@@ -3645,21 +3795,34 @@ impl Database {
             let residential: i64 = quality_counts.get("residential");
 
             let by_type_rows = conn.query(
-                "SELECT proxy_type, COUNT(*)
-                 FROM normalized_proxies
-                 WHERE orphaned_at IS NULL
-                 GROUP BY proxy_type",
+                "SELECT definition.proxy_type, COUNT(*)
+                 FROM subscription_proxies membership
+                 JOIN proxy_definitions definition
+                   ON definition.id = membership.definition_id
+                 WHERE membership.orphaned_at IS NULL
+                 GROUP BY definition.proxy_type",
                 &[],
             )?;
             let by_country_rows = conn.query(
-                "SELECT q.country, COUNT(DISTINCT q.ip_address)
-                 FROM normalized_proxy_quality q
-                 JOIN normalized_proxies p ON p.id = q.proxy_id
-                 WHERE p.is_valid = TRUE
-                   AND p.orphaned_at IS NULL
-                   AND q.country IS NOT NULL
-                 GROUP BY q.country
-                 ORDER BY COUNT(DISTINCT q.ip_address) DESC",
+                "WITH active_healthy_exits AS (
+                    SELECT DISTINCT observed.ip_address
+                    FROM proxy_exit observed
+                    JOIN proxy_health health
+                      ON health.definition_id = observed.definition_id
+                    WHERE health.health_state = 'healthy'
+                      AND EXISTS (
+                          SELECT 1
+                          FROM subscription_proxies membership
+                          WHERE membership.definition_id = observed.definition_id
+                            AND membership.orphaned_at IS NULL
+                      )
+                 )
+                 SELECT quality.country, COUNT(*)
+                 FROM active_healthy_exits active
+                 JOIN exit_quality quality ON quality.ip_address = active.ip_address
+                 WHERE quality.country IS NOT NULL
+                 GROUP BY quality.country
+                 ORDER BY COUNT(*) DESC",
                 &[],
             )?;
 
@@ -3674,14 +3837,14 @@ impl Database {
             let integrity = conn.query_one(
                 "SELECT
                     (SELECT COUNT(*)
-                     FROM subscription_proxies membership
+                     FROM proxy_definitions definition
                      LEFT JOIN proxy_health health
-                       ON health.definition_id = membership.definition_id
+                       ON health.definition_id = definition.id
                      WHERE health.definition_id IS NULL) AS health_missing,
                     (SELECT COUNT(*)
-                     FROM subscription_proxies membership
+                     FROM proxy_definitions definition
                      LEFT JOIN proxy_runtime runtime
-                       ON runtime.definition_id = membership.definition_id
+                       ON runtime.definition_id = definition.id
                      WHERE runtime.definition_id IS NULL) AS runtime_missing,
                     (SELECT COUNT(*)
                      FROM proxy_definitions definition
@@ -5814,6 +5977,15 @@ mod tests {
 
         let (_, overlaps) = db.get_subscription_duplicate_overview().unwrap();
         assert!(overlaps.iter().any(|edge| {
+            edge.left_subscription_id == first_sub_id
+                && edge.right_subscription_id == second_sub_id
+                && edge.shared_exact_nodes == 1
+        }));
+        let (duplicate_stats, targeted_overlaps) = db
+            .get_subscription_duplicate_details(&first_sub_id, 20)
+            .unwrap();
+        assert_eq!(duplicate_stats.subscription_id, first_sub_id);
+        assert!(targeted_overlaps.iter().any(|edge| {
             edge.left_subscription_id == first_sub_id
                 && edge.right_subscription_id == second_sub_id
                 && edge.shared_exact_nodes == 1

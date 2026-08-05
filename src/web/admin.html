@@ -516,6 +516,8 @@ let latestProxyCredential = '';
 let currentJobs = null;
 let jobStatusLoading = false;
 const previousJobStatuses = { validation: 'idle', quality: 'idle' };
+const subscriptionAnalysis = new Map();
+const subscriptionAnalysisLoading = new Set();
 const SUBSCRIPTION_SECTION_STATE_KEY = 'zenproxy_subscription_section_state';
 
 // --- Auth ---
@@ -529,11 +531,12 @@ async function doLogin() {
   const pwd = document.getElementById('login-password').value;
   if (!pwd) return;
   try {
-    const r = await fetch('/api/admin/stats', { headers: { 'Authorization': 'Bearer ' + pwd } });
+    const r = await fetch('/api/admin/ping', { headers: { 'Authorization': 'Bearer ' + pwd } });
     if (r.status === 401) {
       document.getElementById('login-error').style.display = 'block';
       return;
     }
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
     localStorage.setItem(STORAGE_KEY, pwd);
     document.getElementById('login-overlay').style.display = 'none';
     document.getElementById('app').style.display = '';
@@ -551,15 +554,17 @@ function doLogout() {
 function checkAuth() {
   const pwd = getPassword();
   if (pwd) {
-    fetch('/api/admin/stats', { headers: { 'Authorization': 'Bearer ' + pwd } }).then(r => {
+    fetch('/api/admin/ping', { headers: { 'Authorization': 'Bearer ' + pwd } }).then(r => {
       if (r.status === 401) {
         localStorage.removeItem(STORAGE_KEY);
         document.getElementById('login-overlay').style.display = '';
         document.getElementById('app').style.display = 'none';
-      } else {
+      } else if (r.ok) {
         document.getElementById('login-overlay').style.display = 'none';
         document.getElementById('app').style.display = '';
         refresh();
+      } else {
+        throw new Error(`HTTP ${r.status}`);
       }
     }).catch(() => {
       document.getElementById('login-overlay').style.display = '';
@@ -695,6 +700,7 @@ async function loadJobStatus() {
   previousJobStatuses.validation = d.validation?.status || 'idle';
   previousJobStatuses.quality = d.quality_check?.status || 'idle';
   if (completedNow) {
+    subscriptionAnalysis.clear();
     loadStats();
     loadSubscriptions();
     resetProxyCursor();
@@ -704,26 +710,22 @@ async function loadJobStatus() {
 
 async function loadStats() {
   const d = await api('/api/admin/stats');
-  if(!d) return;
-  document.getElementById('s-total').textContent = d.total_proxies??0;
-  document.getElementById('s-valid').textContent = d.valid_proxies??0;
-  document.getElementById('s-invalid').textContent = d.invalid_proxies??0;
-  document.getElementById('s-untested').textContent = d.untested_proxies??0;
-  document.getElementById('s-subs').textContent = d.subscriptions??0;
-  document.getElementById('s-quality').textContent = d.quality_checked??0;
-  document.getElementById('s-chatgpt').textContent = d.chatgpt_accessible??0;
-  document.getElementById('s-google').textContent = d.google_accessible??0;
-  document.getElementById('s-residential').textContent = d.residential??0;
-  // listSubscriptions fills these from its richer per-source telemetry. Only
-  // overwrite them when the aggregate stats endpoint actually exposes the
-  // matching fields; both requests run concurrently during refresh().
-  const aggregateDuplicateCount = d.duplicate_exit_proxies ?? d.duplicate_proxies;
-  if (aggregateDuplicateCount != null) {
-    document.getElementById('s-duplicates').textContent = aggregateDuplicateCount;
+  if (!d || d.error) {
+    toast('统计加载失败，已保留上次显示值：' + (d?.error || '请求失败'));
+    return;
   }
-  if (d.unique_exit_ips != null) {
-    document.getElementById('s-unique-exits').textContent = d.unique_exit_ips;
-  }
+  const updateStat = (id, value) => {
+    if (value != null) document.getElementById(id).textContent = value;
+  };
+  updateStat('s-total', d.total_proxies);
+  updateStat('s-valid', d.valid_proxies);
+  updateStat('s-invalid', d.invalid_proxies);
+  updateStat('s-untested', d.untested_proxies);
+  updateStat('s-subs', d.subscriptions);
+  updateStat('s-quality', d.quality_checked);
+  updateStat('s-chatgpt', d.chatgpt_accessible);
+  updateStat('s-google', d.google_accessible);
+  updateStat('s-residential', d.residential);
   const tc = document.getElementById('type-chips');
   if(d.by_type) {
     tc.innerHTML = Object.entries(d.by_type).map(([k,v])=>`<span class="type-chip">${esc(k)}: ${v}</span>`).join('');
@@ -907,18 +909,37 @@ async function unbanUser(id) {
 
 async function loadSubscriptions() {
   const d = await api('/api/subscriptions');
-  if(!d) return;
+  if (!d || d.error) {
+    toast('订阅列表加载失败：' + (d?.error || '请求失败'));
+    return;
+  }
   renderSubscriptions(d);
-  const duplicateData = await api('/api/subscriptions/duplicates');
-  if (!duplicateData) return;
-  const statsById = Object.fromEntries((duplicateData.duplicate_stats || []).map(item => [String(item.subscription_id), item]));
-  d.subscriptions = (d.subscriptions || []).map(item => ({...item, duplicate_stats: statsById[String(item.id)] || null}));
-  d.overlap_edges = duplicateData.overlap_edges || [];
-  renderSubscriptions(d);
+}
+
+async function analyzeSubscription(id) {
+  const key = String(id);
+  if (subscriptionAnalysisLoading.has(key)) return;
+  subscriptionAnalysisLoading.add(key);
+  renderSubscriptions({ subscriptions: currentSubscriptions, default_refresh_interval_mins: defaultSubRefreshInterval });
+  const d = await api(`/api/subscriptions/${encodeURIComponent(id)}/duplicates`);
+  subscriptionAnalysisLoading.delete(key);
+  if (!d || d.error) {
+    toast('重叠分析失败：' + (d?.error || '请求失败'));
+  } else {
+    subscriptionAnalysis.set(key, {
+      duplicate_stats: d.duplicate_stats || null,
+      overlaps: d.overlaps || []
+    });
+  }
+  renderSubscriptions({ subscriptions: currentSubscriptions, default_refresh_interval_mins: defaultSubRefreshInterval });
 }
 
 function renderSubscriptions(d) {
   currentSubscriptions = d.subscriptions || [];
+  const activeIds = new Set(currentSubscriptions.map(s => String(s.id)));
+  for (const id of subscriptionAnalysis.keys()) {
+    if (!activeIds.has(id)) subscriptionAnalysis.delete(id);
+  }
   updateProxySourceFilter(currentSubscriptions);
   defaultSubRefreshInterval = Number(d.default_refresh_interval_mins || 0);
   const defaultInput = document.getElementById('default-sub-refresh-interval');
@@ -932,24 +953,17 @@ function renderSubscriptions(d) {
   if(!d.subscriptions||!d.subscriptions.length) {
     tb.innerHTML='';
     empty.style.display='';
-    document.getElementById('s-duplicates').textContent = '0';
-    document.getElementById('s-unique-exits').textContent = '0';
+    document.getElementById('s-duplicates').textContent = '按需';
+    document.getElementById('s-unique-exits').textContent = '按需';
     return;
   }
   empty.style.display='none';
   const byId = Object.fromEntries(d.subscriptions.map(s => [String(s.id), s]));
-  const overlapById = {};
-  for (const edge of (d.overlap_edges || [])) {
-    const left = String(edge.left_subscription_id || '');
-    const right = String(edge.right_subscription_id || '');
-    if (!left || !right) continue;
-    (overlapById[left] ||= []).push({ id: right, shared_exact_nodes: edge.shared_exact_nodes, shared_endpoints: edge.shared_endpoints, shared_exit_ips: edge.shared_exit_ips });
-    (overlapById[right] ||= []).push({ id: left, shared_exact_nodes: edge.shared_exact_nodes, shared_endpoints: edge.shared_endpoints, shared_exit_ips: edge.shared_exit_ips });
-  }
-  const duplicateExitTotal = d.subscriptions.reduce((sum, s) => sum + Number(s.duplicate_stats?.duplicate_exit_ip_nodes || 0), 0);
-  const uniqueExitTotal = d.subscriptions.reduce((sum, s) => sum + Number(s.duplicate_stats?.unique_exit_ips || 0), 0);
-  document.getElementById('s-duplicates').textContent = duplicateExitTotal;
-  document.getElementById('s-unique-exits').textContent = uniqueExitTotal;
+  const analyzedResults = d.subscriptions.map(s => subscriptionAnalysis.get(String(s.id))).filter(Boolean);
+  const duplicateExitTotal = analyzedResults.reduce((sum, item) => sum + Number(item.duplicate_stats?.duplicate_exit_ip_nodes || 0), 0);
+  const uniqueExitTotal = analyzedResults.reduce((sum, item) => sum + Number(item.duplicate_stats?.unique_exit_ips || 0), 0);
+  document.getElementById('s-duplicates').textContent = analyzedResults.length ? duplicateExitTotal : '按需';
+  document.getElementById('s-unique-exits').textContent = analyzedResults.length ? uniqueExitTotal : '按需';
   tb.innerHTML = d.subscriptions.map(s => {
     const effectiveInterval = s.refresh_interval_mins == null ? defaultSubRefreshInterval : s.refresh_interval_mins;
     const refreshCell = s.url
@@ -959,10 +973,11 @@ function renderSubscriptions(d) {
         </div>${s.refresh_interval_mins == null ? '<div style="margin-top:4px;color:var(--text-dim);font-size:12px">当前跟随全局默认值</div>' : ''}`
       : '<span style="color:var(--text-dim)">仅 URL 可定时更新</span>';
     const importDuplicateCount = Number(s.duplicate_proxy_count ?? 0);
-    const duplicateStats = s.duplicate_stats || {};
+    const analysis = subscriptionAnalysis.get(String(s.id));
+    const duplicateStats = analysis?.duplicate_stats || {};
     const exitDuplicateCount = Number(duplicateStats.duplicate_exit_ip_nodes || 0);
     const uniqueCount = duplicateStats.unique_exit_ips;
-    const rawOverlaps = overlapById[String(s.id)] || s.overlaps || s.overlap_subscriptions || [];
+    const rawOverlaps = analysis?.overlaps || [];
     const overlapItems = (Array.isArray(rawOverlaps) ? rawOverlaps : []).map(item => {
       if (typeof item === 'string') {
         return { name: byId[item]?.name || item, exact: 0, exits: 0, endpoints: 0 };
@@ -975,10 +990,12 @@ function renderSubscriptions(d) {
         endpoints: Number(item.shared_endpoints || item.shared_count || item.count || 0)
       };
     }).sort((a, b) => b.exact - a.exact || b.exits - a.exits || b.endpoints - a.endpoints || a.name.localeCompare(b.name, 'zh-CN'));
-    const overlapCell = renderOverlapCell(overlapItems);
+    const analyzing = subscriptionAnalysisLoading.has(String(s.id));
+    const analyzeButton = `<button class="btn btn-sm" onclick="analyzeSubscription('${escAttr(s.id)}')" ${analyzing ? 'disabled' : ''}>${analyzing ? '分析中…' : (analysis ? '重新分析' : '分析重叠')}</button>`;
+    const overlapCell = `${analyzeButton}<div style="margin-top:7px">${analysis ? renderOverlapCell(overlapItems) : '<span style="color:var(--text-dim)">按需计算 Top 20</span>'}</div>`;
     const inventoryCell = `<div class="metric-pair"><strong>${s.proxy_count ?? 0}</strong><small>/ 原始 ${s.raw_proxy_count ?? s.proxy_count ?? 0}</small></div>
       <div style="margin-top:4px;color:${importDuplicateCount ? 'var(--warn)' : 'var(--text-dim)'};font-size:10px" title="订阅内容中完全相同、导入时直接丢弃且不会进入验活的节点">导入重复 ${importDuplicateCount}（未验活）</div>
-      <div style="margin-top:3px;color:${exitDuplicateCount ? 'var(--warn)' : 'var(--text-dim)'};font-size:10px">出口重复 ${exitDuplicateCount}${uniqueCount == null ? '' : ` · 唯一出口 ${uniqueCount}`}</div>`;
+      <div style="margin-top:3px;color:${exitDuplicateCount ? 'var(--warn)' : 'var(--text-dim)'};font-size:10px">${analysis ? `出口重复 ${exitDuplicateCount}${uniqueCount == null ? '' : ` · 唯一出口 ${uniqueCount}`}` : '出口重复：按需分析'}</div>`;
     return `<tr ondblclick="openEditSubscription('${s.id}', event)" title="双击编辑订阅源">
       <td>${esc(s.name)}</td>
       <td><span class="badge badge-type">${esc(s.sub_type)}</span></td>
@@ -1095,6 +1112,7 @@ async function saveEditSubscription(event) {
   const refreshed = await api('/api/subscriptions/' + subscription.id + '/refresh', {method:'POST'});
   if (refreshed?.error) toast('设置已保存，但节点刷新失败: ' + refreshed.error);
   else if (refreshed) toast('节点刷新完成: ' + refreshed.proxies_added + ' 个代理，已提交验活');
+  subscriptionAnalysis.clear();
   resetProxyCursor();
   refresh();
 }
@@ -1154,6 +1172,7 @@ async function adminAddSubscription() {
     document.getElementById('add-sub-url').value = '';
     document.getElementById('add-sub-content').value = '';
     document.getElementById('add-sub-refresh-interval').value = '';
+    if (!d.already_exists) subscriptionAnalysis.clear();
     refresh();
   } else if (d && d.error) {
     toast('错误: ' + d.error);
@@ -1357,6 +1376,7 @@ async function deleteProxy(id) {
   if(d && d.error) { toast('删除失败: '+d.error); return; }
   if(!d) return;
   toast('代理已删除');
+  subscriptionAnalysis.clear();
   resetProxyCursor();
   refresh();
 }
@@ -1367,6 +1387,7 @@ async function deleteSub(id) {
   if(d && d.error) { toast('删除失败: '+d.error); return; }
   if(!d) return;
   toast('订阅源已删除');
+  subscriptionAnalysis.clear();
   resetProxyCursor();
   refresh();
 }
@@ -1376,6 +1397,7 @@ async function refreshSub(id) {
   const d = await api('/api/subscriptions/'+id+'/refresh', {method:'POST'});
   if(d && d.error) { toast('刷新失败: ' + d.error); return; }
   if(d) toast('刷新完成: 新增 '+d.proxies_added+' 个代理，已提交验活');
+  subscriptionAnalysis.clear();
   resetProxyCursor();
   refresh();
 }

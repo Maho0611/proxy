@@ -189,6 +189,33 @@ pub async fn get_subscription_duplicates(
     }
 }
 
+pub async fn get_subscription_duplicates_for_id(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    const OVERLAP_LIMIT: i64 = 20;
+    let query_state = state.clone();
+    let query_id = id.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        if query_state.db.get_subscription(&query_id)?.is_none() {
+            return Ok(None);
+        }
+        query_state
+            .db
+            .get_subscription_duplicate_details(&query_id, OVERLAP_LIMIT)
+            .map(Some)
+    })
+    .await
+    .map_err(|error| AppError::Internal(format!("Subscription overlap task failed: {error}")))??
+    .ok_or_else(|| AppError::NotFound("Subscription not found".into()))?;
+    let (stats, overlaps) = result;
+
+    Ok(Json(json!({
+        "duplicate_stats": stats,
+        "overlaps": overlaps,
+    })))
+}
+
 pub async fn add_subscription(
     State(state): State<Arc<AppState>>,
     body: axum::body::Body,

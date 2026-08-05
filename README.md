@@ -489,6 +489,7 @@ https://proxy.mui.moe/sub/{subscription_password}/trojan/clash.yaml
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
+| `GET /api/admin/ping` | 轻量管理鉴权检查 |
 | `GET /api/admin/stats` | 系统统计 |
 | `GET /api/admin/proxies` | 代理列表 |
 | `DELETE /api/admin/proxies/:id` | 删除代理 |
@@ -507,10 +508,11 @@ https://proxy.mui.moe/sub/{subscription_password}/trojan/clash.yaml
 | `POST /api/admin/proxy-accounts/:id/reveal` | 返回派生密码（`Cache-Control: no-store`） |
 | `POST /api/admin/proxy-accounts/:id/rotate-password` | 轮换并返回新密码 |
 | `GET /api/subscriptions` | 返回订阅摘要和默认刷新周期，不加载代理明细/重复分析 |
-| `GET /api/subscriptions/duplicates` | 返回按订阅统计的重复节点及订阅间重叠关系（30 秒缓存） |
+| `GET /api/subscriptions/duplicates` | 兼容旧版的全局重复分析；管理后台不再自动调用 |
 | `PATCH /api/subscriptions/defaults` | 修改默认刷新周期：`{refresh_interval_mins}` |
 | `POST /api/subscriptions` | 添加订阅：`{name,type?,url?|content?,refresh_interval_mins?}` |
 | `GET /api/subscriptions/:id` | 获取单个订阅完整详情 |
+| `GET /api/subscriptions/:id/duplicates` | 按需分析单个订阅，并返回重叠度最高的 20 个订阅 |
 | `PATCH /api/subscriptions/:id` | 仅修改独立刷新周期：`{refresh_interval_mins}` |
 | `PUT /api/subscriptions/:id` | 修改名称、类型、URL/内容和独立刷新周期 |
 | `DELETE /api/subscriptions/:id` | 删除订阅及其代理 |

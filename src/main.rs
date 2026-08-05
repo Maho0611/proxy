@@ -49,6 +49,8 @@ pub struct AppState {
     pub selection_unavailable_definitions: DashMap<String, std::time::Instant>,
     /// Short-lived aggregate dashboard cache; avoids repeated full-table scans.
     pub dashboard_stats_cache: DashMap<(), DashboardStatsCacheEntry>,
+    /// Coalesces concurrent dashboard cache misses into one database query.
+    pub dashboard_stats_cache_fill: Mutex<()>,
     /// Lazy duplicate/overlap analysis for the subscription admin view.
     pub subscription_duplicate_cache: DashMap<(), SubscriptionDuplicateCacheEntry>,
     pub subscription_duplicate_cache_fill: Mutex<()>,
@@ -201,6 +203,7 @@ async fn main() {
         selection_snapshot: ArcSwap::from_pointee(selection_snapshot),
         selection_unavailable_definitions: DashMap::new(),
         dashboard_stats_cache: DashMap::new(),
+        dashboard_stats_cache_fill: Mutex::new(()),
         subscription_duplicate_cache: DashMap::new(),
         subscription_duplicate_cache_fill: Mutex::new(()),
         subscription_duplicate_generation: AtomicU64::new(0),
