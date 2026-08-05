@@ -65,6 +65,9 @@ pub struct DatabaseRuntimeMetrics {
 
 const SETTING_SUBSCRIPTION_DEFAULT_REFRESH_INTERVAL_MINS: &str =
     "subscription_auto_refresh_interval_mins";
+const SETTING_DASHBOARD_STATS_SNAPSHOT: &str = "dashboard_stats_snapshot_v1";
+pub const SETTING_VALIDATION_LAST_COMPLETED_AT: &str = "validation_last_completed_at";
+pub const SETTING_QUALITY_LAST_COMPLETED_AT: &str = "quality_last_completed_at";
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Subscription {
@@ -1199,6 +1202,367 @@ impl Database {
                 CREATE INDEX IF NOT EXISTS idx_exit_quality_checked_at
                     ON exit_quality(checked_at, ip_address);
 
+                -- Compact read model for the proxy-list sort keys. Keeping
+                -- only scalar ordering fields avoids sorting the wide joined
+                -- inventory for every page while the authoritative details
+                -- continue to come from the normalized tables above.
+                CREATE TABLE IF NOT EXISTS proxy_list_sort_keys (
+                    source_proxy_id TEXT PRIMARY KEY
+                        REFERENCES subscription_proxies(source_proxy_id) ON DELETE CASCADE,
+                    proxy_type TEXT NOT NULL,
+                    server TEXT NOT NULL,
+                    status_rank SMALLINT NOT NULL,
+                    error_count INTEGER NOT NULL,
+                    country TEXT NOT NULL,
+                    risk_score DOUBLE PRECISION NOT NULL,
+                    user_visible BOOLEAN NOT NULL DEFAULT TRUE,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+                ALTER TABLE proxy_list_sort_keys
+                    ADD COLUMN IF NOT EXISTS user_visible BOOLEAN NOT NULL DEFAULT TRUE;
+
+                CREATE OR REPLACE FUNCTION zenproxy_refresh_proxy_list_sort_keys_for_definition(
+                    target_definition_id TEXT
+                ) RETURNS VOID LANGUAGE plpgsql AS $$
+                BEGIN
+                    UPDATE proxy_list_sort_keys sort_key
+                    SET proxy_type = definition.proxy_type,
+                        server = definition.server,
+                        status_rank = CASE
+                            WHEN health.health_state = 'healthy' THEN 0
+                            WHEN health.last_success_at IS NULL
+                             AND health.last_failure_at IS NULL THEN 1
+                            ELSE 2
+                        END,
+                        error_count = COALESCE(health.consecutive_failures, 0),
+                        country = COALESCE(quality.country, 'ZZZ'),
+                        risk_score = CASE
+                            WHEN observed.definition_id IS NOT NULL
+                              OR retry.definition_id IS NOT NULL
+                            THEN COALESCE(quality.risk_score, 1.0)
+                            ELSE 2.0
+                        END,
+                        user_visible = observed.definition_id IS NULL OR EXISTS (
+                            SELECT 1 FROM proxy_exit_representatives representative
+                            WHERE representative.source_proxy_id = membership.source_proxy_id
+                        ),
+                        updated_at = NOW()
+                    FROM subscription_proxies membership
+                    JOIN proxy_definitions definition
+                      ON definition.id = membership.definition_id
+                    LEFT JOIN proxy_health health
+                      ON health.definition_id = membership.definition_id
+                    LEFT JOIN proxy_exit observed
+                      ON observed.definition_id = membership.definition_id
+                    LEFT JOIN exit_quality quality
+                      ON quality.ip_address = observed.ip_address
+                    LEFT JOIN quality_retry_state retry
+                      ON retry.definition_id = membership.definition_id
+                    WHERE membership.definition_id = target_definition_id
+                      AND sort_key.source_proxy_id = membership.source_proxy_id;
+                END;
+                $$;
+
+                CREATE OR REPLACE FUNCTION zenproxy_sync_proxy_list_sort_key_membership()
+                RETURNS TRIGGER LANGUAGE plpgsql AS $$
+                BEGIN
+                    INSERT INTO proxy_list_sort_keys (
+                        source_proxy_id, proxy_type, server, status_rank,
+                        error_count, country, risk_score, user_visible, updated_at
+                    )
+                    SELECT NEW.source_proxy_id, definition.proxy_type,
+                           definition.server,
+                           CASE
+                               WHEN health.health_state = 'healthy' THEN 0
+                               WHEN health.last_success_at IS NULL
+                                AND health.last_failure_at IS NULL THEN 1
+                               ELSE 2
+                           END,
+                           COALESCE(health.consecutive_failures, 0),
+                           COALESCE(quality.country, 'ZZZ'),
+                           CASE
+                               WHEN observed.definition_id IS NOT NULL
+                                 OR retry.definition_id IS NOT NULL
+                               THEN COALESCE(quality.risk_score, 1.0)
+                               ELSE 2.0
+                           END,
+                           observed.definition_id IS NULL OR EXISTS (
+                               SELECT 1 FROM proxy_exit_representatives representative
+                               WHERE representative.source_proxy_id = NEW.source_proxy_id
+                           ),
+                           NOW()
+                    FROM proxy_definitions definition
+                    LEFT JOIN proxy_health health
+                      ON health.definition_id = definition.id
+                    LEFT JOIN proxy_exit observed
+                      ON observed.definition_id = definition.id
+                    LEFT JOIN exit_quality quality
+                      ON quality.ip_address = observed.ip_address
+                    LEFT JOIN quality_retry_state retry
+                      ON retry.definition_id = definition.id
+                    WHERE definition.id = NEW.definition_id
+                    ON CONFLICT (source_proxy_id) DO UPDATE SET
+                        proxy_type = EXCLUDED.proxy_type,
+                        server = EXCLUDED.server,
+                        status_rank = EXCLUDED.status_rank,
+                        error_count = EXCLUDED.error_count,
+                        country = EXCLUDED.country,
+                        risk_score = EXCLUDED.risk_score,
+                        user_visible = EXCLUDED.user_visible,
+                        updated_at = EXCLUDED.updated_at;
+                    RETURN NEW;
+                END;
+                $$;
+                DROP TRIGGER IF EXISTS trg_zenproxy_proxy_list_sort_membership
+                    ON subscription_proxies;
+                CREATE TRIGGER trg_zenproxy_proxy_list_sort_membership
+                AFTER INSERT OR UPDATE OF definition_id ON subscription_proxies
+                FOR EACH ROW EXECUTE FUNCTION zenproxy_sync_proxy_list_sort_key_membership();
+
+                CREATE OR REPLACE FUNCTION zenproxy_sync_proxy_list_sort_key_definition()
+                RETURNS TRIGGER LANGUAGE plpgsql AS $$
+                BEGIN
+                    PERFORM zenproxy_refresh_proxy_list_sort_keys_for_definition(NEW.id);
+                    RETURN NEW;
+                END;
+                $$;
+                DROP TRIGGER IF EXISTS trg_zenproxy_proxy_list_sort_definition
+                    ON proxy_definitions;
+                CREATE TRIGGER trg_zenproxy_proxy_list_sort_definition
+                AFTER UPDATE OF proxy_type, server ON proxy_definitions
+                FOR EACH ROW EXECUTE FUNCTION zenproxy_sync_proxy_list_sort_key_definition();
+
+                CREATE OR REPLACE FUNCTION zenproxy_sync_proxy_list_sort_key_health()
+                RETURNS TRIGGER LANGUAGE plpgsql AS $$
+                BEGIN
+                    PERFORM zenproxy_refresh_proxy_list_sort_keys_for_definition(NEW.definition_id);
+                    RETURN NEW;
+                END;
+                $$;
+                DROP TRIGGER IF EXISTS trg_zenproxy_proxy_list_sort_health ON proxy_health;
+                CREATE TRIGGER trg_zenproxy_proxy_list_sort_health
+                AFTER INSERT OR UPDATE OF health_state, consecutive_failures,
+                    last_success_at, last_failure_at ON proxy_health
+                FOR EACH ROW EXECUTE FUNCTION zenproxy_sync_proxy_list_sort_key_health();
+
+                CREATE OR REPLACE FUNCTION zenproxy_sync_proxy_list_sort_key_exit()
+                RETURNS TRIGGER LANGUAGE plpgsql AS $$
+                DECLARE target_definition_id TEXT;
+                BEGIN
+                    IF TG_OP = 'DELETE' THEN
+                        target_definition_id := OLD.definition_id;
+                    ELSE
+                        target_definition_id := NEW.definition_id;
+                    END IF;
+                    PERFORM zenproxy_refresh_proxy_list_sort_keys_for_definition(
+                        target_definition_id
+                    );
+                    IF TG_OP = 'DELETE' THEN RETURN OLD; END IF;
+                    RETURN NEW;
+                END;
+                $$;
+                DROP TRIGGER IF EXISTS trg_zenproxy_proxy_list_sort_exit ON proxy_exit;
+                CREATE TRIGGER trg_zenproxy_proxy_list_sort_exit
+                AFTER INSERT OR UPDATE OF ip_address OR DELETE ON proxy_exit
+                FOR EACH ROW EXECUTE FUNCTION zenproxy_sync_proxy_list_sort_key_exit();
+                DROP TRIGGER IF EXISTS trg_zenproxy_proxy_list_sort_retry
+                    ON quality_retry_state;
+                CREATE TRIGGER trg_zenproxy_proxy_list_sort_retry
+                AFTER INSERT OR UPDATE OR DELETE ON quality_retry_state
+                FOR EACH ROW EXECUTE FUNCTION zenproxy_sync_proxy_list_sort_key_exit();
+
+                CREATE OR REPLACE FUNCTION zenproxy_sync_proxy_list_sort_key_quality()
+                RETURNS TRIGGER LANGUAGE plpgsql AS $$
+                DECLARE affected_ip INET;
+                BEGIN
+                    IF TG_OP = 'DELETE' THEN
+                        affected_ip := OLD.ip_address;
+                    ELSE
+                        affected_ip := NEW.ip_address;
+                    END IF;
+                    UPDATE proxy_list_sort_keys sort_key
+                    SET country = COALESCE(quality.country, 'ZZZ'),
+                        risk_score = COALESCE(quality.risk_score, 1.0),
+                        updated_at = NOW()
+                    FROM subscription_proxies membership
+                    JOIN proxy_exit observed
+                      ON observed.definition_id = membership.definition_id
+                    LEFT JOIN exit_quality quality
+                      ON quality.ip_address = observed.ip_address
+                    WHERE observed.ip_address = affected_ip
+                      AND sort_key.source_proxy_id = membership.source_proxy_id;
+                    IF TG_OP = 'DELETE' THEN RETURN OLD; END IF;
+                    RETURN NEW;
+                END;
+                $$;
+                DROP TRIGGER IF EXISTS trg_zenproxy_proxy_list_sort_quality ON exit_quality;
+                CREATE TRIGGER trg_zenproxy_proxy_list_sort_quality
+                AFTER INSERT OR UPDATE OF country, risk_score OR DELETE ON exit_quality
+                FOR EACH ROW EXECUTE FUNCTION zenproxy_sync_proxy_list_sort_key_quality();
+
+                -- Backfill exactly once. Normal writes are maintained by the
+                -- triggers above, including writes concurrent with a future
+                -- rolling deployment.
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 FROM app_settings
+                        WHERE key = 'proxy_list_sort_keys_backfill_v1'
+                    ) THEN
+                        INSERT INTO proxy_list_sort_keys (
+                            source_proxy_id, proxy_type, server, status_rank,
+                            error_count, country, risk_score, user_visible, updated_at
+                        )
+                        SELECT membership.source_proxy_id, definition.proxy_type,
+                               definition.server,
+                               CASE
+                                   WHEN health.health_state = 'healthy' THEN 0
+                                   WHEN health.last_success_at IS NULL
+                                    AND health.last_failure_at IS NULL THEN 1
+                                   ELSE 2
+                               END,
+                               COALESCE(health.consecutive_failures, 0),
+                               COALESCE(quality.country, 'ZZZ'),
+                               CASE
+                                   WHEN observed.definition_id IS NOT NULL
+                                     OR retry.definition_id IS NOT NULL
+                                   THEN COALESCE(quality.risk_score, 1.0)
+                                   ELSE 2.0
+                               END,
+                               TRUE,
+                               NOW()
+                        FROM subscription_proxies membership
+                        JOIN proxy_definitions definition
+                          ON definition.id = membership.definition_id
+                        LEFT JOIN proxy_health health
+                          ON health.definition_id = membership.definition_id
+                        LEFT JOIN proxy_exit observed
+                          ON observed.definition_id = membership.definition_id
+                        LEFT JOIN exit_quality quality
+                          ON quality.ip_address = observed.ip_address
+                        LEFT JOIN quality_retry_state retry
+                          ON retry.definition_id = membership.definition_id
+                        WHERE TRUE
+                        ON CONFLICT (source_proxy_id) DO NOTHING;
+                        INSERT INTO app_settings (key, value, updated_at)
+                        VALUES (
+                            'proxy_list_sort_keys_backfill_v1', 'complete',
+                            TO_CHAR(NOW() AT TIME ZONE 'UTC',
+                                    'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')
+                        ) ON CONFLICT (key) DO NOTHING;
+                    END IF;
+                END;
+                $$;
+
+                CREATE INDEX IF NOT EXISTS idx_proxy_list_sort_type
+                    ON proxy_list_sort_keys(proxy_type, source_proxy_id);
+                CREATE INDEX IF NOT EXISTS idx_proxy_list_sort_server
+                    ON proxy_list_sort_keys(server, source_proxy_id);
+                CREATE INDEX IF NOT EXISTS idx_proxy_list_sort_status
+                    ON proxy_list_sort_keys(status_rank, source_proxy_id);
+                CREATE INDEX IF NOT EXISTS idx_proxy_list_sort_errors
+                    ON proxy_list_sort_keys(error_count, source_proxy_id);
+                CREATE INDEX IF NOT EXISTS idx_proxy_list_sort_country
+                    ON proxy_list_sort_keys(country, source_proxy_id);
+                CREATE INDEX IF NOT EXISTS idx_proxy_list_sort_risk
+                    ON proxy_list_sort_keys(risk_score, source_proxy_id);
+                -- Stable representative for each measured exit. User-facing
+                -- pagination materializes its selection into user_visible
+                -- instead of ranking or joining the inventory on each request.
+                CREATE TABLE IF NOT EXISTS proxy_exit_representatives (
+                    ip_address INET PRIMARY KEY,
+                    source_proxy_id TEXT NOT NULL
+                        REFERENCES subscription_proxies(source_proxy_id) ON DELETE CASCADE,
+                    definition_id TEXT NOT NULL
+                        REFERENCES proxy_definitions(id) ON DELETE CASCADE,
+                    refreshed_at TIMESTAMPTZ NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_proxy_exit_representative_source
+                    ON proxy_exit_representatives(source_proxy_id);
+
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 FROM app_settings
+                        WHERE key = 'proxy_exit_representatives_backfill_v1'
+                    ) THEN
+                        INSERT INTO proxy_exit_representatives (
+                            ip_address, source_proxy_id, definition_id, refreshed_at
+                        )
+                        SELECT DISTINCT ON (observed.ip_address)
+                               observed.ip_address, membership.source_proxy_id,
+                               membership.definition_id, NOW()
+                        FROM subscription_proxies membership
+                        JOIN proxy_definitions definition
+                          ON definition.id = membership.definition_id
+                        JOIN proxy_health health
+                          ON health.definition_id = membership.definition_id
+                        LEFT JOIN proxy_runtime runtime
+                          ON runtime.definition_id = membership.definition_id
+                        JOIN proxy_exit observed
+                          ON observed.definition_id = membership.definition_id
+                        WHERE membership.orphaned_at IS NULL
+                        ORDER BY observed.ip_address,
+                                 (health.health_state = 'healthy') DESC,
+                                 health.consecutive_failures ASC,
+                                 CASE
+                                     WHEN health.last_success_at IS NULL
+                                         THEN health.last_failure_at
+                                     WHEN health.last_failure_at IS NULL
+                                         THEN health.last_success_at
+                                     ELSE GREATEST(
+                                         health.last_success_at,
+                                         health.last_failure_at
+                                     )
+                                 END DESC NULLS LAST,
+                                 GREATEST(
+                                     membership.updated_at,
+                                     definition.updated_at,
+                                     health.updated_at,
+                                     COALESCE(runtime.updated_at, membership.updated_at)
+                                 ) DESC,
+                                 membership.source_proxy_id ASC
+                        ON CONFLICT (ip_address) DO NOTHING;
+                        INSERT INTO app_settings (key, value, updated_at)
+                        VALUES (
+                            'proxy_exit_representatives_backfill_v1', 'complete',
+                            TO_CHAR(NOW() AT TIME ZONE 'UTC',
+                                    'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')
+                        ) ON CONFLICT (key) DO NOTHING;
+                    END IF;
+                END;
+                $$;
+
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 FROM app_settings
+                        WHERE key = 'proxy_user_visibility_backfill_v1'
+                    ) THEN
+                        UPDATE proxy_list_sort_keys sort_key
+                        SET user_visible = observed.definition_id IS NULL
+                                           OR representative.source_proxy_id IS NOT NULL,
+                            updated_at = NOW()
+                        FROM subscription_proxies membership
+                        LEFT JOIN proxy_exit observed
+                          ON observed.definition_id = membership.definition_id
+                        LEFT JOIN proxy_exit_representatives representative
+                          ON representative.source_proxy_id = membership.source_proxy_id
+                        WHERE sort_key.source_proxy_id = membership.source_proxy_id;
+                        INSERT INTO app_settings (key, value, updated_at)
+                        VALUES (
+                            'proxy_user_visibility_backfill_v1', 'complete',
+                            TO_CHAR(NOW() AT TIME ZONE 'UTC',
+                                    'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')
+                        ) ON CONFLICT (key) DO NOTHING;
+                    END IF;
+                END;
+                $$;
+
+                CREATE INDEX IF NOT EXISTS idx_proxy_list_user_visible
+                    ON proxy_list_sort_keys(source_proxy_id)
+                    WHERE user_visible = TRUE;
+
                 CREATE TABLE IF NOT EXISTS users (
                     id TEXT PRIMARY KEY,
                     username TEXT NOT NULL UNIQUE,
@@ -1810,6 +2174,184 @@ impl Database {
                 ],
             )?;
             Ok(())
+        })
+    }
+
+    pub fn get_dashboard_stats_snapshot(
+        &self,
+    ) -> Result<Option<serde_json::Value>, postgres::Error> {
+        self.with_conn(|conn| {
+            let value: Option<String> = conn
+                .query_opt(
+                    "SELECT value FROM app_settings WHERE key = $1",
+                    &[&SETTING_DASHBOARD_STATS_SNAPSHOT],
+                )?
+                .map(|row| row.get(0));
+            Ok(value.and_then(|raw| serde_json::from_str(&raw).ok()))
+        })
+    }
+
+    pub fn save_dashboard_stats_snapshot(
+        &self,
+        value: &serde_json::Value,
+    ) -> Result<(), postgres::Error> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let value = value.to_string();
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO app_settings (key, value, updated_at)
+                 VALUES ($1, $2, $3)
+                 ON CONFLICT (key) DO UPDATE SET
+                    value = EXCLUDED.value,
+                    updated_at = EXCLUDED.updated_at",
+                &[&SETTING_DASHBOARD_STATS_SNAPSHOT, &value, &now],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn get_maintenance_last_completed_at(
+        &self,
+        key: &str,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, postgres::Error> {
+        self.with_conn(|conn| {
+            let value: Option<String> = conn
+                .query_opt("SELECT value FROM app_settings WHERE key = $1", &[&key])?
+                .map(|row| row.get(0));
+            Ok(value.as_deref().and_then(parse_rfc3339_utc))
+        })
+    }
+
+    pub fn set_maintenance_completed_at(&self, key: &str) -> Result<(), postgres::Error> {
+        let now = chrono::Utc::now().to_rfc3339();
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO app_settings (key, value, updated_at)
+                 VALUES ($1, $2, $2)
+                 ON CONFLICT (key) DO UPDATE SET
+                    value = EXCLUDED.value,
+                    updated_at = EXCLUDED.updated_at",
+                &[&key, &now],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Atomically rebuild the small exit-IP representative snapshot used by
+    /// user pagination. Readers see either the previous complete snapshot or
+    /// the new complete snapshot, never a partially ranked inventory.
+    pub fn refresh_proxy_exit_representatives(&self) -> Result<usize, postgres::Error> {
+        self.with_conn(|conn| {
+            let mut tx = conn.transaction()?;
+            tx.batch_execute(
+                "SET LOCAL statement_timeout = '45s';
+                 CREATE TEMP TABLE proxy_exit_representatives_next
+                 ON COMMIT DROP AS
+                 SELECT DISTINCT ON (observed.ip_address)
+                        observed.ip_address, membership.source_proxy_id,
+                        membership.definition_id
+                 FROM subscription_proxies membership
+                 JOIN proxy_definitions definition
+                   ON definition.id = membership.definition_id
+                 JOIN proxy_health health
+                   ON health.definition_id = membership.definition_id
+                 LEFT JOIN proxy_runtime runtime
+                   ON runtime.definition_id = membership.definition_id
+                 JOIN proxy_exit observed
+                   ON observed.definition_id = membership.definition_id
+                 WHERE membership.orphaned_at IS NULL
+                 ORDER BY observed.ip_address,
+                          (health.health_state = 'healthy') DESC,
+                          health.consecutive_failures ASC,
+                          CASE
+                              WHEN health.last_success_at IS NULL
+                                  THEN health.last_failure_at
+                              WHEN health.last_failure_at IS NULL
+                                  THEN health.last_success_at
+                              ELSE GREATEST(
+                                  health.last_success_at,
+                                  health.last_failure_at
+                              )
+                          END DESC NULLS LAST,
+                          GREATEST(
+                              membership.updated_at,
+                              definition.updated_at,
+                              health.updated_at,
+                              COALESCE(runtime.updated_at, membership.updated_at)
+                          ) DESC,
+                          membership.source_proxy_id ASC;
+                 CREATE UNIQUE INDEX ON proxy_exit_representatives_next(ip_address);
+
+                 -- Only sources whose representative assignment changed need
+                 -- their user-facing visibility recomputed. The one-time
+                 -- migration backfill establishes the baseline for every row.
+                 CREATE TEMP TABLE proxy_exit_representative_sources_changed
+                 ON COMMIT DROP AS
+                 SELECT source_proxy_id
+                 FROM (
+                     SELECT representative.source_proxy_id
+                     FROM proxy_exit_representatives representative
+                     FULL JOIN proxy_exit_representatives_next next
+                       ON next.ip_address = representative.ip_address
+                     WHERE representative.source_proxy_id IS DISTINCT FROM next.source_proxy_id
+                       AND representative.source_proxy_id IS NOT NULL
+                     UNION
+                     SELECT next.source_proxy_id
+                     FROM proxy_exit_representatives representative
+                     FULL JOIN proxy_exit_representatives_next next
+                       ON next.ip_address = representative.ip_address
+                     WHERE representative.source_proxy_id IS DISTINCT FROM next.source_proxy_id
+                       AND next.source_proxy_id IS NOT NULL
+                 ) changed;
+                 CREATE UNIQUE INDEX
+                     ON proxy_exit_representative_sources_changed(source_proxy_id);",
+            )?;
+            tx.execute(
+                "INSERT INTO proxy_exit_representatives (
+                    ip_address, source_proxy_id, definition_id, refreshed_at
+                 )
+                 SELECT ip_address, source_proxy_id, definition_id, NOW()
+                 FROM proxy_exit_representatives_next
+                 ON CONFLICT (ip_address) DO UPDATE SET
+                    source_proxy_id = EXCLUDED.source_proxy_id,
+                    definition_id = EXCLUDED.definition_id,
+                    refreshed_at = EXCLUDED.refreshed_at",
+                &[],
+            )?;
+            tx.execute(
+                "DELETE FROM proxy_exit_representatives representative
+                 WHERE NOT EXISTS (
+                    SELECT 1 FROM proxy_exit_representatives_next next
+                    WHERE next.ip_address = representative.ip_address
+                 )",
+                &[],
+            )?;
+            tx.execute(
+                "UPDATE proxy_list_sort_keys sort_key
+                 SET user_visible = observed.definition_id IS NULL
+                                    OR representative.source_proxy_id IS NOT NULL,
+                     updated_at = NOW()
+                 FROM subscription_proxies membership
+                 LEFT JOIN proxy_exit observed
+                   ON observed.definition_id = membership.definition_id
+                 LEFT JOIN proxy_exit_representatives representative
+                   ON representative.source_proxy_id = membership.source_proxy_id
+                 WHERE sort_key.source_proxy_id = membership.source_proxy_id
+                   AND sort_key.source_proxy_id IN (
+                       SELECT source_proxy_id
+                       FROM proxy_exit_representative_sources_changed
+                   )
+                   AND sort_key.user_visible IS DISTINCT FROM (
+                       observed.definition_id IS NULL
+                       OR representative.source_proxy_id IS NOT NULL
+                   )",
+                &[],
+            )?;
+            let count: i64 = tx
+                .query_one("SELECT COUNT(*) FROM proxy_exit_representatives_next", &[])?
+                .get(0);
+            tx.commit()?;
+            Ok(count as usize)
         })
     }
 
@@ -2650,7 +3192,7 @@ impl Database {
                 "SELECT COUNT(*)
                  {}
                  {where_clause}",
-                proxy_list_from_clause()
+                proxy_list_from_clause(query.unique_exit_ip)
             );
             let count: i64 = tx.query_one(&sql, &param_refs)?.get(0);
             tx.commit()?;
@@ -2684,6 +3226,9 @@ impl Database {
             "ASC"
         };
         let sort_key = proxy_list_sort_key(query.sort.as_deref());
+        let include_sort_keys = query.unique_exit_ip
+            || !matches!(proxy_list_sort_key(query.sort.as_deref()), "name");
+        let from_clause = proxy_list_from_clause(include_sort_keys);
         let cursor = query
             .cursor
             .as_deref()
@@ -2793,7 +3338,7 @@ impl Database {
                  ORDER BY {sort_expr} {query_dir}, membership.source_proxy_id {id_dir}
                  LIMIT ${limit_idx} OFFSET ${offset_idx}",
                 proxy_list_last_validated_expr(),
-                proxy_list_from_clause()
+                from_clause
             );
             let rows = tx.query(&sql, &param_refs)?;
             tx.commit()?;
@@ -3797,11 +4342,19 @@ impl Database {
 
     pub fn get_stats(&self) -> Result<serde_json::Value, postgres::Error> {
         self.with_conn(|conn| {
+            let mut tx = conn.transaction()?;
+            // The production PostgreSQL container intentionally has a small
+            // /dev/shm. Parallel aggregates can exhaust it even though the
+            // serial plan completes quickly and uses bounded memory.
+            tx.batch_execute(
+                "SET LOCAL max_parallel_workers_per_gather = 0;
+                 SET LOCAL statement_timeout = '30s';",
+            )?;
             // Query the normalized base tables directly. The compatibility
             // views materialize timestamps and join quality per source row;
             // doing that repeatedly for dashboard counters is prohibitively
             // expensive once the inventory reaches millions of memberships.
-            let proxy_counts = conn.query_one(
+            let proxy_counts = tx.query_one(
                 "SELECT
                     COUNT(*) AS total,
                     COUNT(DISTINCT observed.ip_address) FILTER (
@@ -3823,10 +4376,10 @@ impl Database {
             let valid: i64 = proxy_counts.get("valid");
             let untested: i64 = proxy_counts.get("untested");
             let invalid: i64 = proxy_counts.get("invalid");
-            let subs: i64 = conn
+            let subs: i64 = tx
                 .query_one("SELECT COUNT(*) FROM subscriptions", &[])?
                 .get(0);
-            let quality_counts = conn.query_one(
+            let quality_counts = tx.query_one(
                 "WITH active_healthy_exits AS (
                     SELECT DISTINCT observed.ip_address
                     FROM proxy_exit observed
@@ -3860,7 +4413,7 @@ impl Database {
             let google_accessible: i64 = quality_counts.get("google_accessible");
             let residential: i64 = quality_counts.get("residential");
 
-            let by_type_rows = conn.query(
+            let by_type_rows = tx.query(
                 "SELECT definition.proxy_type, COUNT(*)
                  FROM subscription_proxies membership
                  JOIN proxy_definitions definition
@@ -3869,7 +4422,7 @@ impl Database {
                  GROUP BY definition.proxy_type",
                 &[],
             )?;
-            let by_country_rows = conn.query(
+            let by_country_rows = tx.query(
                 "WITH active_healthy_exits AS (
                     SELECT DISTINCT observed.ip_address
                     FROM proxy_exit observed
@@ -3900,7 +4453,7 @@ impl Database {
                 .iter()
                 .map(|row| (row.get::<_, String>(0), row.get::<_, i64>(1)))
                 .collect::<std::collections::HashMap<_, _>>();
-            let integrity = conn.query_one(
+            let integrity = tx.query_one(
                 "SELECT
                     (SELECT COUNT(*)
                      FROM proxy_definitions definition
@@ -3930,7 +4483,7 @@ impl Database {
             let unreferenced_definitions: i64 = integrity.get("unreferenced_definitions");
             let retry_with_exit: i64 = integrity.get("retry_with_exit");
 
-            Ok(serde_json::json!({
+            let value = serde_json::json!({
                 "total_proxies": total,
                 "valid_proxies": valid,
                 "untested_proxies": untested,
@@ -3948,7 +4501,9 @@ impl Database {
                     "unreferenced_definitions": unreferenced_definitions,
                     "retry_with_exit": retry_with_exit,
                 },
-            }))
+            });
+            tx.commit()?;
+            Ok(value)
         })
     }
 
@@ -4938,8 +5493,8 @@ fn proxy_list_item_from_row(row: &Row) -> ProxyListItem {
     }
 }
 
-fn proxy_list_from_clause() -> &'static str {
-    "FROM subscription_proxies membership
+fn proxy_list_from_clause(include_sort_keys: bool) -> String {
+    let mut clause = "FROM subscription_proxies membership
      JOIN proxy_definitions definition
        ON definition.id = membership.definition_id
      JOIN proxy_health health
@@ -4952,6 +5507,14 @@ fn proxy_list_from_clause() -> &'static str {
        ON quality.ip_address = observed.ip_address
      LEFT JOIN quality_retry_state retry
        ON retry.definition_id = membership.definition_id"
+        .to_string();
+    if include_sort_keys {
+        clause.push_str(
+            " JOIN proxy_list_sort_keys sort_key
+                ON sort_key.source_proxy_id = membership.source_proxy_id",
+        );
+    }
+    clause
 }
 
 fn proxy_list_last_validated_expr() -> &'static str {
@@ -4986,55 +5549,7 @@ fn build_proxy_list_where(
     let mut conditions = vec!["membership.orphaned_at IS NULL".to_string()];
 
     if query.unique_exit_ip {
-        conditions.push(
-            "(
-                observed.ip_address IS NULL
-                OR membership.source_proxy_id IN (
-                    SELECT ranked.source_proxy_id
-                    FROM (
-                        SELECT candidate.source_proxy_id,
-                               ROW_NUMBER() OVER (
-                                   PARTITION BY candidate_exit.ip_address
-                                   ORDER BY
-                                       (candidate_health.health_state = 'healthy') DESC,
-                                       candidate_health.consecutive_failures ASC,
-                                       CASE
-                                           WHEN candidate_health.last_success_at IS NULL
-                                               THEN candidate_health.last_failure_at
-                                           WHEN candidate_health.last_failure_at IS NULL
-                                               THEN candidate_health.last_success_at
-                                           ELSE GREATEST(
-                                               candidate_health.last_success_at,
-                                               candidate_health.last_failure_at
-                                           )
-                                       END DESC NULLS LAST,
-                                       GREATEST(
-                                           candidate.updated_at,
-                                           candidate_definition.updated_at,
-                                           candidate_health.updated_at,
-                                           COALESCE(
-                                               candidate_runtime.updated_at,
-                                               candidate.updated_at
-                                           )
-                                       ) DESC,
-                                       candidate.source_proxy_id ASC
-                               ) AS exit_rank
-                        FROM subscription_proxies candidate
-                        JOIN proxy_definitions candidate_definition
-                          ON candidate_definition.id = candidate.definition_id
-                        JOIN proxy_health candidate_health
-                          ON candidate_health.definition_id = candidate.definition_id
-                        LEFT JOIN proxy_runtime candidate_runtime
-                          ON candidate_runtime.definition_id = candidate.definition_id
-                        JOIN proxy_exit candidate_exit
-                          ON candidate_exit.definition_id = candidate.definition_id
-                        WHERE candidate.orphaned_at IS NULL
-                    ) ranked
-                    WHERE ranked.exit_rank = 1
-                )
-            )"
-            .to_string(),
-        );
+        conditions.push("sort_key.user_visible = TRUE".to_string());
     }
 
     if let Some(search) = query
@@ -5120,25 +5635,12 @@ fn parse_rfc3339_utc(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
 
 fn proxy_list_sort_expr(sort: Option<&str>) -> &'static str {
     match sort {
-        Some("type") => "definition.proxy_type",
-        Some("server") => "definition.server",
-        Some("status") | Some("is_valid") => {
-            "CASE
-                WHEN health.health_state = 'healthy' THEN 0
-                WHEN health.last_success_at IS NULL
-                 AND health.last_failure_at IS NULL THEN 1
-                ELSE 2
-             END"
-        }
-        Some("error_count") => "COALESCE(health.consecutive_failures, 0)",
-        Some("country") => "COALESCE(quality.country, 'ZZZ')",
-        Some("risk") => {
-            "CASE WHEN observed.ip_address IS NOT NULL
-                        OR retry.definition_id IS NOT NULL
-                  THEN COALESCE(quality.risk_score, 1.0)
-                  ELSE 2.0
-             END"
-        }
+        Some("type") => "sort_key.proxy_type",
+        Some("server") => "sort_key.server",
+        Some("status") | Some("is_valid") => "sort_key.status_rank",
+        Some("error_count") => "sort_key.error_count",
+        Some("country") => "sort_key.country",
+        Some("risk") => "sort_key.risk_score",
         _ => "membership.display_name",
     }
 }
@@ -5176,7 +5678,13 @@ fn build_proxy_cursor_clause(
     params: &mut Vec<Box<dyn ToSql + Sync>>,
 ) -> String {
     match sort_key {
-        "status" | "error_count" => {
+        "status" => {
+            let Ok(value) = cursor.value.parse::<i16>() else {
+                return String::new();
+            };
+            params.push(Box::new(value));
+        }
+        "error_count" => {
             let Ok(value) = cursor.value.parse::<i32>() else {
                 return String::new();
             };
@@ -5206,7 +5714,8 @@ fn build_proxy_cursor_clause(
 
 fn proxy_cursor_value_is_valid(cursor: &ProxyListCursor, sort_key: &str) -> bool {
     match sort_key {
-        "status" | "error_count" => cursor.value.parse::<i32>().is_ok(),
+        "status" => cursor.value.parse::<i16>().is_ok(),
+        "error_count" => cursor.value.parse::<i32>().is_ok(),
         "risk" => cursor
             .value
             .parse::<f64>()
@@ -5254,7 +5763,7 @@ mod tests {
     }
 
     #[test]
-    fn unique_exit_filter_uses_one_window_ranking_pass() {
+    fn unique_exit_filter_uses_visibility_snapshot() {
         let query = ProxyListQuery {
             unique_exit_ip: true,
             ..Default::default()
@@ -5263,11 +5772,27 @@ mod tests {
 
         let clause = build_proxy_list_where(&query, &mut params);
 
-        assert!(clause.contains("ROW_NUMBER() OVER"));
-        assert!(clause.contains("PARTITION BY candidate_exit.ip_address"));
-        assert!(!clause.contains("normalized_proxies"));
-        assert!(!clause.contains("NOT EXISTS"));
+        assert!(clause.contains("sort_key.user_visible = TRUE"));
+        assert!(!clause.contains("representative.source_proxy_id"));
+        assert!(!clause.contains("ROW_NUMBER() OVER"));
         assert!(params.is_empty());
+    }
+
+    #[test]
+    fn non_name_sorts_use_compact_read_model() {
+        for (sort, column) in [
+            ("type", "sort_key.proxy_type"),
+            ("server", "sort_key.server"),
+            ("status", "sort_key.status_rank"),
+            ("error_count", "sort_key.error_count"),
+            ("country", "sort_key.country"),
+            ("risk", "sort_key.risk_score"),
+        ] {
+            assert_eq!(super::proxy_list_sort_expr(Some(sort)), column);
+        }
+        let clause = super::proxy_list_from_clause(true);
+        assert!(!clause.contains("proxy_exit_representatives representative"));
+        assert!(clause.contains("proxy_list_sort_keys sort_key"));
     }
 
     #[test]
@@ -6095,6 +6620,7 @@ mod tests {
         assert_ne!(refresh_definition_state.0, old_refresh_definition);
         assert_eq!(refresh_definition_state.1, 0);
 
+        assert!(db.refresh_proxy_exit_representatives().unwrap() >= 1);
         let unique_page = db
             .list_proxy_page(&ProxyListQuery {
                 page: 1,
@@ -6106,6 +6632,27 @@ mod tests {
             .unwrap();
         assert_eq!(unique_page.filtered, 1);
         assert_eq!(unique_page.proxies.len(), 1);
+        let status_page = db
+            .list_proxy_page(&ProxyListQuery {
+                page: 1,
+                page_size: 1,
+                sort: Some("status".into()),
+                ..ProxyListQuery::default()
+            })
+            .unwrap();
+        let status_cursor_page = db
+            .list_proxy_page_cancellable(
+                &ProxyListQuery {
+                    page: 1,
+                    page_size: 1,
+                    cursor: status_page.next_cursor,
+                    sort: Some("status".into()),
+                    ..ProxyListQuery::default()
+                },
+                None,
+            )
+            .unwrap();
+        assert_eq!(status_cursor_page.proxies.len(), 1);
         db.mark_proxy_relay_failed(&third_id, "integration relay failure", 1)
             .unwrap();
         let relay_failure_state: (String, Option<String>) = db
@@ -6125,6 +6672,17 @@ mod tests {
             relay_failure_state,
             ("unhealthy".into(), Some("relay_failure".into()))
         );
+        let relay_sort_key: (i16, i32) = db
+            .with_conn(|conn| {
+                let row = conn.query_one(
+                    "SELECT status_rank, error_count
+                     FROM proxy_list_sort_keys WHERE source_proxy_id = $1",
+                    &[&third_id],
+                )?;
+                Ok((row.get(0), row.get(1)))
+            })
+            .unwrap();
+        assert_eq!(relay_sort_key, (2, 1));
 
         let (_, overlaps) = db.get_subscription_duplicate_overview().unwrap();
         assert!(overlaps.iter().any(|edge| {

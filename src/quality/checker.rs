@@ -158,6 +158,12 @@ async fn run_quality_check(
             state
                 .quality_progress
                 .finish("没有待质检或已过期的有效代理");
+            if let Err(error) = state
+                .db
+                .set_maintenance_completed_at(crate::db::SETTING_QUALITY_LAST_COMPLETED_AT)
+            {
+                tracing::warn!("Failed to persist quality completion timestamp: {error}");
+            }
             return Ok(0);
         }
 
@@ -235,6 +241,12 @@ async fn run_quality_check(
         "质检完成：检查 {total_checked} 条线路，成功 {}，失败 {}（解锁检测已包含）",
         progress.succeeded, progress.failed
     ));
+    if let Err(error) = state
+        .db
+        .set_maintenance_completed_at(crate::db::SETTING_QUALITY_LAST_COMPLETED_AT)
+    {
+        tracing::warn!("Failed to persist quality completion timestamp: {error}");
+    }
 
     Ok(total_checked)
 }

@@ -26,7 +26,7 @@ use dashmap::DashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::Arc;
 use sysinfo::{Pid, System};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 
 pub struct AppState {
     pub config: AppConfig,
@@ -47,16 +47,20 @@ pub struct AppState {
     /// Immediate circuit-breaker overlay for definitions that failed after
     /// the latest immutable snapshot was built.
     pub selection_unavailable_definitions: DashMap<String, std::time::Instant>,
-    /// Short-lived aggregate dashboard cache; avoids repeated full-table scans.
+    /// Last-good dashboard snapshot. Requests never perform the aggregate.
     pub dashboard_stats_cache: DashMap<(), DashboardStatsCacheEntry>,
-    /// Coalesces concurrent dashboard cache misses into one database query.
-    pub dashboard_stats_cache_fill: Mutex<()>,
+    pub stats_refresh_pending: AtomicBool,
+    pub stats_refresh_notify: Notify,
     /// Short-lived exact counts for filtered proxy-list views.
     pub proxy_list_count_cache: DashMap<String, ProxyListCountCacheEntry>,
     pub proxy_list_count_cache_fill: Mutex<()>,
     /// Lazy duplicate/overlap analysis for the subscription admin view.
     pub subscription_duplicate_cache: DashMap<(), SubscriptionDuplicateCacheEntry>,
     pub subscription_duplicate_cache_fill: Mutex<()>,
+    /// Per-subscription Top-20 overlap cache and keyed singleflight locks.
+    pub subscription_duplicate_details_cache:
+        DashMap<String, SubscriptionDuplicateDetailsCacheEntry>,
+    pub subscription_duplicate_details_locks: DashMap<String, Arc<Mutex<()>>>,
     pub subscription_duplicate_generation: AtomicU64,
     /// Auth cache: (api_key | session_id) → (User, expires_at_instant).
     pub auth_cache: DashMap<String, (User, tokio::time::Instant)>,
@@ -91,7 +95,6 @@ pub struct SubscriptionExportCacheEntry {
 #[derive(Debug, Clone)]
 pub struct DashboardStatsCacheEntry {
     pub value: serde_json::Value,
-    pub expires_at: tokio::time::Instant,
 }
 
 #[derive(Debug, Clone)]
@@ -103,6 +106,14 @@ pub struct ProxyListCountCacheEntry {
 #[derive(Debug, Clone)]
 pub struct SubscriptionDuplicateCacheEntry {
     pub stats: Vec<SubscriptionDuplicateStats>,
+    pub overlaps: Vec<SubscriptionOverlap>,
+    pub expires_at: tokio::time::Instant,
+    pub generation: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct SubscriptionDuplicateDetailsCacheEntry {
+    pub stats: SubscriptionDuplicateStats,
     pub overlaps: Vec<SubscriptionOverlap>,
     pub expires_at: tokio::time::Instant,
     pub generation: u64,
@@ -201,6 +212,22 @@ async fn main() {
     let selection_snapshot = selection::SelectionSnapshot::load(&db)
         .expect("Failed to build initial proxy selection snapshot");
 
+    let initial_stats = match db.get_dashboard_stats_snapshot() {
+        Ok(Some(value)) => value,
+        Ok(None) => api::fetch::empty_dashboard_stats(),
+        Err(error) => {
+            tracing::warn!("Failed to load persisted dashboard stats snapshot: {error}");
+            api::fetch::empty_dashboard_stats()
+        }
+    };
+    let dashboard_stats_cache = DashMap::new();
+    dashboard_stats_cache.insert(
+        (),
+        DashboardStatsCacheEntry {
+            value: initial_stats,
+        },
+    );
+
     let state = Arc::new(AppState {
         config: config.clone(),
         db,
@@ -211,12 +238,15 @@ async fn main() {
         subscription_export_cache: DashMap::new(),
         selection_snapshot: ArcSwap::from_pointee(selection_snapshot),
         selection_unavailable_definitions: DashMap::new(),
-        dashboard_stats_cache: DashMap::new(),
-        dashboard_stats_cache_fill: Mutex::new(()),
+        dashboard_stats_cache,
+        stats_refresh_pending: AtomicBool::new(true),
+        stats_refresh_notify: Notify::new(),
         proxy_list_count_cache: DashMap::new(),
         proxy_list_count_cache_fill: Mutex::new(()),
         subscription_duplicate_cache: DashMap::new(),
         subscription_duplicate_cache_fill: Mutex::new(()),
+        subscription_duplicate_details_cache: DashMap::new(),
+        subscription_duplicate_details_locks: DashMap::new(),
         subscription_duplicate_generation: AtomicU64::new(0),
         auth_cache: DashMap::new(),
         proxy_accounts,
@@ -271,21 +301,60 @@ async fn start_background_tasks(state: Arc<AppState>) {
     });
 
     let state_clone = state.clone();
+    // Requests always read the last-good snapshot. Expensive aggregates and
+    // exit representative ranking are coalesced here after mutations.
+    tokio::spawn(async move {
+        let mut refresh_exit_representatives = true;
+        loop {
+            state_clone
+                .stats_refresh_pending
+                .store(false, std::sync::atomic::Ordering::Release);
+            refresh_background_snapshots(&state_clone, refresh_exit_representatives).await;
+
+            refresh_exit_representatives = tokio::select! {
+                _ = state_clone.stats_refresh_notify.notified() => {
+                    // Collapse validation batches and subscription refreshes
+                    // that finish within the same short window.
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    true
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_secs(120)) => false,
+            };
+        }
+    });
+
+    let state_clone = state.clone();
     // Periodic validation
     tokio::spawn(async move {
-        tracing::info!("Running startup proxy validation...");
-        if let Err(e) = pool::validator::validate_all(state_clone.clone()).await {
-            tracing::error!("Startup validation error: {e}");
+        if state_clone.config.validation.interval_mins == 0 {
+            tracing::info!("Automatic validation is disabled (validation.interval_mins=0)");
+            return;
         }
-
         let interval =
             std::time::Duration::from_secs(state_clone.config.validation.interval_mins * 60);
+        let last_completed = state_clone
+            .db
+            .get_maintenance_last_completed_at(db::SETTING_VALIDATION_LAST_COMPLETED_AT)
+            .unwrap_or_else(|error| {
+                tracing::warn!("Failed to load validation completion timestamp: {error}");
+                None
+            });
+        let initial_delay = maintenance_initial_delay(
+            last_completed,
+            interval,
+            std::time::Duration::from_secs(120),
+        );
+        tracing::info!(
+            delay_secs = initial_delay.as_secs(),
+            "Scheduled initial automatic validation"
+        );
+        tokio::time::sleep(initial_delay).await;
         loop {
-            tokio::time::sleep(interval).await;
             tracing::info!("Running periodic proxy validation...");
             if let Err(e) = pool::validator::validate_all(state_clone.clone()).await {
                 tracing::error!("Validation error: {e}");
             }
+            tokio::time::sleep(interval).await;
         }
     });
 
@@ -296,11 +365,26 @@ async fn start_background_tasks(state: Arc<AppState>) {
             tracing::info!("Automatic quality checks are disabled (quality.interval_mins=0)");
             return;
         }
-        // Wait a bit on startup for proxies to be validated first
-        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
         let idle_interval = std::time::Duration::from_secs(
             state_clone.config.quality.interval_mins.saturating_mul(60),
         );
+        let last_completed = state_clone
+            .db
+            .get_maintenance_last_completed_at(db::SETTING_QUALITY_LAST_COMPLETED_AT)
+            .unwrap_or_else(|error| {
+                tracing::warn!("Failed to load quality completion timestamp: {error}");
+                None
+            });
+        let initial_delay = maintenance_initial_delay(
+            last_completed,
+            idle_interval,
+            std::time::Duration::from_secs(180),
+        );
+        tracing::info!(
+            delay_secs = initial_delay.as_secs(),
+            "Scheduled initial automatic quality check"
+        );
+        tokio::time::sleep(initial_delay).await;
         loop {
             if let Err(e) = quality::checker::check_all(state_clone.clone()).await {
                 tracing::error!("Quality check error: {e}");
@@ -409,6 +493,69 @@ async fn start_background_tasks(state: Arc<AppState>) {
             check_singbox_watchdog(&state_clone).await;
         }
     });
+}
+
+fn maintenance_initial_delay(
+    last_completed: Option<chrono::DateTime<chrono::Utc>>,
+    interval: std::time::Duration,
+    minimum_startup_delay: std::time::Duration,
+) -> std::time::Duration {
+    let remaining = last_completed
+        .and_then(|completed| {
+            let interval = chrono::Duration::from_std(interval).ok()?;
+            (completed + interval - chrono::Utc::now()).to_std().ok()
+        })
+        .unwrap_or_default();
+    remaining.max(minimum_startup_delay)
+}
+
+async fn refresh_background_snapshots(
+    state: &Arc<AppState>,
+    refresh_exit_representatives: bool,
+) {
+    let stats_state = state.clone();
+    match tokio::task::spawn_blocking(move || {
+        let value = stats_state.db.get_stats()?;
+        if let Err(error) = stats_state.db.save_dashboard_stats_snapshot(&value) {
+            tracing::warn!("Failed to persist dashboard stats snapshot: {error}");
+        }
+        Ok::<_, postgres::Error>(value)
+    })
+    .await
+    {
+        Ok(Ok(value)) => {
+            state
+                .dashboard_stats_cache
+                .insert((), DashboardStatsCacheEntry { value });
+        }
+        Ok(Err(error)) => {
+            tracing::warn!("Background dashboard stats refresh failed: {error}");
+        }
+        Err(error) => {
+            tracing::warn!("Background dashboard stats task failed: {error}");
+        }
+    }
+
+    if !refresh_exit_representatives {
+        return;
+    }
+    let representative_state = state.clone();
+    match tokio::task::spawn_blocking(move || {
+        representative_state.db.refresh_proxy_exit_representatives()
+    })
+    .await
+    {
+        Ok(Ok(count)) => {
+            state.proxy_list_count_cache.clear();
+            tracing::info!(count, "Refreshed exit-IP representative snapshot");
+        }
+        Ok(Err(error)) => {
+            tracing::warn!("Exit-IP representative refresh failed: {error}");
+        }
+        Err(error) => {
+            tracing::warn!("Exit-IP representative refresh task failed: {error}");
+        }
+    }
 }
 
 fn read_process_memory_mb(pid: u32) -> Option<u64> {
@@ -563,5 +710,31 @@ async fn refresh_due_subscriptions(state: &Arc<AppState>) {
                 tracing::error!("Validation after auto-refresh failed: {e}");
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod scheduling_tests {
+    use super::maintenance_initial_delay;
+    use std::time::Duration;
+
+    #[test]
+    fn first_maintenance_run_keeps_a_startup_grace_period() {
+        assert_eq!(
+            maintenance_initial_delay(None, Duration::from_secs(1_800), Duration::from_secs(120)),
+            Duration::from_secs(120)
+        );
+    }
+
+    #[test]
+    fn recent_completion_delays_until_the_interval_is_due() {
+        let completed = chrono::Utc::now() - chrono::Duration::minutes(10);
+        let delay = maintenance_initial_delay(
+            Some(completed),
+            Duration::from_secs(30 * 60),
+            Duration::from_secs(120),
+        );
+        assert!(delay >= Duration::from_secs(19 * 60 + 55));
+        assert!(delay <= Duration::from_secs(20 * 60 + 5));
     }
 }

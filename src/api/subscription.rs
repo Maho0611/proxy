@@ -194,26 +194,129 @@ pub async fn get_subscription_duplicates_for_id(
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     const OVERLAP_LIMIT: i64 = 20;
-    let query_state = state.clone();
-    let query_id = id.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        if query_state.db.get_subscription(&query_id)?.is_none() {
-            return Ok(None);
-        }
-        query_state
-            .db
-            .get_subscription_duplicate_details(&query_id, OVERLAP_LIMIT)
-            .map(Some)
-    })
-    .await
-    .map_err(|error| AppError::Internal(format!("Subscription overlap task failed: {error}")))??
-    .ok_or_else(|| AppError::NotFound("Subscription not found".into()))?;
-    let (stats, overlaps) = result;
+    const CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(300);
 
-    Ok(Json(json!({
-        "duplicate_stats": stats,
-        "overlaps": overlaps,
-    })))
+    let generation = state
+        .subscription_duplicate_generation
+        .load(std::sync::atomic::Ordering::Acquire);
+    if let Some(cached) = state.subscription_duplicate_details_cache.get(&id) {
+        if cached.generation == generation && cached.expires_at > tokio::time::Instant::now() {
+            return Ok(Json(json!({
+                "duplicate_stats": cached.stats,
+                "overlaps": cached.overlaps,
+                "cached": true,
+                "stale": false,
+            })));
+        }
+    }
+
+    let lock = state
+        .subscription_duplicate_details_locks
+        .entry(id.clone())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone();
+    let _singleflight = lock.lock().await;
+
+    loop {
+        let generation = state
+            .subscription_duplicate_generation
+            .load(std::sync::atomic::Ordering::Acquire);
+        if let Some(cached) = state.subscription_duplicate_details_cache.get(&id) {
+            if cached.generation == generation
+                && cached.expires_at > tokio::time::Instant::now()
+            {
+                return Ok(Json(json!({
+                    "duplicate_stats": cached.stats,
+                    "overlaps": cached.overlaps,
+                    "cached": true,
+                    "stale": false,
+                })));
+            }
+        }
+
+        let stale = state
+            .subscription_duplicate_details_cache
+            .get(&id)
+            .map(|entry| entry.clone());
+        let query_state = state.clone();
+        let query_id = id.clone();
+        let queried = tokio::task::spawn_blocking(move || {
+            if query_state.db.get_subscription(&query_id)?.is_none() {
+                return Ok(None);
+            }
+            query_state
+                .db
+                .get_subscription_duplicate_details(&query_id, OVERLAP_LIMIT)
+                .map(Some)
+        })
+        .await;
+
+        let queried = match queried {
+            Ok(result) => result,
+            Err(error) => {
+                if let Some(stale) = stale.clone() {
+                    tracing::warn!(
+                        "Subscription overlap task failed for {id}, serving stale cache: {error}"
+                    );
+                    return Ok(Json(json!({
+                        "duplicate_stats": stale.stats,
+                        "overlaps": stale.overlaps,
+                        "cached": true,
+                        "stale": true,
+                    })));
+                }
+                return Err(AppError::Internal(format!(
+                    "Subscription overlap task failed: {error}"
+                )));
+            }
+        };
+
+        let result = match queried {
+            Ok(result) => result,
+            Err(error) => {
+                if let Some(stale) = stale {
+                    tracing::warn!(
+                        "Subscription overlap refresh failed for {id}, serving stale cache: {error}"
+                    );
+                    return Ok(Json(json!({
+                        "duplicate_stats": stale.stats,
+                        "overlaps": stale.overlaps,
+                        "cached": true,
+                        "stale": true,
+                    })));
+                }
+                return Err(error.into());
+            }
+        }
+        .ok_or_else(|| AppError::NotFound("Subscription not found".into()))?;
+
+        // Do not publish a result computed across a concurrent inventory
+        // mutation. Retry while retaining the keyed singleflight lock.
+        if state
+            .subscription_duplicate_generation
+            .load(std::sync::atomic::Ordering::Acquire)
+            != generation
+        {
+            continue;
+        }
+        let (stats, overlaps) = result;
+        state.subscription_duplicate_details_cache.insert(
+            id.clone(),
+            crate::SubscriptionDuplicateDetailsCacheEntry {
+                stats: stats.clone(),
+                overlaps: overlaps.clone(),
+                expires_at: tokio::time::Instant::now() + CACHE_TTL,
+                generation,
+            },
+        );
+
+        return Ok(Json(json!({
+            "duplicate_stats": stats,
+            "overlaps": overlaps,
+            "cached": false,
+            "stale": false,
+        })));
+    }
 }
 
 pub async fn add_subscription(

@@ -377,66 +377,45 @@ where
 }
 
 pub async fn get_cached_stats(state: Arc<AppState>) -> Result<serde_json::Value, AppError> {
-    const CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(120);
-    let now = tokio::time::Instant::now();
     if let Some(entry) = state.dashboard_stats_cache.get(&()) {
-        if entry.expires_at > now {
-            return Ok(entry.value.clone());
-        }
+        return Ok(entry.value.clone());
     }
+    invalidate_stats_cache(state.as_ref());
+    Ok(empty_dashboard_stats())
+}
 
-    // Keep the expired value available while another request refreshes it.
-    // This prevents a burst of dashboard, user-access and proxy-list requests
-    // from launching the same aggregate query concurrently.
-    let stale_value = state
-        .dashboard_stats_cache
-        .get(&())
-        .map(|entry| entry.value.clone());
-    let _singleflight = match state.dashboard_stats_cache_fill.try_lock() {
-        Ok(guard) => guard,
-        Err(_) if stale_value.is_some() => return Ok(stale_value.unwrap()),
-        Err(_) => state.dashboard_stats_cache_fill.lock().await,
-    };
-
-    // A request waiting for the singleflight guard can use the result that the
-    // previous owner just published.
-    if let Some(entry) = state.dashboard_stats_cache.get(&()) {
-        if entry.expires_at > tokio::time::Instant::now() {
-            return Ok(entry.value.clone());
-        }
-    }
-
-    let query_state = state.clone();
-    let computed = tokio::task::spawn_blocking(move || query_state.db.get_stats())
-        .await
-        .map_err(|error| AppError::Internal(format!("Dashboard stats task failed: {error}")))?;
-    let value = match computed {
-        Ok(value) => value,
-        Err(error) => {
-            if let Some(value) = stale_value {
-                tracing::warn!("Dashboard stats refresh failed, serving stale cache: {error}");
-                return Ok(value);
-            }
-            return Err(error.into());
-        }
-    };
-    state.dashboard_stats_cache.insert(
-        (),
-        crate::DashboardStatsCacheEntry {
-            value: value.clone(),
-            expires_at: tokio::time::Instant::now() + CACHE_TTL,
+pub fn empty_dashboard_stats() -> serde_json::Value {
+    json!({
+        "total_proxies": 0,
+        "valid_proxies": 0,
+        "untested_proxies": 0,
+        "invalid_proxies": 0,
+        "subscriptions": 0,
+        "quality_checked": 0,
+        "chatgpt_accessible": 0,
+        "google_accessible": 0,
+        "residential": 0,
+        "by_type": {},
+        "by_country": {},
+        "normalization_integrity": {
+            "health_missing": 0,
+            "runtime_missing": 0,
+            "unreferenced_definitions": 0,
+            "retry_with_exit": 0,
         },
-    );
-    Ok(value)
+    })
 }
 
 pub fn invalidate_stats_cache(state: &AppState) {
-    // Retain the last good value as a stale fallback while the next request
-    // refreshes it. Clearing here would make every invalidation block all
-    // callers on a cold aggregate query.
-    if let Some(mut entry) = state.dashboard_stats_cache.get_mut(&()) {
-        entry.expires_at = tokio::time::Instant::now();
+    // Preserve the last-good values while a single background worker merges
+    // bursts of mutations into one refresh.
+    if !state
+        .stats_refresh_pending
+        .swap(true, std::sync::atomic::Ordering::AcqRel)
+    {
+        state.stats_refresh_notify.notify_one();
     }
+    state.proxy_list_count_cache.clear();
     state.subscription_duplicate_generation.fetch_add(
         1,
         std::sync::atomic::Ordering::AcqRel,

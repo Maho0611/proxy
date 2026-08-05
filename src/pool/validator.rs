@@ -74,6 +74,12 @@ async fn run_validation(state: Arc<AppState>) -> Result<(), String> {
     if total == 0 {
         tracing::info!("No proxies to validate");
         state.validation_progress.finish("没有可验活的代理");
+        if let Err(error) = state
+            .db
+            .set_maintenance_completed_at(crate::db::SETTING_VALIDATION_LAST_COMPLETED_AT)
+        {
+            tracing::warn!("Failed to persist validation completion timestamp: {error}");
+        }
         return Ok(());
     }
 
@@ -285,6 +291,12 @@ async fn run_validation(state: Arc<AppState>) -> Result<(), String> {
     state.validation_progress.finish(format!(
         "验活完成：本次检查 {total_validated} 条线路，当前 {valid}/{total} 有效"
     ));
+    if let Err(error) = state
+        .db
+        .set_maintenance_completed_at(crate::db::SETTING_VALIDATION_LAST_COMPLETED_AT)
+    {
+        tracing::warn!("Failed to persist validation completion timestamp: {error}");
+    }
 
     Ok(())
 }
