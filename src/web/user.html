@@ -273,7 +273,7 @@ tr:hover td { background:rgba(108,99,255,.03); }
         <div class="builder-grid">
           <div class="form-group"><label>国家 / 地区</label><select id="fixed-country"><option value="">选择国家</option></select></div>
           <div class="form-group"><label>上游代理类型</label><select id="fixed-type"><option value="">不限类型</option></select></div>
-          <div class="form-group"><label>申请数量</label><input type="number" id="fixed-count" min="1" max="50" value="10"></div>
+          <div class="form-group"><label>申请数量</label><input type="number" id="fixed-count" min="1" max="500" value="10"></div>
           <div class="form-group"><label>连接协议</label><select id="fixed-protocol" onchange="renderFixedExits()"><option value="http">HTTP</option><option value="socks5h">SOCKS5（远程 DNS）</option></select></div>
         </div>
         <div class="checkbox-group">
@@ -680,7 +680,7 @@ async function loadFixedExits() {
     fixedAccess = d;
     empty.style.display = 'none';
     panel.style.display = '';
-    document.getElementById('fixed-count').max = d.max_slots || 50;
+    document.getElementById('fixed-count').max = d.max_slots || 500;
     renderFixedExits();
   } catch (e) {
     panel.style.display = 'none';
@@ -715,7 +715,7 @@ function fixedReasonLabel(reason) {
 function renderFixedExits() {
   if (!fixedAccess) return;
   const slots = fixedAccess.slots || [];
-  document.getElementById('fixed-exits-count').textContent = `${slots.length} / ${fixedAccess.max_slots || 50}`;
+  document.getElementById('fixed-exits-count').textContent = `${slots.length} / ${fixedAccess.max_slots || 500}`;
   document.getElementById('fixed-exits-included').textContent = slots.filter(slot => slot.included_in_subscription).length;
   const subscriptions = fixedAccess.subscriptions || {};
   const subscriptionFields = {

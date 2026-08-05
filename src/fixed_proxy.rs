@@ -6,8 +6,8 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-pub const MAX_SLOTS_PER_ACCOUNT: usize = 50;
-const CANDIDATE_SCAN_LIMIT: usize = 500;
+pub const MAX_SLOTS_PER_ACCOUNT: usize = 500;
+const CANDIDATE_SCAN_LIMIT: usize = 1_000;
 
 pub fn valid_country(value: &str) -> bool {
     (2..=8).contains(&value.len()) && value.bytes().all(|byte| byte.is_ascii_alphanumeric())
