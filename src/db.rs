@@ -361,10 +361,16 @@ impl Database {
             }
             Ok::<(), postgres::Error>(())
         })();
-        let unlock_result = tokio::task::block_in_place(|| {
-            migration_guard.batch_execute(
+        // `postgres::Client` owns a small synchronous Tokio runtime. Dropping
+        // it from this async caller attempts to block that runtime from within
+        // the application's runtime and panics. Keep both the final query and
+        // destruction of the migration-only client inside the blocking region.
+        let unlock_result = tokio::task::block_in_place(move || {
+            let result = migration_guard.batch_execute(
                 "SELECT pg_advisory_unlock(1514491472, 1380931673)",
-            )
+            );
+            drop(migration_guard);
+            result
         });
         migration_result?;
         unlock_result?;
@@ -3057,6 +3063,19 @@ impl Database {
                     .iter()
                     .map(|(_, port)| i32::from(*port))
                     .collect();
+                // A reconciliation may reuse a listener port for a different
+                // definition. Free every incoming port first so the partial
+                // unique index cannot observe the previous owner while the
+                // assignments are being updated below. Both statements live
+                // in this transaction, so readers never see a committed
+                // half-reconciled state.
+                tx.execute(
+                    "UPDATE proxy_runtime
+                     SET local_port = NULL, binding_owner_id = NULL,
+                         updated_at = NOW()
+                     WHERE local_port = ANY($1::int[])",
+                    &[&ports],
+                )?;
                 tx.execute(
                     "WITH input AS (
                         SELECT *
@@ -5241,6 +5260,36 @@ mod tests {
         })
         .to_string();
         db.insert_proxies_batch(&[third]).unwrap();
+        db.sync_proxy_local_ports(
+            &[(third_id.clone(), 12001)],
+            std::slice::from_ref(&first_id),
+        )
+        .unwrap();
+        let reassigned_ports: (Option<i32>, Option<i32>) = db
+            .with_conn(|conn| {
+                let row = conn.query_one(
+                    "SELECT
+                        MAX(runtime.local_port) FILTER (
+                            WHERE membership.source_proxy_id = $1
+                        ),
+                        MAX(runtime.local_port) FILTER (
+                            WHERE membership.source_proxy_id = $2
+                        )
+                     FROM subscription_proxies membership
+                     JOIN proxy_runtime runtime
+                       ON runtime.definition_id = membership.definition_id
+                     WHERE membership.source_proxy_id IN ($1, $2)",
+                    &[&first_id, &third_id],
+                )?;
+                Ok((row.get(0), row.get(1)))
+            })
+            .unwrap();
+        assert_eq!(reassigned_ports, (None, Some(12001)));
+        db.sync_proxy_local_ports(
+            &[(first_id.clone(), 12001)],
+            std::slice::from_ref(&third_id),
+        )
+        .unwrap();
         let third_validation = db
             .apply_validation_outcomes(
                 &[ProxyValidationOutcome {
