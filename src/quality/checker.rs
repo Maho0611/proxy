@@ -1,7 +1,8 @@
 use crate::db::ProxyQuality;
 use crate::pool::manager::{PoolProxy, ProxyQualityInfo};
 use crate::AppState;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::future::Future;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{Mutex, Semaphore};
 use tokio::task::JoinSet;
@@ -11,10 +12,18 @@ use tokio::time::Instant;
 pub(crate) const MAX_INCOMPLETE_RETRIES: u8 = 2;
 pub(crate) const QUALITY_SCHEMA_VERSION: u8 = 2;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QualityProfile {
+    Basic,
+    Full,
+}
+
 /// ip-api.com rate limiter: max 40 requests/minute (free tier limit is 45).
 struct RateLimiter {
-    last_call: Mutex<Instant>,
+    next_slot: Mutex<Instant>,
     min_interval: std::time::Duration,
+    wait_calls: AtomicU64,
+    wait_total_micros: AtomicU64,
 }
 
 struct RunningGuard<'a> {
@@ -36,18 +45,36 @@ fn acquire_running_guard(flag: &AtomicBool) -> Option<RunningGuard<'_>> {
 impl RateLimiter {
     fn new(calls_per_minute: u32) -> Self {
         RateLimiter {
-            last_call: Mutex::new(Instant::now() - std::time::Duration::from_secs(60)),
+            next_slot: Mutex::new(Instant::now()),
             min_interval: std::time::Duration::from_millis(60_000 / calls_per_minute as u64),
+            wait_calls: AtomicU64::new(0),
+            wait_total_micros: AtomicU64::new(0),
         }
     }
 
     async fn wait(&self) {
-        let mut last = self.last_call.lock().await;
-        let elapsed = last.elapsed();
-        if elapsed < self.min_interval {
-            tokio::time::sleep(self.min_interval - elapsed).await;
-        }
-        *last = Instant::now();
+        let sleep_until = {
+            let mut next_slot = self.next_slot.lock().await;
+            let now = Instant::now();
+            let reserved = (*next_slot).max(now);
+            *next_slot = reserved + self.min_interval;
+            reserved
+        };
+        let wait_started = Instant::now();
+        tokio::time::sleep_until(sleep_until).await;
+        let waited = wait_started.elapsed();
+        self.wait_calls.fetch_add(1, Ordering::Relaxed);
+        self.wait_total_micros.fetch_add(
+            waited.as_micros().min(u128::from(u64::MAX)) as u64,
+            Ordering::Relaxed,
+        );
+    }
+
+    fn wait_metrics(&self) -> (u64, f64) {
+        (
+            self.wait_calls.load(Ordering::Relaxed),
+            self.wait_total_micros.load(Ordering::Relaxed) as f64 / 1000.0,
+        )
     }
 }
 
@@ -66,7 +93,7 @@ pub fn start_quality_check(state: Arc<AppState>) -> bool {
         let _running = RunningGuard {
             flag: &state.quality_running,
         };
-        if let Err(error) = run_quality_check(state.clone()).await {
+        if let Err(error) = run_quality_check(state.clone(), QualityProfile::Full).await {
             state.quality_progress.fail(&error);
             tracing::error!("Manual quality check failed: {error}");
         }
@@ -84,10 +111,15 @@ pub async fn check_all(state: Arc<AppState>) -> Result<usize, String> {
         }
     };
 
-    run_quality_check(state.clone()).await
+    run_quality_check(state.clone(), QualityProfile::Basic).await
 }
 
-async fn run_quality_check(state: Arc<AppState>) -> Result<usize, String> {
+async fn run_quality_check(
+    state: Arc<AppState>,
+    profile: QualityProfile,
+) -> Result<usize, String> {
+    let run_started = std::time::Instant::now();
+    let db_calls_before = state.db.runtime_metrics().calls;
     state
         .quality_progress
         .begin(None, None, None, "waiting-for-bindings");
@@ -97,17 +129,21 @@ async fn run_quality_check(state: Arc<AppState>) -> Result<usize, String> {
     let rate_limiter = Arc::new(RateLimiter::new(40));
     let stale_hours = state.config.quality.stale_hours.max(1);
     let max_checks = state.config.quality.max_checks_per_run.max(1);
+    let lease_owner = format!("quality-{}", uuid::Uuid::new_v4());
+    let lease_seconds = quality_lease_seconds(max_checks, state.config.quality.concurrency);
 
     // Keep maintenance binding assignments stable until all checks finish.
     let _lock = state.validation_lock.lock().await;
     let to_check = {
         state.quality_progress.set_phase("preparing");
         let stale_before = (now - chrono::Duration::hours(stale_hours as i64)).to_rfc3339();
-        let due = match state.db.get_due_quality_proxy_records(
+        let due = match state.db.claim_due_quality_proxy_records(
             max_checks,
             &stale_before,
             MAX_INCOMPLETE_RETRIES,
             QUALITY_SCHEMA_VERSION,
+            &lease_owner,
+            lease_seconds,
         ) {
             Ok(due) => due,
             Err(error) => {
@@ -126,14 +162,15 @@ async fn run_quality_check(state: Arc<AppState>) -> Result<usize, String> {
         }
 
         state.quality_progress.set_phase("binding");
+        let due_ids: Vec<_> = due.into_iter().map(|(proxy, _)| proxy.id).collect();
         let sync_result = crate::api::subscription::sync_proxy_bindings(
             &state,
-            crate::api::subscription::SyncMode::QualityCheck,
+            crate::api::subscription::SyncMode::Targeted(due_ids),
         )
         .await;
 
         sync_result
-            .selected_ids
+            .work_ids
             .iter()
             .filter_map(|id| state.pool.get(id))
             .filter(|p| p.status == crate::pool::manager::ProxyStatus::Valid)
@@ -152,7 +189,7 @@ async fn run_quality_check(state: Arc<AppState>) -> Result<usize, String> {
         );
         state.quality_progress.set_round(1);
         state.quality_progress.set_phase("checking-unlock");
-        total_checked += check_batch(&to_check, &state, &rate_limiter).await;
+        total_checked += check_batch(&to_check, &state, &rate_limiter, profile).await;
     } else {
         tracing::info!(
             "Quality check: due proxies exist but none received active bindings this round"
@@ -164,15 +201,33 @@ async fn run_quality_check(state: Arc<AppState>) -> Result<usize, String> {
         crate::api::subscription::SyncMode::Normal,
     )
     .await;
+    if let Err(error) = state.db.release_quality_leases(&lease_owner) {
+        tracing::warn!("Failed to release quality leases for {lease_owner}: {error}");
+    }
 
     if total_checked > 0 {
+        if let Err(error) = crate::selection::rebuild(state.as_ref()) {
+            tracing::warn!("Failed to rebuild selection snapshot after quality checks: {error}");
+        }
         crate::api::fetch::invalidate_stats_cache(state.as_ref());
         crate::api::sub_export::invalidate_subscription_export_cache(state.as_ref());
         let reconciled = crate::fixed_proxy::reconcile_all(&state).await;
         if reconciled > 0 {
             tracing::info!("Reconciled {reconciled} fixed exits after quality checks");
         }
-        tracing::info!("Quality check complete: {total_checked} proxies checked in this run");
+        let (rate_wait_calls, rate_wait_total_ms) = rate_limiter.wait_metrics();
+        let db_calls = state
+            .db
+            .runtime_metrics()
+            .calls
+            .saturating_sub(db_calls_before);
+        tracing::info!(
+            elapsed_ms = run_started.elapsed().as_secs_f64() * 1000.0,
+            db_calls,
+            rate_wait_calls,
+            rate_wait_total_ms,
+            "Quality check complete: {total_checked} proxies checked in this run"
+        );
     }
 
     let progress = state.quality_progress.snapshot();
@@ -278,7 +333,8 @@ async fn run_subscription_quality_check(
             state.quality_progress.advance(false);
         }
         state.quality_progress.set_phase("checking-unlock");
-        total_checked += check_batch(&to_check, &state, &rate_limiter).await;
+        total_checked +=
+            check_batch(&to_check, &state, &rate_limiter, QualityProfile::Full).await;
     }
 
     let _ = crate::api::subscription::sync_proxy_bindings(
@@ -288,6 +344,11 @@ async fn run_subscription_quality_check(
     .await;
 
     if total_checked > 0 {
+        if let Err(error) = crate::selection::rebuild(state.as_ref()) {
+            tracing::warn!(
+                "Failed to rebuild selection snapshot after subscription quality checks: {error}"
+            );
+        }
         crate::api::fetch::invalidate_stats_cache(state.as_ref());
         crate::api::sub_export::invalidate_subscription_export_cache(state.as_ref());
         let reconciled = crate::fixed_proxy::reconcile_all(&state).await;
@@ -304,31 +365,44 @@ async fn run_subscription_quality_check(
 }
 
 /// Check a batch of proxies concurrently, respecting rate limits.
+enum CompletedQualityCheck {
+    Success {
+        source_id: String,
+        quality: ProxyQualityInfo,
+        db_quality: Box<ProxyQuality>,
+    },
+    Failure,
+}
+
 async fn check_batch(
     proxies: &[PoolProxy],
     state: &Arc<AppState>,
     rate_limiter: &Arc<RateLimiter>,
+    profile: QualityProfile,
 ) -> usize {
-    let semaphore = Arc::new(Semaphore::new(state.config.quality.concurrency));
+    let semaphore = Arc::new(Semaphore::new(state.config.quality.concurrency.max(1)));
     let mut handles = JoinSet::new();
 
     for proxy in proxies.iter().cloned() {
-        let sem = semaphore.clone();
-        let state = state.clone();
+        let network = semaphore.clone();
         let rl = rate_limiter.clone();
 
         handles.spawn(async move {
-            let _permit = sem.acquire().await.unwrap();
-
             let local_port = match proxy.local_port {
                 Some(p) => p,
-                None => return false,
+                None => return CompletedQualityCheck::Failure,
             };
 
             let proxy_addr = format!("http://127.0.0.1:{local_port}");
-            match check_single(&proxy_addr, &proxy, &rl).await {
+            match check_single(&proxy_addr, &proxy, &rl, &network, profile).await {
                 Ok(result) => {
                     let mut quality = result.quality;
+                    // Make the just-collected unlock details visible to the
+                    // completeness check. Previously details were attached
+                    // only after this check, so provider errors looked like a
+                    // complete result and were not retried until the global
+                    // stale TTL elapsed.
+                    quality.details = Some(result.extra_json.clone());
                     let is_incomplete = quality_is_incomplete(&quality);
                     let incomplete_retry_count = if is_incomplete {
                         proxy
@@ -356,12 +430,24 @@ async fn check_batch(
                         &quality.risk_level,
                     );
                     let mut extra = result.extra_json;
+                    let checked_at = chrono::Utc::now();
                     if let Some(obj) = extra.as_object_mut() {
                         obj.insert(
                             "incomplete_retry_count".to_string(),
                             serde_json::json!(incomplete_retry_count),
                         );
+                        if is_incomplete && incomplete_retry_count < MAX_INCOMPLETE_RETRIES {
+                            obj.insert(
+                                "next_retry_at".to_string(),
+                                serde_json::json!(
+                                    (checked_at
+                                        + incomplete_retry_delay(incomplete_retry_count))
+                                    .to_rfc3339()
+                                ),
+                            );
+                        }
                     }
+                    quality.checked_at = Some(checked_at.to_rfc3339());
                     quality.details = Some(extra.clone());
                     let db_quality = ProxyQuality {
                         proxy_id: proxy.id.clone(),
@@ -374,35 +460,95 @@ async fn check_batch(
                         risk_score: quality.risk_score,
                         risk_level: quality.risk_level.clone(),
                         extra_json: Some(extra.to_string()),
-                        checked_at: chrono::Utc::now().to_rfc3339(),
-                    };
-                    let duplicate_ids = match state
-                        .db
-                        .upsert_exact_duplicate_quality(&proxy.id, &db_quality)
-                    {
-                        Ok(ids) => ids,
-                        Err(error) => {
-                            tracing::warn!("Failed to save quality for {}: {error}", proxy.name);
-                            return false;
-                        }
+                        checked_at: checked_at.to_rfc3339(),
                     };
                     quality.incomplete_retry_count = incomplete_retry_count;
-                    for id in duplicate_ids {
-                        state.pool.set_quality(&id, quality.clone());
+                    CompletedQualityCheck::Success {
+                        source_id: proxy.id,
+                        quality,
+                        db_quality: Box::new(db_quality),
                     }
-                    true
                 }
                 Err(e) => {
                     tracing::warn!("Quality check failed for {}: {e}", proxy.name);
-                    false
+                    CompletedQualityCheck::Failure
                 }
             }
         });
     }
 
-    let mut count = 0;
+    let mut successful_checks = Vec::new();
     while let Some(result) = handles.join_next().await {
-        let succeeded = matches!(result, Ok(true));
+        match result {
+            Ok(CompletedQualityCheck::Success {
+                source_id,
+                quality,
+                db_quality,
+            }) => successful_checks.push((source_id, quality, *db_quality)),
+            Ok(CompletedQualityCheck::Failure) => state.quality_progress.advance(false),
+            Err(error) => {
+                tracing::warn!("Quality check task failed to join: {error}");
+                state.quality_progress.advance(false);
+            }
+        }
+    }
+
+    if successful_checks.is_empty() {
+        return 0;
+    }
+    let db_qualities: Vec<_> = successful_checks
+        .iter()
+        .map(|(_, _, quality)| quality.clone())
+        .collect();
+    let critical_unlock_errors = db_qualities
+        .iter()
+        .filter_map(|quality| quality.extra_json.as_deref())
+        .filter_map(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+        .map(|details| {
+            ["google", "chatgpt"]
+                .into_iter()
+                .filter(|service| {
+                    details["unlock"][*service]["status"].as_str() == Some("error")
+                })
+                .count()
+        })
+        .sum::<usize>();
+    tracing::info!(
+        critical_unlock_errors,
+        critical_unlock_checks = db_qualities.len().saturating_mul(2),
+        "Quality batch critical unlock transport-error ratio"
+    );
+    let applied = match state.db.apply_quality_outcomes(&db_qualities) {
+        Ok(applied) => applied,
+        Err(error) => {
+            tracing::warn!(
+                "Failed to persist quality batch of {} checks: {error}",
+                successful_checks.len()
+            );
+            for _ in &successful_checks {
+                state.quality_progress.advance(false);
+            }
+            return 0;
+        }
+    };
+
+    let quality_by_source: std::collections::HashMap<_, _> = successful_checks
+        .iter()
+        .map(|(source_id, quality, _)| (source_id.as_str(), quality))
+        .collect();
+    let applied_sources: std::collections::HashSet<_> = applied
+        .iter()
+        .map(|result| result.source_id.clone())
+        .collect();
+    for result in applied {
+        if let Some(quality) = quality_by_source.get(result.source_id.as_str()) {
+            state.pool.set_quality(&result.proxy_id, (*quality).clone());
+        }
+    }
+
+    let mut count = 0;
+    for (source_id, _, _) in &successful_checks {
+        let succeeded = applied_sources.contains(source_id.as_str());
         if succeeded {
             count += 1;
         }
@@ -438,14 +584,51 @@ pub(crate) fn needs_quality_check(
                 return true;
             }
 
-            // Fresh but incomplete data gets a small immediate retry budget.
+            // Fresh incomplete data uses a bounded, persisted backoff. This
+            // includes critical unlock provider errors, which are unknown but
+            // must not monopolize every quality run during a provider outage.
             if quality_is_incomplete(q) {
-                return q.incomplete_retry_count < MAX_INCOMPLETE_RETRIES;
+                return q.incomplete_retry_count < MAX_INCOMPLETE_RETRIES
+                    && incomplete_retry_is_due(q.details.as_ref(), now);
             }
 
             false
         }
     }
+}
+
+fn incomplete_retry_delay(retry_count: u8) -> chrono::Duration {
+    let exponent = retry_count.saturating_sub(1).min(4) as u32;
+    chrono::Duration::minutes(5_i64.saturating_mul(4_i64.pow(exponent)))
+}
+
+fn quality_lease_seconds(max_checks: usize, concurrency: usize) -> u64 {
+    let max_checks = max_checks.max(1) as u64;
+    let concurrency = concurrency.max(1) as u64;
+    let waves = max_checks / concurrency + u64::from(max_checks % concurrency != 0);
+    // A workflow can perform a primary metadata request, fallback metadata,
+    // and an unlock profile. The separate rate-limit budget covers the
+    // serialized ip-api queue without holding a network permit.
+    waves
+        .saturating_mul(120)
+        .saturating_add(max_checks.saturating_mul(2))
+        .saturating_add(120)
+        .max(15 * 60)
+}
+
+fn incomplete_retry_is_due(
+    details: Option<&serde_json::Value>,
+    now: &chrono::DateTime<chrono::Utc>,
+) -> bool {
+    let Some(next_retry_at) = details
+        .and_then(|details| details.get("next_retry_at"))
+        .and_then(serde_json::Value::as_str)
+    else {
+        return true;
+    };
+    chrono::DateTime::parse_from_rfc3339(next_retry_at)
+        .map(|next| next.with_timezone(&chrono::Utc) <= *now)
+        .unwrap_or(true)
 }
 
 pub(crate) fn quality_checked_at_is_stale(
@@ -470,6 +653,24 @@ fn quality_is_incomplete(q: &ProxyQualityInfo) -> bool {
         || q.ip_type.is_none()
         || q.ip_address.is_none()
         || q.risk_level == "Unknown"
+        || critical_unlock_check_failed(q.details.as_ref())
+}
+
+fn critical_unlock_check_failed(details: Option<&serde_json::Value>) -> bool {
+    let Some(unlock) = details.and_then(|details| details.get("unlock")) else {
+        return false;
+    };
+    ["google", "chatgpt"].iter().any(|service| {
+        unlock
+            .get(service)
+            .and_then(|result| result.get("status"))
+            .and_then(serde_json::Value::as_str)
+            == Some("error")
+    })
+}
+
+fn merge_unlock_availability(current: Option<bool>, previous: Option<bool>) -> bool {
+    current.or(previous).unwrap_or(false)
 }
 
 /// IP info from ip-api.com (primary source — free, no key, auto-detects caller IP)
@@ -501,6 +702,33 @@ struct IpPureResult {
     is_native: Option<bool>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct ProviderIpSelection<'a> {
+    selected: Option<&'a str>,
+    ippure_matches: bool,
+    ipinfo_matches: bool,
+    ip_api_matches: bool,
+    mismatch: bool,
+}
+
+fn select_provider_ip<'a>(
+    ippure: Option<&'a str>,
+    ipinfo: Option<&'a str>,
+    ip_api: Option<&'a str>,
+    validation: Option<&'a str>,
+) -> ProviderIpSelection<'a> {
+    let selected = ippure.or(ipinfo).or(ip_api).or(validation);
+    let observed: std::collections::HashSet<_> =
+        [ippure, ipinfo, ip_api, validation].into_iter().flatten().collect();
+    ProviderIpSelection {
+        selected,
+        ippure_matches: ippure.is_some() && ippure == selected,
+        ipinfo_matches: ipinfo.is_some() && ipinfo == selected,
+        ip_api_matches: ip_api.is_some() && ip_api == selected,
+        mismatch: observed.len() > 1,
+    }
+}
+
 struct QualityCheckResult {
     quality: ProxyQualityInfo,
     extra_json: serde_json::Value,
@@ -512,6 +740,8 @@ async fn check_single(
     proxy_addr: &str,
     proxy: &PoolProxy,
     rate_limiter: &RateLimiter,
+    network_semaphore: &Semaphore,
+    profile: QualityProfile,
 ) -> Result<QualityCheckResult, String> {
     let reqwest_proxy = reqwest::Proxy::all(proxy_addr).map_err(|e| e.to_string())?;
     // no_proxy() must come BEFORE .proxy() — it clears all proxies and disables
@@ -526,85 +756,132 @@ async fn check_single(
         .build()
         .map_err(|e| e.to_string())?;
 
-    // IPPure is queried first. Legacy providers are contacted only for
-    // fields omitted by the public endpoint, avoiding unnecessary traffic
-    // and rate-limit noise when IPPure returns a complete record.
-    let ippure_result = query_ippure(&client).await;
-    let need_ip_api = ippure_result
-        .as_ref()
-        .map(|result| {
-            result.ip.is_none() || result.country_code.is_none() || result.fraud_score.is_none()
-        })
-        .unwrap_or(true);
-    let need_ipinfo = ippure_result
-        .as_ref()
-        .map(|result| {
-            result.ip.is_none()
-                || result.country_code.is_none()
-                || (result.is_residential.is_none() && result.is_datacenter.is_none())
-        })
-        .unwrap_or(true);
-    let (ipapi_result, ipinfo_result, unlock_report) = tokio::join!(
+    // Unlock checks do not depend on IP metadata. Run them from the beginning
+    // while the metadata branch first tries IPPure and only then schedules
+    // fallback providers. IP-api rate waiting is outside the shared network
+    // semaphore so a five-minute provider queue cannot consume every proxy
+    // workflow slot.
+    let ((ippure_result, ipapi_result, ipinfo_result), mut unlock_report) = tokio::join!(
         async {
-            if need_ip_api {
-                rate_limited_ip_api(&client, rate_limiter).await
-            } else {
-                None
-            }
+            let ippure_result =
+                with_network_permit(network_semaphore, query_ippure(&client)).await;
+            let need_ip_api = ippure_result
+                .as_ref()
+                .map(|result| {
+                    result.ip.is_none()
+                        || result.country_code.is_none()
+                        || result.fraud_score.is_none()
+                })
+                .unwrap_or(true);
+            let need_ipinfo = ippure_result
+                .as_ref()
+                .map(|result| {
+                    result.ip.is_none()
+                        || result.country_code.is_none()
+                        || (result.is_residential.is_none()
+                            && result.is_datacenter.is_none())
+                })
+                .unwrap_or(true);
+            let (ipapi_result, ipinfo_result) = tokio::join!(
+                async {
+                    if need_ip_api {
+                        query_ip_api(&client, rate_limiter).await
+                    } else {
+                        None
+                    }
+                },
+                async {
+                    if need_ipinfo {
+                        with_network_permit(network_semaphore, query_ipinfo(&client)).await
+                    } else {
+                        None
+                    }
+                },
+            );
+            (ippure_result, ipapi_result, ipinfo_result)
         },
-        async {
-            if need_ipinfo {
-                query_ipinfo(&client).await
-            } else {
-                None
-            }
-        },
-        crate::quality::unlock::check_all(&client),
+        with_network_permit(
+            network_semaphore,
+            async {
+                match profile {
+                    QualityProfile::Basic => crate::quality::unlock::check_basic(&client).await,
+                    QualityProfile::Full => crate::quality::unlock::check_all(&client).await,
+                }
+            },
+        ),
     );
+
+    if profile == QualityProfile::Basic {
+        let mut merged = proxy
+            .quality
+            .as_ref()
+            .and_then(|quality| quality.details.as_ref())
+            .and_then(|details| details.get("unlock"))
+            .and_then(serde_json::Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        if let Some(current) = unlock_report.checks.as_object() {
+            for (service, result) in current {
+                merged.insert(service.clone(), result.clone());
+            }
+        }
+        unlock_report.checks = serde_json::Value::Object(merged);
+    }
 
     let ippure_ok = ippure_result.is_some();
     let ip_api_ok = ipapi_result.is_some();
     let ipinfo_ok = ipinfo_result.is_some();
 
-    // Merge IP info: prefer ipinfo.io for org detail, fall back to ip-api.com for IP/country
+    // Pick one observed address first, then accept metadata only from providers
+    // that explicitly report that same address. Mixing country/risk/type from
+    // different rotating exits produces a record that describes no real IP.
     let validation_ip = proxy
         .quality
         .as_ref()
         .and_then(|quality| quality.ip_address.clone());
-    let (ipinfo_ip, ipinfo_country, ipinfo_type, ipinfo_residential) =
-        ipinfo_result.unwrap_or((None, None, None, false));
-    let ip_address = ippure_result
+    let ippure_ip = ippure_result
         .as_ref()
-        .and_then(|result| result.ip.clone())
-        .or(ipinfo_ip)
-        .or_else(|| ipapi_result.as_ref().and_then(|result| result.ip.clone()))
-        .or(validation_ip);
-    let country = ippure_result
+        .and_then(|result| result.ip.as_deref());
+    let ipinfo_ip = ipinfo_result
         .as_ref()
+        .and_then(|(ip, _, _, _)| ip.as_deref());
+    let ipapi_ip = ipapi_result
+        .as_ref()
+        .and_then(|result| result.ip.as_deref());
+    let provider_selection =
+        select_provider_ip(ippure_ip, ipinfo_ip, ipapi_ip, validation_ip.as_deref());
+    let ip_address = provider_selection.selected.map(str::to_string);
+    let ippure_selected = ippure_result
+        .as_ref()
+        .filter(|_| provider_selection.ippure_matches);
+    let ipinfo_selected = ipinfo_result
+        .as_ref()
+        .filter(|_| provider_selection.ipinfo_matches);
+    let ipapi_selected = ipapi_result
+        .as_ref()
+        .filter(|_| provider_selection.ip_api_matches);
+    let ip_mismatch = provider_selection.mismatch;
+
+    let country = ippure_selected
         .and_then(|result| result.country_code.clone())
-        .or(ipinfo_country)
-        .or_else(|| {
-            ipapi_result
-                .as_ref()
-                .and_then(|result| result.country.clone())
-        });
-    let ippure_residential = ippure_result
-        .as_ref()
-        .and_then(|result| result.is_residential);
-    let ippure_datacenter = ippure_result
-        .as_ref()
-        .and_then(|result| result.is_datacenter);
+        .or_else(|| ipinfo_selected.and_then(|(_, country, _, _)| country.clone()))
+        .or_else(|| ipapi_selected.and_then(|result| result.country.clone()));
+    let ippure_residential = ippure_selected.and_then(|result| result.is_residential);
+    let ippure_datacenter = ippure_selected.and_then(|result| result.is_datacenter);
+    let ipinfo_residential = ipinfo_selected
+        .map(|(_, _, _, residential)| *residential)
+        .unwrap_or(false);
     let mut is_residential = ippure_residential.unwrap_or(ipinfo_residential);
     let mut ip_type = match (ippure_residential, ippure_datacenter) {
         (Some(true), _) => Some("Residential".to_string()),
         (Some(false), _) | (_, Some(true)) => Some("Datacenter".to_string()),
         (_, Some(false)) => Some("Native/ISP".to_string()),
-        _ => ipinfo_type,
+        _ => ipinfo_selected.and_then(|(_, _, ip_type, _)| ip_type.clone()),
     };
 
     // Prefer IPPure's 0-100 fraud score. ip-api.com's coarse proxy/hosting
     // matrix is retained only when IPPure omits fraudScore.
-    let (fallback_risk_score, fallback_risk_level, is_hosting) = match &ipapi_result {
+    let (fallback_risk_score, fallback_risk_level, is_hosting) = match ipapi_selected {
         Some(r) => {
             let (score, level) = match (r.is_proxy, r.is_hosting) {
                 (true, true) => (0.9, "Very High"),
@@ -616,8 +893,7 @@ async fn check_single(
         }
         None => (0.5, "Unknown".to_string(), false),
     };
-    let (risk_score, risk_level) = ippure_result
-        .as_ref()
+    let (risk_score, risk_level) = ippure_selected
         .and_then(|result| result.fraud_score)
         .map(|score| {
             let normalized = (score.clamp(0.0, 100.0)) / 100.0;
@@ -633,8 +909,26 @@ async fn check_single(
 
     let google_detail = unlock_report.google_detail.clone();
     let chatgpt_detail = unlock_report.chatgpt_detail.clone();
+    // A transport/provider error is unknown, not unavailable. Preserve the
+    // last definitive value until a later check can replace it. New proxies
+    // still default to false for compatibility, while their JSON detail keeps
+    // the explicit `error` state and makes them immediately due for retry.
+    let google_accessible = merge_unlock_availability(
+        unlock_report.google_available,
+        proxy
+            .quality
+            .as_ref()
+            .map(|quality| quality.google_accessible),
+    );
+    let chatgpt_accessible = merge_unlock_availability(
+        unlock_report.chatgpt_available,
+        proxy
+            .quality
+            .as_ref()
+            .map(|quality| quality.chatgpt_accessible),
+    );
     let ip_details = ippure_metadata(
-        ippure_result.as_ref(),
+        ippure_selected,
         ip_address.as_deref(),
         country.as_deref(),
         is_residential,
@@ -647,12 +941,12 @@ async fn check_single(
 
     Ok(QualityCheckResult {
         quality: ProxyQualityInfo {
-            ip_address,
+            ip_address: ip_address.clone(),
             country,
             ip_type,
             is_residential,
-            chatgpt_accessible: unlock_report.chatgpt_accessible,
-            google_accessible: unlock_report.google_accessible,
+            chatgpt_accessible,
+            google_accessible,
             risk_score,
             risk_level,
             checked_at: Some(chrono::Utc::now().to_rfc3339()),
@@ -664,6 +958,14 @@ async fn check_single(
             "ippure_ok": ippure_ok,
             "ip_api_ok": ip_api_ok,
             "ipinfo_ok": ipinfo_ok,
+            "ip_consistency": {
+                "mismatch": ip_mismatch,
+                "selected": ip_address,
+                "ippure": ippure_ip,
+                "ipinfo": ipinfo_ip,
+                "ip_api": ipapi_ip,
+                "validation": validation_ip,
+            },
             "ip": ip_details,
             "unlock": unlock_report.checks,
             "google_check": google_check,
@@ -674,13 +976,15 @@ async fn check_single(
     })
 }
 
-/// Wraps query_ip_api with rate limiting to stay under free tier limits.
-async fn rate_limited_ip_api(
-    client: &reqwest::Client,
-    rate_limiter: &RateLimiter,
-) -> Option<IpApiResult> {
-    rate_limiter.wait().await;
-    query_ip_api(client).await
+async fn with_network_permit<T>(
+    semaphore: &Semaphore,
+    future: impl Future<Output = T>,
+) -> T {
+    let _permit = semaphore
+        .acquire()
+        .await
+        .expect("quality network semaphore must remain open");
+    future.await
 }
 
 /// Query IPPure through the candidate proxy. The public API occasionally
@@ -858,12 +1162,18 @@ fn ippure_metadata(
 
 /// Query ip-api.com — auto-detects caller IP, returns IP/country/proxy/hosting.
 /// Retries up to 2 times on failure.
-async fn query_ip_api(client: &reqwest::Client) -> Option<IpApiResult> {
+async fn query_ip_api(
+    client: &reqwest::Client,
+    rate_limiter: &RateLimiter,
+) -> Option<IpApiResult> {
     let url = "http://ip-api.com/json?fields=query,countryCode,proxy,hosting,status,message";
     for attempt in 0..3 {
         if attempt > 0 {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         }
+        // Every retry is a provider call and must consume its own reserved
+        // slot; limiting only the first attempt can exceed the free-tier cap.
+        rate_limiter.wait().await;
         let resp = match client.get(url).send().await {
             Ok(r) if r.status().as_u16() == 429 => {
                 tracing::warn!(
@@ -988,6 +1298,12 @@ async fn query_ipinfo(
 mod tests {
     use super::*;
 
+    #[test]
+    fn quality_lease_covers_network_and_rate_limit_queues() {
+        assert_eq!(quality_lease_seconds(200, 10), 2_920);
+        assert_eq!(quality_lease_seconds(1, 100), 900);
+    }
+
     fn proxy_with_quality(checked_at: Option<String>, incomplete_retries: u8) -> PoolProxy {
         PoolProxy {
             id: "proxy-1".into(),
@@ -1041,6 +1357,90 @@ mod tests {
         assert!(!quality_checked_at_is_stale(Some(&fresh), &now, 2));
         assert!(quality_checked_at_is_stale(Some(&stale), &now, 2));
         assert!(quality_checked_at_is_stale(Some("invalid"), &now, 2));
+    }
+
+    #[test]
+    fn critical_unlock_transport_errors_stop_after_retry_budget_until_stale() {
+        let now = chrono::Utc::now();
+        let mut proxy = proxy_with_quality(Some(now.to_rfc3339()), MAX_INCOMPLETE_RETRIES);
+        proxy.quality.as_mut().unwrap().ip_address = Some("203.0.113.10".into());
+        proxy.quality.as_mut().unwrap().country = Some("US".into());
+        proxy.quality.as_mut().unwrap().ip_type = Some("Residential".into());
+        proxy.quality.as_mut().unwrap().risk_level = "Low".into();
+        proxy.quality.as_mut().unwrap().details = Some(serde_json::json!({
+            "schema_version": QUALITY_SCHEMA_VERSION,
+            "unlock": {
+                "google": {"status": "error", "available": null},
+                "chatgpt": {"status": "available", "available": true}
+            }
+        }));
+
+        assert!(!needs_quality_check(&proxy, &now, 24));
+    }
+
+    #[test]
+    fn incomplete_quality_respects_persisted_retry_time() {
+        let now = chrono::Utc::now();
+        let mut proxy = proxy_with_quality(Some(now.to_rfc3339()), 1);
+        proxy.quality.as_mut().unwrap().details = Some(serde_json::json!({
+            "schema_version": QUALITY_SCHEMA_VERSION,
+            "next_retry_at": (now + chrono::Duration::minutes(5)).to_rfc3339(),
+            "unlock": {
+                "google": {"status": "error", "available": null},
+                "chatgpt": {"status": "available", "available": true}
+            }
+        }));
+        assert!(!needs_quality_check(&proxy, &now, 24));
+
+        proxy.quality.as_mut().unwrap().details.as_mut().unwrap()["next_retry_at"] =
+            serde_json::json!((now - chrono::Duration::seconds(1)).to_rfc3339());
+        assert!(needs_quality_check(&proxy, &now, 24));
+    }
+
+    #[test]
+    fn explicit_unlock_unavailability_is_complete() {
+        let details = serde_json::json!({
+            "unlock": {
+                "google": {"status": "unavailable", "available": false},
+                "chatgpt": {"status": "available", "available": true}
+            }
+        });
+        assert!(!critical_unlock_check_failed(Some(&details)));
+    }
+
+    #[test]
+    fn unlock_transport_error_preserves_last_definitive_value() {
+        assert!(merge_unlock_availability(None, Some(true)));
+        assert!(!merge_unlock_availability(None, Some(false)));
+        assert!(!merge_unlock_availability(Some(false), Some(true)));
+        assert!(merge_unlock_availability(Some(true), Some(false)));
+    }
+
+    #[test]
+    fn provider_ip_mismatch_rejects_metadata_from_other_exits() {
+        let selected = select_provider_ip(
+            Some("203.0.113.10"),
+            Some("198.51.100.20"),
+            Some("203.0.113.10"),
+            Some("192.0.2.30"),
+        );
+
+        assert_eq!(selected.selected, Some("203.0.113.10"));
+        assert!(selected.ippure_matches);
+        assert!(!selected.ipinfo_matches);
+        assert!(selected.ip_api_matches);
+        assert!(selected.mismatch);
+    }
+
+    #[test]
+    fn provider_ip_selection_falls_back_without_false_mismatch() {
+        let selected = select_provider_ip(None, Some("198.51.100.20"), None, None);
+
+        assert_eq!(selected.selected, Some("198.51.100.20"));
+        assert!(!selected.ippure_matches);
+        assert!(selected.ipinfo_matches);
+        assert!(!selected.ip_api_matches);
+        assert!(!selected.mismatch);
     }
 
     #[test]

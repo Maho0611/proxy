@@ -852,6 +852,16 @@ async function unbanUser(id) {
 async function loadSubscriptions() {
   const d = await api('/api/subscriptions');
   if(!d) return;
+  renderSubscriptions(d);
+  const duplicateData = await api('/api/subscriptions/duplicates');
+  if (!duplicateData) return;
+  const statsById = Object.fromEntries((duplicateData.duplicate_stats || []).map(item => [String(item.subscription_id), item]));
+  d.subscriptions = (d.subscriptions || []).map(item => ({...item, duplicate_stats: statsById[String(item.id)] || null}));
+  d.overlap_edges = duplicateData.overlap_edges || [];
+  renderSubscriptions(d);
+}
+
+function renderSubscriptions(d) {
   currentSubscriptions = d.subscriptions || [];
   updateProxySourceFilter(currentSubscriptions);
   defaultSubRefreshInterval = Number(d.default_refresh_interval_mins || 0);
@@ -935,10 +945,17 @@ async function loadSubscriptions() {
   applyJobButtonState();
 }
 
-function openEditSubscription(id, event) {
+async function openEditSubscription(id, event) {
   if (event?.target.closest('button,input,select,textarea,a')) return;
-  const subscription = currentSubscriptions.find(item => String(item.id) === String(id));
-  if (!subscription) return toast('订阅信息已更新，请刷新后重试');
+  const summary = currentSubscriptions.find(item => String(item.id) === String(id));
+  if (!summary) return toast('订阅信息已更新，请刷新后重试');
+  let subscription;
+  try {
+    const detail = await api(`/api/subscriptions/${encodeURIComponent(id)}`);
+    subscription = detail.subscription || summary;
+  } catch (error) {
+    return toast('加载订阅详情失败: ' + error.message);
+  }
 
   editingSubscription = subscription;
   document.getElementById('edit-sub-id').value = subscription.id;

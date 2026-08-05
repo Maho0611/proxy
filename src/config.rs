@@ -87,6 +87,18 @@ fn default_memory_restart_mb() -> u64 {
 #[derive(Debug, Clone, Deserialize)]
 pub struct DatabaseConfig {
     pub url: String,
+    #[serde(default = "default_database_max_connections")]
+    pub max_connections: u32,
+    #[serde(default = "default_database_checkout_timeout_ms")]
+    pub checkout_timeout_ms: u64,
+}
+
+fn default_database_max_connections() -> u32 {
+    8
+}
+
+fn default_database_checkout_timeout_ms() -> u64 {
+    5_000
 }
 
 #[derive(Debug, Clone, Deserialize)]

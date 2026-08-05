@@ -108,7 +108,7 @@ pub async fn relay_request(
                 }
             };
             let usage = BindingUseGuard::new(state.clone(), proxy.id.clone());
-            let client = get_or_create_client(&state, local_port)?;
+            let client = get_or_create_client(&state, local_port, &proxy)?;
             match do_relay(&client, target_url.as_str(), method, &headers, &body).await {
                 Ok(resp) => {
                     return Ok(build_streaming_response(resp, &proxy, None, usage));
@@ -145,7 +145,7 @@ pub async fn relay_request(
         };
 
         let usage = BindingUseGuard::new(state.clone(), proxy.id.clone());
-        let client = get_or_create_client(&state, local_port)?;
+        let client = get_or_create_client(&state, local_port, proxy)?;
         match do_relay(&client, target_url.as_str(), method, &headers, &body).await {
             Ok(resp) => {
                 return Ok(build_streaming_response(
@@ -191,6 +191,10 @@ async fn record_relay_failure(
 ) {
     tracing::debug!("Relay failure recorded for {}: {}", proxy.name, error);
 
+    // Stop selecting this definition immediately while retaining other
+    // definitions in the same measured-exit group as availability fallbacks.
+    crate::selection::exclude_definition(state.as_ref(), proxy);
+
     crate::bindings::cleanup_proxy_binding(state, &proxy.id, local_port).await;
 
     if should_delete_proxy_after_relay_failure(error) {
@@ -209,7 +213,14 @@ async fn record_relay_failure(
 
     state.pool.increment_error(&proxy.id);
     state.pool.set_status(&proxy.id, ProxyStatus::Untested);
-    state.db.mark_proxy_relay_failed(&proxy.id, error).ok();
+    state
+        .db
+        .mark_proxy_relay_failed(
+            &proxy.id,
+            error,
+            state.config.validation.error_threshold,
+        )
+        .ok();
     crate::api::fetch::invalidate_stats_cache(state.as_ref());
     crate::api::sub_export::invalidate_subscription_export_cache(state.as_ref());
 }
@@ -251,8 +262,19 @@ mod tests {
 }
 
 /// Get a cached reqwest::Client for the given proxy port, or create one.
-fn get_or_create_client(state: &AppState, local_port: u16) -> Result<reqwest::Client, AppError> {
-    if let Some(client) = state.relay_clients.get(&local_port) {
+fn get_or_create_client(
+    state: &AppState,
+    local_port: u16,
+    bound_proxy: &PoolProxy,
+) -> Result<reqwest::Client, AppError> {
+    let definition = crate::api::subscription::outbound_definition_key(
+        &bound_proxy.proxy_type,
+        &bound_proxy.server,
+        bound_proxy.port,
+        &bound_proxy.singbox_outbound,
+    );
+    let key = (local_port, definition);
+    if let Some(client) = state.relay_clients.get(&key) {
         return Ok(client.clone());
     }
 
@@ -275,20 +297,25 @@ fn get_or_create_client(state: &AppState, local_port: u16) -> Result<reqwest::Cl
         .build()
         .map_err(|e| AppError::Internal(format!("Client build error: {e}")))?;
 
-    state.relay_clients.insert(local_port, client.clone());
+    // Remove any client left behind by the previous definition assigned to
+    // this port before making the new client visible.
+    state
+        .relay_clients
+        .retain(|(port, _), _| *port != local_port);
+    state.relay_clients.insert(key, client.clone());
     Ok(client)
 }
 
 /// Invalidate cached clients for ports that are no longer in use.
 pub fn invalidate_relay_clients(state: &AppState, active_ports: &[u16]) {
-    let stale: Vec<u16> = state
+    let stale: Vec<(u16, String)> = state
         .relay_clients
         .iter()
-        .map(|e| *e.key())
-        .filter(|port| !active_ports.contains(port))
+        .map(|e| e.key().clone())
+        .filter(|(port, _)| !active_ports.contains(port))
         .collect();
-    for port in stale {
-        state.relay_clients.remove(&port);
+    for key in stale {
+        state.relay_clients.remove(&key);
     }
 }
 

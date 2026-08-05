@@ -5,11 +5,14 @@ edition = "2021"
 
 [dependencies]
 axum = { version = "0.7", features = ["multipart"] }
+arc-swap = "1"
 tokio = { version = "1", features = ["full"] }
 tower-http = { version = "0.5", features = ["cors"] }
 reqwest = { version = "0.12", features = ["json", "socks", "rustls-tls", "stream"], default-features = false }
 rusqlite = { version = "0.31", features = ["bundled"] }
 postgres = "0.19"
+r2d2 = "0.8"
+r2d2_postgres = "0.18"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"

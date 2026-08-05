@@ -3,11 +3,15 @@ use serde_json::{Map, Value};
 pub const BROWSER_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+const UNLOCK_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub struct UnlockReport {
     pub checks: Value,
-    pub google_accessible: bool,
-    pub chatgpt_accessible: bool,
+    /// Tri-state result used by the persistence layer. `None` means the
+    /// provider check failed and must not overwrite a previous definitive
+    /// result with a synthetic `false`.
+    pub google_available: Option<bool>,
+    pub chatgpt_available: Option<bool>,
     pub google_detail: String,
     pub chatgpt_detail: String,
 }
@@ -75,6 +79,7 @@ impl UnlockCheck {
             "status_code": self.status_code,
             "region": self.region,
             "detail": self.detail,
+            "checked_at": chrono::Utc::now().to_rfc3339(),
         })
     }
 }
@@ -99,8 +104,8 @@ pub async fn check_all(client: &reqwest::Client) -> UnlockReport {
         check_tiktok(client),
     );
 
-    let google_accessible = google.available == Some(true);
-    let chatgpt_accessible = chatgpt.available == Some(true);
+    let google_available = google.available;
+    let chatgpt_available = chatgpt.available;
     let google_detail = google.detail.clone();
     let chatgpt_detail = chatgpt.detail.clone();
     let mut checks = Map::new();
@@ -121,8 +126,29 @@ pub async fn check_all(client: &reqwest::Client) -> UnlockReport {
 
     UnlockReport {
         checks: Value::Object(checks),
-        google_accessible,
-        chatgpt_accessible,
+        google_available,
+        chatgpt_available,
+        google_detail,
+        chatgpt_detail,
+    }
+}
+
+/// High-frequency profile used by scheduled checks. It contains only the
+/// capabilities promoted into selection/filter columns; the caller merges
+/// older long-profile details for services not checked in this pass.
+pub async fn check_basic(client: &reqwest::Client) -> UnlockReport {
+    let (google, chatgpt) = tokio::join!(check_google(client), check_chatgpt(client));
+    let google_available = google.available;
+    let chatgpt_available = chatgpt.available;
+    let google_detail = google.detail.clone();
+    let chatgpt_detail = chatgpt.detail.clone();
+    let mut checks = Map::new();
+    checks.insert("google".into(), google.as_json());
+    checks.insert("chatgpt".into(), chatgpt.as_json());
+    UnlockReport {
+        checks: Value::Object(checks),
+        google_available,
+        chatgpt_available,
         google_detail,
         chatgpt_detail,
     }
@@ -131,6 +157,7 @@ pub async fn check_all(client: &reqwest::Client) -> UnlockReport {
 async fn check_google(client: &reqwest::Client) -> UnlockCheck {
     match client
         .get("https://www.google.com/generate_204")
+        .timeout(UNLOCK_REQUEST_TIMEOUT)
         .send()
         .await
     {
@@ -218,7 +245,7 @@ async fn check_gemini(client: &reqwest::Client) -> UnlockCheck {
             "f.req",
             r#"[[["K4WWud","[[0],[\"en-US\"]]",null,"generic"]]]"#,
         )]);
-    match request.send().await {
+    match request.timeout(UNLOCK_REQUEST_TIMEOUT).send().await {
         Ok(response) => match snapshot(response).await {
             Ok(result) if success_or_redirect(result.status) && result.body.contains("K4WWud") => {
                 UnlockCheck::available(
@@ -328,7 +355,7 @@ async fn check_youtube_premium(client: &reqwest::Client) -> UnlockCheck {
     let request = client
         .get("https://www.youtube.com/premium")
         .header("accept-language", "en-US,en;q=0.9");
-    match request.send().await {
+    match request.timeout(UNLOCK_REQUEST_TIMEOUT).send().await {
         Ok(response) => match snapshot(response).await {
             Ok(result) => {
                 let region = extract_json_string(&result.body, "countryCode");
@@ -374,6 +401,7 @@ async fn check_tiktok(client: &reqwest::Client) -> UnlockCheck {
         tokio::join!(get_snapshot(client, "https://www.tiktok.com/"), async {
             let response = client
                 .post("https://www.tiktok.com/passport/web/store_region/")
+                .timeout(UNLOCK_REQUEST_TIMEOUT)
                 .send()
                 .await
                 .map_err(|error| shorten(error.to_string()))?;
@@ -408,6 +436,7 @@ async fn check_tiktok(client: &reqwest::Client) -> UnlockCheck {
 async fn get_snapshot(client: &reqwest::Client, url: &str) -> Result<HttpSnapshot, String> {
     let response = client
         .get(url)
+        .timeout(UNLOCK_REQUEST_TIMEOUT)
         .send()
         .await
         .map_err(|error| shorten(error.to_string()))?;
@@ -531,5 +560,13 @@ mod tests {
         assert!(contains_region_block("unsupported_country"));
         assert!(contains_region_block("Unavailable in your country"));
         assert!(!contains_region_block("Welcome to the service"));
+    }
+
+    #[test]
+    fn serialized_service_result_has_its_own_timestamp() {
+        let value = UnlockCheck::error("temporary transport failure").as_json();
+        let checked_at = value["checked_at"].as_str().unwrap();
+        assert!(chrono::DateTime::parse_from_rfc3339(checked_at).is_ok());
+        assert_eq!(value["status"], "error");
     }
 }

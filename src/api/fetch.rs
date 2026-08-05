@@ -10,8 +10,6 @@ use serde::Deserialize;
 use serde_json::json;
 use std::sync::Arc;
 
-const RELAY_FAILURE_COOLDOWN_SECS: i64 = 300;
-
 #[derive(Debug, Deserialize)]
 pub struct FetchQuery {
     pub api_key: Option<String>,
@@ -230,6 +228,11 @@ pub fn get_cached_stats(state: &AppState) -> Result<serde_json::Value, AppError>
 
 pub fn invalidate_stats_cache(state: &AppState) {
     state.dashboard_stats_cache.clear();
+    state.subscription_duplicate_generation.fetch_add(
+        1,
+        std::sync::atomic::Ordering::AcqRel,
+    );
+    state.subscription_duplicate_cache.clear();
 }
 
 pub fn find_proxy_snapshot(
@@ -252,22 +255,6 @@ pub fn pick_random_valid_proxies(
     if count == 0 {
         return Ok(Vec::new());
     }
-
-    let recent_error_before = if RELAY_FAILURE_COOLDOWN_SECS > 0 {
-        Some(
-            (chrono::Utc::now() - chrono::Duration::seconds(RELAY_FAILURE_COOLDOWN_SECS))
-                .to_rfc3339(),
-        )
-    } else {
-        None
-    };
-
-    let records =
-        state
-            .db
-            .get_random_valid_proxy_records(filter, count, recent_error_before.as_deref())?;
-    Ok(records
-        .into_iter()
-        .map(|(row, quality)| crate::pool::manager::ProxyPool::from_db_parts(row, quality))
-        .collect())
+    let snapshot = state.selection_snapshot.load();
+    Ok(snapshot.pick(filter, count, state))
 }

@@ -11,15 +11,19 @@ mod proxy_account;
 mod proxy_listener;
 mod proxy_rotation;
 mod quality;
+mod selection;
 mod singbox;
 
+use arc_swap::ArcSwap;
 use crate::config::AppConfig;
-use crate::db::{Database, ProxyAccount, User};
+use crate::db::{
+    Database, ProxyAccount, SubscriptionDuplicateStats, SubscriptionOverlap, User,
+};
 use crate::jobs::JobTracker;
 use crate::pool::manager::ProxyPool;
 use crate::singbox::process::SingboxManager;
 use dashmap::DashMap;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::Arc;
 use sysinfo::{Pid, System};
 use tokio::sync::Mutex;
@@ -30,12 +34,25 @@ pub struct AppState {
     pub pool: ProxyPool,
     pub singbox: Arc<Mutex<SingboxManager>>,
     pub binding_usage: DashMap<String, bindings::BindingUsage>,
-    /// Cached reqwest::Client per proxy local_port — avoids rebuilding per request.
-    pub relay_clients: DashMap<u16, reqwest::Client>,
+    /// Cached relay clients keyed by both local port and immutable proxy
+    /// definition. Ports are reused, so using the port alone can retain a
+    /// pooled connection for the previous binding.
+    pub relay_clients: DashMap<(u16, String), reqwest::Client>,
     /// Cached generated client subscription bodies keyed by selector/format.
     pub subscription_export_cache: DashMap<String, SubscriptionExportCacheEntry>,
+    /// Immutable, precomputed selection index used by every new data-plane
+    /// connection. Full proxy definitions are retained here so selection and
+    /// on-demand binding require no database query.
+    pub selection_snapshot: ArcSwap<selection::SelectionSnapshot>,
+    /// Immediate circuit-breaker overlay for definitions that failed after
+    /// the latest immutable snapshot was built.
+    pub selection_unavailable_definitions: DashMap<String, std::time::Instant>,
     /// Short-lived aggregate dashboard cache; avoids repeated full-table scans.
     pub dashboard_stats_cache: DashMap<(), DashboardStatsCacheEntry>,
+    /// Lazy duplicate/overlap analysis for the subscription admin view.
+    pub subscription_duplicate_cache: DashMap<(), SubscriptionDuplicateCacheEntry>,
+    pub subscription_duplicate_cache_fill: Mutex<()>,
+    pub subscription_duplicate_generation: AtomicU64,
     /// Auth cache: (api_key | session_id) → (User, expires_at_instant).
     pub auth_cache: DashMap<String, (User, tokio::time::Instant)>,
     /// Live proxy-account cache keyed by base username. Admin mutations update
@@ -72,6 +89,14 @@ pub struct DashboardStatsCacheEntry {
     pub expires_at: tokio::time::Instant,
 }
 
+#[derive(Debug, Clone)]
+pub struct SubscriptionDuplicateCacheEntry {
+    pub stats: Vec<SubscriptionDuplicateStats>,
+    pub overlaps: Vec<SubscriptionOverlap>,
+    pub expires_at: tokio::time::Instant,
+    pub generation: u64,
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
@@ -92,7 +117,12 @@ async fn main() {
     std::fs::create_dir_all("data").ok();
 
     // Initialize database
-    let db = Database::new(&config.database.url).expect("Failed to initialize database");
+    let db = Database::new(
+        &config.database.url,
+        config.database.max_connections,
+        std::time::Duration::from_millis(config.database.checkout_timeout_ms.max(100)),
+    )
+    .expect("Failed to initialize database");
 
     // Keep only the managed ready-set in memory on startup; the full inventory stays in DB.
     let pool = ProxyPool::new();
@@ -133,7 +163,9 @@ async fn main() {
             let assignments = manager.sync_bindings(&desired, &[]).await;
             for (id, port) in &assignments {
                 pool.set_local_port(id, *port);
-                db.update_proxy_local_port(id, *port as i32).ok();
+            }
+            if let Err(error) = db.sync_proxy_local_ports(&assignments, &[]) {
+                tracing::warn!("Failed to persist initial proxy bindings: {error}");
             }
             tracing::info!(
                 "Created {} initial bindings for valid proxies (prebound limit={})",
@@ -155,6 +187,9 @@ async fn main() {
         proxy_accounts.insert(account.username.clone(), account);
     }
 
+    let selection_snapshot = selection::SelectionSnapshot::load(&db)
+        .expect("Failed to build initial proxy selection snapshot");
+
     let state = Arc::new(AppState {
         config: config.clone(),
         db,
@@ -163,7 +198,12 @@ async fn main() {
         binding_usage: DashMap::new(),
         relay_clients: DashMap::new(),
         subscription_export_cache: DashMap::new(),
+        selection_snapshot: ArcSwap::from_pointee(selection_snapshot),
+        selection_unavailable_definitions: DashMap::new(),
         dashboard_stats_cache: DashMap::new(),
+        subscription_duplicate_cache: DashMap::new(),
+        subscription_duplicate_cache_fill: Mutex::new(()),
+        subscription_duplicate_generation: AtomicU64::new(0),
         auth_cache: DashMap::new(),
         proxy_accounts,
         proxy_account_last_used: DashMap::new(),
@@ -203,6 +243,19 @@ async fn main() {
 }
 
 async fn start_background_tasks(state: Arc<AppState>) {
+    let state_clone = state.clone();
+    // Safety-net refresh for missed invalidation events. Reads remain lock-free
+    // because the rebuilt snapshot is swapped atomically after the DB scan.
+    tokio::spawn(async move {
+        let interval = std::time::Duration::from_secs(selection::SNAPSHOT_REFRESH_SECS);
+        loop {
+            tokio::time::sleep(interval).await;
+            if let Err(error) = selection::rebuild(state_clone.as_ref()) {
+                tracing::warn!("Periodic selection snapshot rebuild failed: {error}");
+            }
+        }
+    });
+
     let state_clone = state.clone();
     // Periodic validation
     tokio::spawn(async move {
