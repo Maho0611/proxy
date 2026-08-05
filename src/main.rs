@@ -51,6 +51,9 @@ pub struct AppState {
     pub dashboard_stats_cache: DashMap<(), DashboardStatsCacheEntry>,
     /// Coalesces concurrent dashboard cache misses into one database query.
     pub dashboard_stats_cache_fill: Mutex<()>,
+    /// Short-lived exact counts for filtered proxy-list views.
+    pub proxy_list_count_cache: DashMap<String, ProxyListCountCacheEntry>,
+    pub proxy_list_count_cache_fill: Mutex<()>,
     /// Lazy duplicate/overlap analysis for the subscription admin view.
     pub subscription_duplicate_cache: DashMap<(), SubscriptionDuplicateCacheEntry>,
     pub subscription_duplicate_cache_fill: Mutex<()>,
@@ -88,6 +91,12 @@ pub struct SubscriptionExportCacheEntry {
 #[derive(Debug, Clone)]
 pub struct DashboardStatsCacheEntry {
     pub value: serde_json::Value,
+    pub expires_at: tokio::time::Instant,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProxyListCountCacheEntry {
+    pub filtered: usize,
     pub expires_at: tokio::time::Instant,
 }
 
@@ -204,6 +213,8 @@ async fn main() {
         selection_unavailable_definitions: DashMap::new(),
         dashboard_stats_cache: DashMap::new(),
         dashboard_stats_cache_fill: Mutex::new(()),
+        proxy_list_count_cache: DashMap::new(),
+        proxy_list_count_cache_fill: Mutex::new(()),
         subscription_duplicate_cache: DashMap::new(),
         subscription_duplicate_cache_fill: Mutex::new(()),
         subscription_duplicate_generation: AtomicU64::new(0),

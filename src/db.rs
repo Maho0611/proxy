@@ -1176,6 +1176,9 @@ impl Database {
                     WHERE orphaned_at IS NULL;
                 CREATE INDEX IF NOT EXISTS idx_subscription_proxies_subscription
                     ON subscription_proxies(subscription_id, orphaned_at, definition_id);
+                CREATE INDEX IF NOT EXISTS idx_subscription_proxies_active_name
+                    ON subscription_proxies(display_name, source_proxy_id)
+                    WHERE orphaned_at IS NULL;
                 CREATE INDEX IF NOT EXISTS idx_proxy_definitions_type
                     ON proxy_definitions(proxy_type, id);
                 CREATE INDEX IF NOT EXISTS idx_proxy_health_due
@@ -2613,6 +2616,62 @@ impl Database {
         &self,
         query: &ProxyListQuery,
     ) -> Result<ProxyListPage, postgres::Error> {
+        let filtered = self.count_proxy_list(query)?;
+        let total = if proxy_list_query_has_filters(query) {
+            self.count_proxy_list(&ProxyListQuery::default())?
+        } else {
+            filtered
+        };
+        self.list_proxy_page_inner(query, Some((filtered, total)), None)
+    }
+
+    pub fn count_proxy_list(&self, query: &ProxyListQuery) -> Result<usize, postgres::Error> {
+        self.count_proxy_list_cancellable(query, None)
+    }
+
+    pub fn count_proxy_list_cancellable(
+        &self,
+        query: &ProxyListQuery,
+        cancel_sender: Option<tokio::sync::oneshot::Sender<postgres::CancelToken>>,
+    ) -> Result<usize, postgres::Error> {
+        let mut params: Vec<Box<dyn ToSql + Sync>> = Vec::new();
+        let where_clause = build_proxy_list_where(query, &mut params);
+        self.with_conn(move |conn| {
+            if let Some(sender) = cancel_sender {
+                let _ = sender.send(conn.cancel_token());
+            }
+            let mut tx = conn.transaction()?;
+            tx.batch_execute("SET LOCAL statement_timeout = '15s'")?;
+            let param_refs: Vec<&(dyn ToSql + Sync)> = params
+                .iter()
+                .map(|param| &**param as &(dyn ToSql + Sync))
+                .collect();
+            let sql = format!(
+                "SELECT COUNT(*)
+                 {}
+                 {where_clause}",
+                proxy_list_from_clause()
+            );
+            let count: i64 = tx.query_one(&sql, &param_refs)?.get(0);
+            tx.commit()?;
+            Ok(count as usize)
+        })
+    }
+
+    pub fn list_proxy_page_cancellable(
+        &self,
+        query: &ProxyListQuery,
+        cancel_sender: Option<tokio::sync::oneshot::Sender<postgres::CancelToken>>,
+    ) -> Result<ProxyListPage, postgres::Error> {
+        self.list_proxy_page_inner(query, None, cancel_sender)
+    }
+
+    fn list_proxy_page_inner(
+        &self,
+        query: &ProxyListQuery,
+        counts: Option<(usize, usize)>,
+        cancel_sender: Option<tokio::sync::oneshot::Sender<postgres::CancelToken>>,
+    ) -> Result<ProxyListPage, postgres::Error> {
         let page_size = query.page_size.clamp(1, 200);
         let requested_page = query.page.max(1);
 
@@ -2637,46 +2696,21 @@ impl Database {
         let backwards = cursor.is_some()
             && matches!(query.direction.as_deref(), Some("prev") | Some("previous"));
 
-        let count_params = params;
-        self.with_conn(|conn| {
-            // Cursor requests already have their totals from the first page. Avoid
-            // repeating a million-row COUNT on every next/previous click.
-            let counts_available = cursor.is_none();
-            let (filtered, total) = if counts_available {
-                let count_refs: Vec<&(dyn ToSql + Sync)> = count_params
-                    .iter()
-                    .map(|p| &**p as &(dyn ToSql + Sync))
-                    .collect();
-                let sql = format!(
-                    "SELECT
-                        COUNT(*) AS filtered,
-                    (SELECT COUNT(*) FROM normalized_proxies WHERE orphaned_at IS NULL) AS total
-                     FROM normalized_proxies p
-                     LEFT JOIN normalized_proxy_quality q ON q.proxy_id = p.id
-                     {where_clause}"
-                );
-                let row = conn.query_one(&sql, &count_refs)?;
-                let filtered: i64 = row.get("filtered");
-                let total: i64 = row.get("total");
-                (filtered as usize, total as usize)
-            } else {
-                (0, 0)
-            };
-
-        // The admin/user list represents the current subscription contents.
-        // Orphaned rows are retained internally for smooth refresh/rechecking,
-        // but are not eligible for export and must not inflate the UI totals.
-        let total_pages = if filtered == 0 {
+        let counts_available = counts.is_some() && cursor.is_none();
+        let (filtered, total) = counts.unwrap_or_default();
+        let total_pages = if !counts_available || filtered == 0 {
             0
         } else {
             filtered.div_ceil(page_size)
         };
-        // A filter change or deletion can make the requested page disappear.
-        // Return the last available page instead of a misleading empty result.
-        let page = requested_page.min(total_pages.max(1));
+        let page = if counts_available {
+            requested_page.min(total_pages.max(1))
+        } else {
+            requested_page
+        };
         let offset = (page - 1).saturating_mul(page_size).min(i64::MAX as usize) as i64;
 
-        let mut select_params = count_params;
+        let mut select_params = params;
         let cursor_clause = cursor
             .as_ref()
             .map(|cursor| {
@@ -2712,25 +2746,57 @@ impl Database {
         select_params.push(Box::new(legacy_offset));
         let offset_idx = select_params.len();
 
+        self.with_conn(move |conn| {
+            if let Some(sender) = cancel_sender {
+                let _ = sender.send(conn.cancel_token());
+            }
+            let mut tx = conn.transaction()?;
+            tx.batch_execute("SET LOCAL statement_timeout = '5s'")?;
             let param_refs: Vec<&(dyn ToSql + Sync)> = select_params
                 .iter()
                 .map(|p| &**p as &(dyn ToSql + Sync))
                 .collect();
             let sql = format!(
                 "SELECT
-                    p.id, p.subscription_id, p.name, p.proxy_type, p.server, p.port, p.local_port,
-                    p.error_count, p.is_valid, p.last_validated,
-                    q.proxy_id, q.ip_address, q.country, q.ip_type, q.is_residential,
-                    q.chatgpt_accessible, q.google_accessible, q.risk_score, q.risk_level,
-                    q.extra_json, q.checked_at,
+                    membership.source_proxy_id AS id,
+                    membership.subscription_id,
+                    membership.display_name AS name,
+                    definition.proxy_type,
+                    definition.server,
+                    definition.port,
+                    runtime.local_port,
+                    COALESCE(health.consecutive_failures, 0) AS error_count,
+                    (health.health_state = 'healthy') AS is_valid,
+                    zenproxy_rfc3339({}) AS last_validated,
+                    CASE WHEN observed.ip_address IS NOT NULL
+                                   OR retry.definition_id IS NOT NULL
+                         THEN membership.source_proxy_id END AS proxy_id,
+                    HOST(observed.ip_address) AS ip_address,
+                    quality.country,
+                    quality.ip_type,
+                    COALESCE(quality.is_residential, FALSE) AS is_residential,
+                    COALESCE(quality.chatgpt_accessible, FALSE) AS chatgpt_accessible,
+                    COALESCE(quality.google_accessible, FALSE) AS google_accessible,
+                    COALESCE(quality.risk_score, 1.0) AS risk_score,
+                    COALESCE(quality.risk_level, 'Unknown') AS risk_level,
+                    COALESCE(
+                        quality.extra_json,
+                        retry.extra_json,
+                        jsonb_build_object('unlock', quality.unlock_json)
+                    )::text AS extra_json,
+                    zenproxy_rfc3339(COALESCE(
+                        quality.checked_at, retry.checked_at, observed.observed_at
+                    )) AS checked_at,
                     ({sort_expr})::text AS cursor_value
-                 FROM normalized_proxies p
-                 LEFT JOIN normalized_proxy_quality q ON q.proxy_id = p.id
+                 {}
                  {where_clause} {cursor_clause}
-                 ORDER BY {sort_expr} {query_dir}, p.id {id_dir}
-                 LIMIT ${limit_idx} OFFSET ${offset_idx}"
+                 ORDER BY {sort_expr} {query_dir}, membership.source_proxy_id {id_dir}
+                 LIMIT ${limit_idx} OFFSET ${offset_idx}",
+                proxy_list_last_validated_expr(),
+                proxy_list_from_clause()
             );
-            let rows = conn.query(&sql, &param_refs)?;
+            let rows = tx.query(&sql, &param_refs)?;
+            tx.commit()?;
             let has_extra = rows.len() > page_size;
             let visible_rows = &rows[..rows.len().min(page_size)];
             let mut proxies: Vec<_> = visible_rows.iter().map(proxy_list_item_from_row).collect();
@@ -4872,36 +4938,97 @@ fn proxy_list_item_from_row(row: &Row) -> ProxyListItem {
     }
 }
 
+fn proxy_list_from_clause() -> &'static str {
+    "FROM subscription_proxies membership
+     JOIN proxy_definitions definition
+       ON definition.id = membership.definition_id
+     JOIN proxy_health health
+       ON health.definition_id = membership.definition_id
+     LEFT JOIN proxy_runtime runtime
+       ON runtime.definition_id = membership.definition_id
+     LEFT JOIN proxy_exit observed
+       ON observed.definition_id = membership.definition_id
+     LEFT JOIN exit_quality quality
+       ON quality.ip_address = observed.ip_address
+     LEFT JOIN quality_retry_state retry
+       ON retry.definition_id = membership.definition_id"
+}
+
+fn proxy_list_last_validated_expr() -> &'static str {
+    "CASE
+        WHEN health.last_success_at IS NULL THEN health.last_failure_at
+        WHEN health.last_failure_at IS NULL THEN health.last_success_at
+        ELSE GREATEST(health.last_success_at, health.last_failure_at)
+     END"
+}
+
+fn proxy_list_query_has_filters(query: &ProxyListQuery) -> bool {
+    query.unique_exit_ip
+        || query.search.as_deref().is_some_and(|value| !value.trim().is_empty())
+        || query.status.as_deref().is_some_and(|value| !value.trim().is_empty())
+        || query
+            .subscription_id
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+        || query
+            .proxy_type
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+        || query.quality.as_deref().is_some_and(|value| !value.trim().is_empty())
+}
+
 fn build_proxy_list_where(
     query: &ProxyListQuery,
     params: &mut Vec<Box<dyn ToSql + Sync>>,
 ) -> String {
     // Orphaned rows exist only as a short-lived refresh fallback. They are not
     // part of the current subscription and are excluded from export as well.
-    let mut conditions = vec!["p.orphaned_at IS NULL".to_string()];
+    let mut conditions = vec!["membership.orphaned_at IS NULL".to_string()];
 
     if query.unique_exit_ip {
         conditions.push(
             "(
-                q.ip_address IS NULL
-                OR BTRIM(q.ip_address) = ''
-                OR p.id IN (
-                    SELECT ranked.id
+                observed.ip_address IS NULL
+                OR membership.source_proxy_id IN (
+                    SELECT ranked.source_proxy_id
                     FROM (
-                        SELECT candidate.id,
+                        SELECT candidate.source_proxy_id,
                                ROW_NUMBER() OVER (
-                                   PARTITION BY quality.ip_address
-                                   ORDER BY candidate.is_valid DESC,
-                                            candidate.error_count ASC,
-                                            candidate.last_validated_ts DESC NULLS LAST,
-                                            candidate.updated_at_ts DESC NULLS LAST,
-                                            candidate.id ASC
+                                   PARTITION BY candidate_exit.ip_address
+                                   ORDER BY
+                                       (candidate_health.health_state = 'healthy') DESC,
+                                       candidate_health.consecutive_failures ASC,
+                                       CASE
+                                           WHEN candidate_health.last_success_at IS NULL
+                                               THEN candidate_health.last_failure_at
+                                           WHEN candidate_health.last_failure_at IS NULL
+                                               THEN candidate_health.last_success_at
+                                           ELSE GREATEST(
+                                               candidate_health.last_success_at,
+                                               candidate_health.last_failure_at
+                                           )
+                                       END DESC NULLS LAST,
+                                       GREATEST(
+                                           candidate.updated_at,
+                                           candidate_definition.updated_at,
+                                           candidate_health.updated_at,
+                                           COALESCE(
+                                               candidate_runtime.updated_at,
+                                               candidate.updated_at
+                                           )
+                                       ) DESC,
+                                       candidate.source_proxy_id ASC
                                ) AS exit_rank
-                        FROM normalized_proxies candidate
-                        JOIN normalized_proxy_quality quality ON quality.proxy_id = candidate.id
+                        FROM subscription_proxies candidate
+                        JOIN proxy_definitions candidate_definition
+                          ON candidate_definition.id = candidate.definition_id
+                        JOIN proxy_health candidate_health
+                          ON candidate_health.definition_id = candidate.definition_id
+                        LEFT JOIN proxy_runtime candidate_runtime
+                          ON candidate_runtime.definition_id = candidate.definition_id
+                        JOIN proxy_exit candidate_exit
+                          ON candidate_exit.definition_id = candidate.definition_id
                         WHERE candidate.orphaned_at IS NULL
-                          AND quality.ip_address IS NOT NULL
-                          AND BTRIM(quality.ip_address) <> ''
                     ) ranked
                     WHERE ranked.exit_rank = 1
                 )
@@ -4919,18 +5046,26 @@ fn build_proxy_list_where(
         params.push(Box::new(format!("%{search}%")));
         let idx = params.len();
         conditions.push(format!(
-            "(p.name ILIKE ${idx} OR p.server ILIKE ${idx} OR COALESCE(q.ip_address, '') ILIKE ${idx})"
+            "(membership.display_name ILIKE ${idx}
+              OR definition.server ILIKE ${idx}
+              OR COALESCE(HOST(observed.ip_address), '') ILIKE ${idx})"
         ));
     }
 
     if let Some(status) = query.status.as_deref() {
         match status {
-            "valid" => conditions.push("p.is_valid = TRUE".to_string()),
+            "valid" => conditions.push("health.health_state = 'healthy'".to_string()),
             "invalid" => {
-                conditions.push("p.is_valid = FALSE AND p.last_validated IS NOT NULL".to_string())
+                conditions.push(format!(
+                    "health.health_state <> 'healthy' AND {} IS NOT NULL",
+                    proxy_list_last_validated_expr()
+                ))
             }
             "untested" => {
-                conditions.push("p.is_valid = FALSE AND p.last_validated IS NULL".to_string())
+                conditions.push(format!(
+                    "health.health_state <> 'healthy' AND {} IS NULL",
+                    proxy_list_last_validated_expr()
+                ))
             }
             _ => {}
         }
@@ -4944,7 +5079,7 @@ fn build_proxy_list_where(
     {
         params.push(Box::new(subscription_id.to_string()));
         let idx = params.len();
-        conditions.push(format!("p.subscription_id = ${idx}"));
+        conditions.push(format!("membership.subscription_id = ${idx}"));
     }
 
     if let Some(proxy_type) = query
@@ -4955,15 +5090,17 @@ fn build_proxy_list_where(
     {
         params.push(Box::new(proxy_type.to_string()));
         let idx = params.len();
-        conditions.push(format!("p.proxy_type = ${idx}"));
+        conditions.push(format!("definition.proxy_type = ${idx}"));
     }
 
     if let Some(quality) = query.quality.as_deref() {
         match quality {
-            "chatgpt" => conditions.push("q.chatgpt_accessible = TRUE".to_string()),
-            "google" => conditions.push("q.google_accessible = TRUE".to_string()),
-            "residential" => conditions.push("q.is_residential = TRUE".to_string()),
-            "unchecked" => conditions.push("q.proxy_id IS NULL".to_string()),
+            "chatgpt" => conditions.push("quality.chatgpt_accessible = TRUE".to_string()),
+            "google" => conditions.push("quality.google_accessible = TRUE".to_string()),
+            "residential" => conditions.push("quality.is_residential = TRUE".to_string()),
+            "unchecked" => conditions.push(
+                "observed.ip_address IS NULL AND retry.definition_id IS NULL".to_string(),
+            ),
             _ => {}
         }
     }
@@ -4983,15 +5120,26 @@ fn parse_rfc3339_utc(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
 
 fn proxy_list_sort_expr(sort: Option<&str>) -> &'static str {
     match sort {
-        Some("type") => "p.proxy_type",
-        Some("server") => "p.server",
+        Some("type") => "definition.proxy_type",
+        Some("server") => "definition.server",
         Some("status") | Some("is_valid") => {
-            "CASE WHEN p.is_valid THEN 0 WHEN p.last_validated IS NULL THEN 1 ELSE 2 END"
+            "CASE
+                WHEN health.health_state = 'healthy' THEN 0
+                WHEN health.last_success_at IS NULL
+                 AND health.last_failure_at IS NULL THEN 1
+                ELSE 2
+             END"
         }
-        Some("error_count") => "p.error_count",
-        Some("country") => "COALESCE(q.country, 'ZZZ')",
-        Some("risk") => "COALESCE(q.risk_score, 2.0)",
-        _ => "p.name",
+        Some("error_count") => "COALESCE(health.consecutive_failures, 0)",
+        Some("country") => "COALESCE(quality.country, 'ZZZ')",
+        Some("risk") => {
+            "CASE WHEN observed.ip_address IS NOT NULL
+                        OR retry.definition_id IS NOT NULL
+                  THEN COALESCE(quality.risk_score, 1.0)
+                  ELSE 2.0
+             END"
+        }
+        _ => "membership.display_name",
     }
 }
 
@@ -5050,7 +5198,9 @@ fn build_proxy_cursor_clause(
     // including when the primary sort itself is DESC.
     let id_op = if (dir == "ASC") ^ backwards { ">" } else { "<" };
     format!(
-        "AND (({sort_expr}) {value_op} ${value_idx} OR (({sort_expr}) = ${value_idx} AND p.id {id_op} ${id_idx}))"
+        "AND (({sort_expr}) {value_op} ${value_idx}
+          OR (({sort_expr}) = ${value_idx}
+              AND membership.source_proxy_id {id_op} ${id_idx}))"
     )
 }
 
@@ -5082,7 +5232,7 @@ mod tests {
 
         let clause = build_proxy_list_where(&query, &mut params);
 
-        assert_eq!(clause, "WHERE p.orphaned_at IS NULL");
+        assert_eq!(clause, "WHERE membership.orphaned_at IS NULL");
         assert!(params.is_empty());
     }
 
@@ -5098,7 +5248,7 @@ mod tests {
 
         assert_eq!(
             clause,
-            "WHERE p.orphaned_at IS NULL AND p.subscription_id = $1"
+            "WHERE membership.orphaned_at IS NULL AND membership.subscription_id = $1"
         );
         assert_eq!(params.len(), 1);
     }
@@ -5114,7 +5264,8 @@ mod tests {
         let clause = build_proxy_list_where(&query, &mut params);
 
         assert!(clause.contains("ROW_NUMBER() OVER"));
-        assert!(clause.contains("PARTITION BY quality.ip_address"));
+        assert!(clause.contains("PARTITION BY candidate_exit.ip_address"));
+        assert!(!clause.contains("normalized_proxies"));
         assert!(!clause.contains("NOT EXISTS"));
         assert!(params.is_empty());
     }
@@ -5150,13 +5301,13 @@ mod tests {
         let mut params: Vec<Box<dyn ToSql + Sync>> = Vec::new();
 
         let next =
-            super::build_proxy_cursor_clause(&cursor, "p.name", "name", "DESC", false, &mut params);
-        assert!(next.contains("p.id < $2"));
+            super::build_proxy_cursor_clause(&cursor, "membership.display_name", "name", "DESC", false, &mut params);
+        assert!(next.contains("membership.source_proxy_id < $2"));
 
         let mut params: Vec<Box<dyn ToSql + Sync>> = Vec::new();
         let previous =
-            super::build_proxy_cursor_clause(&cursor, "p.name", "name", "DESC", true, &mut params);
-        assert!(previous.contains("p.id > $2"));
+            super::build_proxy_cursor_clause(&cursor, "membership.display_name", "name", "DESC", true, &mut params);
+        assert!(previous.contains("membership.source_proxy_id > $2"));
     }
 
     #[test]

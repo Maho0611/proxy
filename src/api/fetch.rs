@@ -82,7 +82,7 @@ pub async fn list_all_proxies(
 
     let mut db_query = list_query_to_db(&query);
     db_query.unique_exit_ip = true;
-    let page = state.db.list_proxy_page(&db_query)?;
+    let page = load_proxy_list_page(state.clone(), db_query).await?;
     let stats = get_cached_stats(state.clone()).await?;
     let stale_hours = state.config.quality.stale_hours.max(1);
     let proxy_list: Vec<serde_json::Value> = page
@@ -206,6 +206,174 @@ pub fn list_query_to_db(query: &ListProxyQuery) -> ProxyListQuery {
         sort: query.sort.clone(),
         dir: query.dir.clone(),
     }
+}
+
+pub async fn load_proxy_list_page(
+    state: Arc<AppState>,
+    query: ProxyListQuery,
+) -> Result<crate::db::ProxyListPage, AppError> {
+    let page_state = state.clone();
+    let page_query = query.clone();
+    let page_future = run_cancellable_db_query(move |cancel_sender| {
+        page_state
+            .db
+            .list_proxy_page_cancellable(&page_query, Some(cancel_sender))
+    });
+
+    if query.cursor.is_some() {
+        return page_future.await;
+    }
+
+    let (mut page, (filtered, total)) =
+        tokio::try_join!(page_future, get_proxy_list_counts(state, query))?;
+    page.filtered = filtered;
+    page.total = total;
+    page.total_pages = if filtered == 0 {
+        0
+    } else {
+        filtered.div_ceil(page.page_size)
+    };
+    page.page = page.page.min(page.total_pages.max(1));
+    page.counts_available = true;
+    Ok(page)
+}
+
+async fn get_proxy_list_counts(
+    state: Arc<AppState>,
+    query: ProxyListQuery,
+) -> Result<(usize, usize), AppError> {
+    let total_future =
+        get_cached_filtered_proxy_count(state.clone(), ProxyListQuery::default());
+    if !proxy_list_query_has_filters(&query) {
+        let total = total_future.await?;
+        return Ok((total, total));
+    }
+
+    let filtered_future = get_cached_filtered_proxy_count(state, query);
+    let (total, filtered) = tokio::try_join!(total_future, filtered_future)?;
+    Ok((filtered, total))
+}
+
+async fn get_cached_filtered_proxy_count(
+    state: Arc<AppState>,
+    query: ProxyListQuery,
+) -> Result<usize, AppError> {
+    const CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+    let cache_key = proxy_list_count_cache_key(&query);
+    let now = tokio::time::Instant::now();
+    if let Some(entry) = state.proxy_list_count_cache.get(&cache_key) {
+        if entry.expires_at > now {
+            return Ok(entry.filtered);
+        }
+    }
+
+    let stale_value = state
+        .proxy_list_count_cache
+        .get(&cache_key)
+        .map(|entry| entry.filtered);
+    let _singleflight = match state.proxy_list_count_cache_fill.try_lock() {
+        Ok(guard) => guard,
+        Err(_) if stale_value.is_some() => return Ok(stale_value.unwrap()),
+        Err(_) => state.proxy_list_count_cache_fill.lock().await,
+    };
+    if let Some(entry) = state.proxy_list_count_cache.get(&cache_key) {
+        if entry.expires_at > tokio::time::Instant::now() {
+            return Ok(entry.filtered);
+        }
+    }
+
+    let query_state = state.clone();
+    let count_result = run_cancellable_db_query(move |cancel_sender| {
+        query_state
+            .db
+            .count_proxy_list_cancellable(&query, Some(cancel_sender))
+    })
+    .await;
+    let filtered = match count_result {
+        Ok(filtered) => filtered,
+        Err(error) => {
+            if let Some(filtered) = stale_value {
+                tracing::warn!("Filtered proxy count refresh failed, serving stale cache: {error}");
+                return Ok(filtered);
+            }
+            return Err(error);
+        }
+    };
+    state.proxy_list_count_cache.insert(
+        cache_key,
+        crate::ProxyListCountCacheEntry {
+            filtered,
+            expires_at: tokio::time::Instant::now() + CACHE_TTL,
+        },
+    );
+    Ok(filtered)
+}
+
+fn proxy_list_query_has_filters(query: &ProxyListQuery) -> bool {
+    query.unique_exit_ip
+        || query.search.as_deref().is_some_and(|value| !value.trim().is_empty())
+        || query.status.as_deref().is_some_and(|value| !value.trim().is_empty())
+        || query
+            .subscription_id
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+        || query
+            .proxy_type
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+        || query.quality.as_deref().is_some_and(|value| !value.trim().is_empty())
+}
+
+fn proxy_list_count_cache_key(query: &ProxyListQuery) -> String {
+    serde_json::json!({
+        "unique_exit_ip": query.unique_exit_ip,
+        "search": query.search.as_deref().map(str::trim).filter(|value| !value.is_empty()),
+        "status": query.status.as_deref().map(str::trim).filter(|value| !value.is_empty()),
+        "subscription_id": query.subscription_id.as_deref().map(str::trim).filter(|value| !value.is_empty()),
+        "proxy_type": query.proxy_type.as_deref().map(str::trim).filter(|value| !value.is_empty()),
+        "quality": query.quality.as_deref().map(str::trim).filter(|value| !value.is_empty()),
+    })
+    .to_string()
+}
+
+struct PostgresCancelGuard(Option<postgres::CancelToken>);
+
+impl PostgresCancelGuard {
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for PostgresCancelGuard {
+    fn drop(&mut self) {
+        let Some(cancel_token) = self.0.take() else {
+            return;
+        };
+        std::thread::spawn(move || {
+            if let Err(error) = cancel_token.cancel_query(postgres::NoTls) {
+                tracing::debug!("Failed to cancel abandoned PostgreSQL query: {error}");
+            }
+        });
+    }
+}
+
+async fn run_cancellable_db_query<T, F>(query: F) -> Result<T, AppError>
+where
+    T: Send + 'static,
+    F: FnOnce(
+            tokio::sync::oneshot::Sender<postgres::CancelToken>,
+        ) -> Result<T, postgres::Error>
+        + Send
+        + 'static,
+{
+    let (cancel_sender, cancel_receiver) = tokio::sync::oneshot::channel();
+    let task = tokio::task::spawn_blocking(move || query(cancel_sender));
+    let mut cancel_guard = PostgresCancelGuard(cancel_receiver.await.ok());
+    let result = task
+        .await
+        .map_err(|error| AppError::Internal(format!("Proxy list task failed: {error}")))?;
+    cancel_guard.disarm();
+    result.map_err(AppError::from)
 }
 
 pub async fn get_cached_stats(state: Arc<AppState>) -> Result<serde_json::Value, AppError> {

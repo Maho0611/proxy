@@ -510,6 +510,7 @@ let proxyHasNext = false;
 let proxyHasPrevious = false;
 let proxyFilterTimer = null;
 let proxyLoadSequence = 0;
+let proxyLoadController = null;
 let defaultSubRefreshInterval = 0;
 let adminUsers = [];
 let latestProxyCredential = '';
@@ -592,7 +593,11 @@ async function api(path, opts={}) {
       return { error: `HTTP ${r.status} ${r.statusText}${summary ? ': ' + summary : ''}` };
     }
   }
-  catch(e) { toast('错误: '+e.message); return null; }
+  catch(e) {
+    if (e.name === 'AbortError') return null;
+    toast('错误: '+e.message);
+    return null;
+  }
 }
 
 function toast(msg) {
@@ -1212,6 +1217,9 @@ async function saveDefaultSubRefresh() {
 
 async function loadProxies() {
   const loadSequence = ++proxyLoadSequence;
+  if (proxyLoadController) proxyLoadController.abort();
+  proxyLoadController = new AbortController();
+  const loadController = proxyLoadController;
   const params = new URLSearchParams({
     page_size: String(pageSize),
     sort: sortField,
@@ -1231,8 +1239,13 @@ async function loadProxies() {
     params.set('cursor', proxyCursor);
     params.set('direction', proxyCursorDirection);
   }
-  const d = await api('/api/admin/proxies?' + params.toString());
-  if(!d || loadSequence !== proxyLoadSequence) return;
+  const d = await api('/api/admin/proxies?' + params.toString(), {signal: loadController.signal});
+  if (proxyLoadController === loadController) proxyLoadController = null;
+  if (!d || loadSequence !== proxyLoadSequence) return;
+  if (d.error) {
+    toast('代理列表加载失败，已保留当前页面：' + d.error);
+    return;
+  }
   if (!proxyCursor) currentPage = d.page ?? currentPage;
   currentProxies = d.proxies||[];
   if (d.total != null) proxyTotal = d.total;

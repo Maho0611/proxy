@@ -12,7 +12,11 @@ pub async fn list_proxies(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ListProxyQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let page = state.db.list_proxy_page(&list_query_to_db(&query))?;
+    let page = crate::api::fetch::load_proxy_list_page(
+        state.clone(),
+        list_query_to_db(&query),
+    )
+    .await?;
     let stale_hours = state.config.quality.stale_hours.max(1);
     let proxy_list: Vec<serde_json::Value> = page
         .proxies
