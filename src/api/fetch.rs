@@ -380,7 +380,7 @@ pub async fn get_cached_stats(state: Arc<AppState>) -> Result<serde_json::Value,
     if let Some(entry) = state.dashboard_stats_cache.get(&()) {
         return Ok(entry.value.clone());
     }
-    invalidate_stats_cache(state.as_ref());
+    schedule_stats_refresh(state.as_ref());
     Ok(empty_dashboard_stats())
 }
 
@@ -409,18 +409,32 @@ pub fn empty_dashboard_stats() -> serde_json::Value {
 pub fn invalidate_stats_cache(state: &AppState) {
     // Preserve the last-good values while a single background worker merges
     // bursts of mutations into one refresh.
-    if !state
-        .stats_refresh_pending
-        .swap(true, std::sync::atomic::Ordering::AcqRel)
-    {
-        state.stats_refresh_notify.notify_one();
-    }
+    schedule_stats_refresh(state);
+    schedule_representative_refresh(state);
     state.proxy_list_count_cache.clear();
     state.subscription_duplicate_generation.fetch_add(
         1,
         std::sync::atomic::Ordering::AcqRel,
     );
     state.subscription_duplicate_cache.clear();
+}
+
+fn schedule_stats_refresh(state: &AppState) {
+    if !state
+        .stats_refresh_pending
+        .swap(true, std::sync::atomic::Ordering::AcqRel)
+    {
+        state.stats_refresh_notify.notify_one();
+    }
+}
+
+fn schedule_representative_refresh(state: &AppState) {
+    if !state
+        .representative_refresh_pending
+        .swap(true, std::sync::atomic::Ordering::AcqRel)
+    {
+        state.representative_refresh_notify.notify_one();
+    }
 }
 
 pub fn find_proxy_snapshot(

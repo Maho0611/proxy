@@ -51,6 +51,10 @@ pub struct AppState {
     pub dashboard_stats_cache: DashMap<(), DashboardStatsCacheEntry>,
     pub stats_refresh_pending: AtomicBool,
     pub stats_refresh_notify: Notify,
+    pub representative_refresh_pending: AtomicBool,
+    pub representative_refresh_notify: Notify,
+    /// Prevent aggregate and representative snapshots from competing for I/O.
+    pub snapshot_refresh_lock: Mutex<()>,
     /// Short-lived exact counts for filtered proxy-list views.
     pub proxy_list_count_cache: DashMap<String, ProxyListCountCacheEntry>,
     pub proxy_list_count_cache_fill: Mutex<()>,
@@ -241,6 +245,9 @@ async fn main() {
         dashboard_stats_cache,
         stats_refresh_pending: AtomicBool::new(true),
         stats_refresh_notify: Notify::new(),
+        representative_refresh_pending: AtomicBool::new(true),
+        representative_refresh_notify: Notify::new(),
+        snapshot_refresh_lock: Mutex::new(()),
         proxy_list_count_cache: DashMap::new(),
         proxy_list_count_cache_fill: Mutex::new(()),
         subscription_duplicate_cache: DashMap::new(),
@@ -301,25 +308,60 @@ async fn start_background_tasks(state: Arc<AppState>) {
     });
 
     let state_clone = state.clone();
-    // Requests always read the last-good snapshot. Expensive aggregates and
-    // exit representative ranking are coalesced here after mutations.
+    // Requests always read the last-good snapshot. Aggregate refreshes have a
+    // minimum cadence so frequent relay failures cannot continuously rescan
+    // the inventory.
     tokio::spawn(async move {
-        let mut refresh_exit_representatives = true;
+        const MIN_REFRESH: std::time::Duration = std::time::Duration::from_secs(120);
+        const SAFETY_REFRESH: std::time::Duration = std::time::Duration::from_secs(300);
+        state_clone
+            .stats_refresh_pending
+            .store(false, std::sync::atomic::Ordering::Release);
+        refresh_dashboard_stats_snapshot(&state_clone).await;
+        let mut last_refresh = tokio::time::Instant::now();
         loop {
+            tokio::select! {
+                _ = state_clone.stats_refresh_notify.notified() => {}
+                _ = tokio::time::sleep(SAFETY_REFRESH) => {}
+            }
+            let remaining = MIN_REFRESH.saturating_sub(last_refresh.elapsed());
+            if !remaining.is_zero() {
+                tokio::time::sleep(remaining).await;
+            }
             state_clone
                 .stats_refresh_pending
                 .store(false, std::sync::atomic::Ordering::Release);
-            refresh_background_snapshots(&state_clone, refresh_exit_representatives).await;
+            refresh_dashboard_stats_snapshot(&state_clone).await;
+            last_refresh = tokio::time::Instant::now();
+        }
+    });
 
-            refresh_exit_representatives = tokio::select! {
-                _ = state_clone.stats_refresh_notify.notified() => {
-                    // Collapse validation batches and subscription refreshes
-                    // that finish within the same short window.
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                    true
-                }
-                _ = tokio::time::sleep(std::time::Duration::from_secs(120)) => false,
-            };
+    let state_clone = state.clone();
+    // Exit representatives are independent from dashboard aggregates. The
+    // definition-first query is cheap, but still rate-limited under a burst of
+    // health changes; only changed assignments are written by the DB refresh.
+    tokio::spawn(async move {
+        const MIN_REFRESH: std::time::Duration = std::time::Duration::from_secs(30);
+        const SAFETY_REFRESH: std::time::Duration = std::time::Duration::from_secs(120);
+        state_clone
+            .representative_refresh_pending
+            .store(false, std::sync::atomic::Ordering::Release);
+        refresh_exit_representative_snapshot(&state_clone).await;
+        let mut last_refresh = tokio::time::Instant::now();
+        loop {
+            tokio::select! {
+                _ = state_clone.representative_refresh_notify.notified() => {}
+                _ = tokio::time::sleep(SAFETY_REFRESH) => {}
+            }
+            let remaining = MIN_REFRESH.saturating_sub(last_refresh.elapsed());
+            if !remaining.is_zero() {
+                tokio::time::sleep(remaining).await;
+            }
+            state_clone
+                .representative_refresh_pending
+                .store(false, std::sync::atomic::Ordering::Release);
+            refresh_exit_representative_snapshot(&state_clone).await;
+            last_refresh = tokio::time::Instant::now();
         }
     });
 
@@ -509,10 +551,8 @@ fn maintenance_initial_delay(
     remaining.max(minimum_startup_delay)
 }
 
-async fn refresh_background_snapshots(
-    state: &Arc<AppState>,
-    refresh_exit_representatives: bool,
-) {
+async fn refresh_dashboard_stats_snapshot(state: &Arc<AppState>) {
+    let _snapshot_guard = state.snapshot_refresh_lock.lock().await;
     let stats_state = state.clone();
     match tokio::task::spawn_blocking(move || {
         let value = stats_state.db.get_stats()?;
@@ -535,10 +575,10 @@ async fn refresh_background_snapshots(
             tracing::warn!("Background dashboard stats task failed: {error}");
         }
     }
+}
 
-    if !refresh_exit_representatives {
-        return;
-    }
+async fn refresh_exit_representative_snapshot(state: &Arc<AppState>) {
+    let _snapshot_guard = state.snapshot_refresh_lock.lock().await;
     let representative_state = state.clone();
     match tokio::task::spawn_blocking(move || {
         representative_state.db.refresh_proxy_exit_representatives()

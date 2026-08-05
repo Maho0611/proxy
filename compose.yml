@@ -40,6 +40,31 @@ services:
     image: postgres:16-alpine
     container_name: zenproxy-postgres
     restart: unless-stopped
+    shm_size: "1gb"
+    command:
+      - postgres
+      - -c
+      - shared_preload_libraries=pg_stat_statements
+      - -c
+      - pg_stat_statements.track=all
+      - -c
+      - track_io_timing=on
+      - -c
+      - shared_buffers=2GB
+      - -c
+      - effective_cache_size=12GB
+      - -c
+      - work_mem=16MB
+      - -c
+      - maintenance_work_mem=512MB
+      - -c
+      - max_connections=40
+      - -c
+      - max_wal_size=4GB
+      - -c
+      - wal_compression=on
+      - -c
+      - effective_io_concurrency=200
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-zenproxy}
       POSTGRES_USER: ${POSTGRES_USER:-zenproxy}

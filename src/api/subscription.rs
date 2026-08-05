@@ -744,33 +744,48 @@ pub async fn refresh_subscription_core(
             let config_changed = old_value.as_ref().is_none_or(|old| {
                 !outbound_definitions_equal(old, &pc.singbox_outbound)
             });
-            let mut refreshed = old.clone();
-            refreshed.name = pc.name.clone();
-            refreshed.proxy_type = pc.proxy_type.to_string();
-            refreshed.server = pc.server.clone();
-            refreshed.port = i32::from(pc.port);
-            refreshed.config_json = new_config.clone();
-            refreshed.updated_at = now.clone();
-            refreshed.orphaned_at = None;
-            if config_changed {
-                if let Some(port) = old.local_port {
-                    crate::bindings::cleanup_proxy_binding(state, &old.id, Some(port as u16)).await;
+            let proxy_type = pc.proxy_type.to_string();
+            let row_changed = config_changed
+                || old.name != pc.name
+                || old.proxy_type != proxy_type
+                || !old.server.eq_ignore_ascii_case(&pc.server)
+                || old.port != i32::from(pc.port)
+                || old.orphaned_at.is_some();
+
+            if row_changed {
+                let mut refreshed = old.clone();
+                refreshed.name = pc.name.clone();
+                refreshed.proxy_type = proxy_type;
+                refreshed.server = pc.server.clone();
+                refreshed.port = i32::from(pc.port);
+                if config_changed {
+                    refreshed.config_json = new_config.clone();
                 }
-                state.binding_usage.remove(&old.id);
-                state.pool.remove(&old.id);
-                refreshed.is_valid = false;
-                refreshed.local_port = None;
-                refreshed.error_count = 0;
-                refreshed.last_error = None;
-                refreshed.last_validated = None;
-            } else {
+                refreshed.updated_at = now.clone();
+                refreshed.orphaned_at = None;
+                if config_changed {
+                    if let Some(port) = old.local_port {
+                        crate::bindings::cleanup_proxy_binding(state, &old.id, Some(port as u16))
+                            .await;
+                    }
+                    state.binding_usage.remove(&old.id);
+                    state.pool.remove(&old.id);
+                    refreshed.is_valid = false;
+                    refreshed.local_port = None;
+                    refreshed.error_count = 0;
+                    refreshed.last_error = None;
+                    refreshed.last_validated = None;
+                }
+                refreshed_proxy_rows.push(refreshed);
+            }
+
+            if !config_changed {
                 unchanged_pool_updates.push((
                     old.id.clone(),
                     pc.name.clone(),
                     pc.singbox_outbound.clone(),
                 ));
             }
-            refreshed_proxy_rows.push(refreshed);
 
             total += 1;
         } else {

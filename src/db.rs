@@ -362,6 +362,11 @@ impl Database {
                     "pg_trgm search indexes were not installed (database role may lack CREATE EXTENSION): {error}"
                 );
             }
+            if let Err(error) = db.migrate_optional_observability_extension() {
+                tracing::warn!(
+                    "pg_stat_statements was not installed (database role may lack CREATE EXTENSION): {error}"
+                );
+            }
             Ok::<(), postgres::Error>(())
         })();
         // `postgres::Client` owns a small synchronous Tokio runtime. Dropping
@@ -1221,56 +1226,54 @@ impl Database {
                 ALTER TABLE proxy_list_sort_keys
                     ADD COLUMN IF NOT EXISTS user_visible BOOLEAN NOT NULL DEFAULT TRUE;
 
-                CREATE OR REPLACE FUNCTION zenproxy_refresh_proxy_list_sort_keys_for_definition(
-                    target_definition_id TEXT
-                ) RETURNS VOID LANGUAGE plpgsql AS $$
+                CREATE TABLE IF NOT EXISTS proxy_definition_membership_counts (
+                    definition_id TEXT PRIMARY KEY
+                        REFERENCES proxy_definitions(id) ON DELETE CASCADE,
+                    active_memberships BIGINT NOT NULL
+                        CHECK (active_memberships >= 0),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+
+                DO $$
                 BEGIN
-                    UPDATE proxy_list_sort_keys sort_key
-                    SET proxy_type = definition.proxy_type,
-                        server = definition.server,
-                        status_rank = CASE
-                            WHEN health.health_state = 'healthy' THEN 0
-                            WHEN health.last_success_at IS NULL
-                             AND health.last_failure_at IS NULL THEN 1
-                            ELSE 2
-                        END,
-                        error_count = COALESCE(health.consecutive_failures, 0),
-                        country = COALESCE(quality.country, 'ZZZ'),
-                        risk_score = CASE
-                            WHEN observed.definition_id IS NOT NULL
-                              OR retry.definition_id IS NOT NULL
-                            THEN COALESCE(quality.risk_score, 1.0)
-                            ELSE 2.0
-                        END,
-                        user_visible = observed.definition_id IS NULL OR EXISTS (
-                            SELECT 1 FROM proxy_exit_representatives representative
-                            WHERE representative.source_proxy_id = membership.source_proxy_id
-                        ),
-                        updated_at = NOW()
-                    FROM subscription_proxies membership
-                    JOIN proxy_definitions definition
-                      ON definition.id = membership.definition_id
-                    LEFT JOIN proxy_health health
-                      ON health.definition_id = membership.definition_id
-                    LEFT JOIN proxy_exit observed
-                      ON observed.definition_id = membership.definition_id
-                    LEFT JOIN exit_quality quality
-                      ON quality.ip_address = observed.ip_address
-                    LEFT JOIN quality_retry_state retry
-                      ON retry.definition_id = membership.definition_id
-                    WHERE membership.definition_id = target_definition_id
-                      AND sort_key.source_proxy_id = membership.source_proxy_id;
+                    IF NOT EXISTS (
+                        SELECT 1 FROM app_settings
+                        WHERE key = 'proxy_definition_membership_counts_backfill_v1'
+                    ) THEN
+                        INSERT INTO proxy_definition_membership_counts (
+                            definition_id, active_memberships, updated_at
+                        )
+                        SELECT membership.definition_id,
+                               COUNT(*) FILTER (WHERE membership.orphaned_at IS NULL),
+                               NOW()
+                        FROM subscription_proxies membership
+                        GROUP BY membership.definition_id
+                        ON CONFLICT (definition_id) DO UPDATE SET
+                            active_memberships = EXCLUDED.active_memberships,
+                            updated_at = EXCLUDED.updated_at;
+                        INSERT INTO app_settings (key, value, updated_at)
+                        VALUES (
+                            'proxy_definition_membership_counts_backfill_v1', 'complete',
+                            TO_CHAR(NOW() AT TIME ZONE 'UTC',
+                                    'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')
+                        ) ON CONFLICT (key) DO NOTHING;
+                    END IF;
                 END;
                 $$;
 
-                CREATE OR REPLACE FUNCTION zenproxy_sync_proxy_list_sort_key_membership()
-                RETURNS TRIGGER LANGUAGE plpgsql AS $$
+                CREATE OR REPLACE FUNCTION zenproxy_sync_proxy_list_sort_keys(
+                    target_definition_ids TEXT[], target_source_ids TEXT[]
+                ) RETURNS VOID LANGUAGE plpgsql AS $$
                 BEGIN
+                    IF COALESCE(CARDINALITY(target_definition_ids), 0) = 0
+                       AND COALESCE(CARDINALITY(target_source_ids), 0) = 0 THEN
+                        RETURN;
+                    END IF;
                     INSERT INTO proxy_list_sort_keys (
                         source_proxy_id, proxy_type, server, status_rank,
                         error_count, country, risk_score, user_visible, updated_at
                     )
-                    SELECT NEW.source_proxy_id, definition.proxy_type,
+                    SELECT membership.source_proxy_id, definition.proxy_type,
                            definition.server,
                            CASE
                                WHEN health.health_state = 'healthy' THEN 0
@@ -1288,19 +1291,28 @@ impl Database {
                            END,
                            observed.definition_id IS NULL OR EXISTS (
                                SELECT 1 FROM proxy_exit_representatives representative
-                               WHERE representative.source_proxy_id = NEW.source_proxy_id
+                               WHERE representative.source_proxy_id = membership.source_proxy_id
                            ),
                            NOW()
-                    FROM proxy_definitions definition
+                    FROM subscription_proxies membership
+                    JOIN proxy_definitions definition
+                      ON definition.id = membership.definition_id
                     LEFT JOIN proxy_health health
-                      ON health.definition_id = definition.id
+                      ON health.definition_id = membership.definition_id
                     LEFT JOIN proxy_exit observed
-                      ON observed.definition_id = definition.id
+                      ON observed.definition_id = membership.definition_id
                     LEFT JOIN exit_quality quality
                       ON quality.ip_address = observed.ip_address
                     LEFT JOIN quality_retry_state retry
-                      ON retry.definition_id = definition.id
-                    WHERE definition.id = NEW.definition_id
+                      ON retry.definition_id = membership.definition_id
+                    WHERE (
+                            COALESCE(CARDINALITY(target_definition_ids), 0) > 0
+                            AND membership.definition_id = ANY(target_definition_ids)
+                          )
+                       OR (
+                            COALESCE(CARDINALITY(target_source_ids), 0) > 0
+                            AND membership.source_proxy_id = ANY(target_source_ids)
+                          )
                     ON CONFLICT (source_proxy_id) DO UPDATE SET
                         proxy_type = EXCLUDED.proxy_type,
                         server = EXCLUDED.server,
@@ -1309,96 +1321,372 @@ impl Database {
                         country = EXCLUDED.country,
                         risk_score = EXCLUDED.risk_score,
                         user_visible = EXCLUDED.user_visible,
-                        updated_at = EXCLUDED.updated_at;
-                    RETURN NEW;
+                        updated_at = EXCLUDED.updated_at
+                    WHERE (
+                        proxy_list_sort_keys.proxy_type,
+                        proxy_list_sort_keys.server,
+                        proxy_list_sort_keys.status_rank,
+                        proxy_list_sort_keys.error_count,
+                        proxy_list_sort_keys.country,
+                        proxy_list_sort_keys.risk_score,
+                        proxy_list_sort_keys.user_visible
+                    ) IS DISTINCT FROM (
+                        EXCLUDED.proxy_type,
+                        EXCLUDED.server,
+                        EXCLUDED.status_rank,
+                        EXCLUDED.error_count,
+                        EXCLUDED.country,
+                        EXCLUDED.risk_score,
+                        EXCLUDED.user_visible
+                    );
                 END;
                 $$;
+
+                CREATE OR REPLACE FUNCTION zenproxy_refresh_definition_membership_counts(
+                    target_definition_ids TEXT[]
+                ) RETURNS VOID LANGUAGE plpgsql AS $$
+                BEGIN
+                    IF COALESCE(CARDINALITY(target_definition_ids), 0) = 0 THEN
+                        RETURN;
+                    END IF;
+                    INSERT INTO proxy_definition_membership_counts (
+                        definition_id, active_memberships, updated_at
+                    )
+                    SELECT target.definition_id,
+                           COUNT(membership.source_proxy_id) FILTER (
+                               WHERE membership.orphaned_at IS NULL
+                           ),
+                           NOW()
+                    FROM (
+                        SELECT DISTINCT definition_id
+                        FROM UNNEST(target_definition_ids) value(definition_id)
+                    ) target
+                    JOIN proxy_definitions definition
+                      ON definition.id = target.definition_id
+                    LEFT JOIN subscription_proxies membership
+                      ON membership.definition_id = target.definition_id
+                    GROUP BY target.definition_id
+                    ON CONFLICT (definition_id) DO UPDATE SET
+                        active_memberships = EXCLUDED.active_memberships,
+                        updated_at = EXCLUDED.updated_at
+                    WHERE proxy_definition_membership_counts.active_memberships
+                          IS DISTINCT FROM EXCLUDED.active_memberships;
+                END;
+                $$;
+
+                CREATE OR REPLACE FUNCTION zenproxy_sync_membership_insert_stmt()
+                RETURNS TRIGGER LANGUAGE plpgsql AS $$
+                BEGIN
+                    PERFORM zenproxy_sync_proxy_list_sort_keys(
+                        NULL,
+                        ARRAY(SELECT source_proxy_id FROM new_memberships)
+                    );
+                    PERFORM zenproxy_refresh_definition_membership_counts(
+                        ARRAY(SELECT DISTINCT definition_id FROM new_memberships)
+                    );
+                    RETURN NULL;
+                END;
+                $$;
+
+                CREATE OR REPLACE FUNCTION zenproxy_sync_membership_update_stmt()
+                RETURNS TRIGGER LANGUAGE plpgsql AS $$
+                BEGIN
+                    PERFORM zenproxy_sync_proxy_list_sort_keys(
+                        NULL,
+                        ARRAY(
+                            SELECT new_row.source_proxy_id
+                            FROM new_memberships new_row
+                            JOIN old_memberships old_row USING (source_proxy_id)
+                            WHERE new_row.definition_id
+                                  IS DISTINCT FROM old_row.definition_id
+                        )
+                    );
+                    PERFORM zenproxy_refresh_definition_membership_counts(
+                        ARRAY(
+                            SELECT definition_id
+                            FROM (
+                                SELECT new_row.definition_id
+                                FROM new_memberships new_row
+                                JOIN old_memberships old_row USING (source_proxy_id)
+                                WHERE (new_row.definition_id, new_row.orphaned_at)
+                                      IS DISTINCT FROM
+                                      (old_row.definition_id, old_row.orphaned_at)
+                                UNION
+                                SELECT old_row.definition_id
+                                FROM new_memberships new_row
+                                JOIN old_memberships old_row USING (source_proxy_id)
+                                WHERE (new_row.definition_id, new_row.orphaned_at)
+                                      IS DISTINCT FROM
+                                      (old_row.definition_id, old_row.orphaned_at)
+                            ) affected
+                        )
+                    );
+                    RETURN NULL;
+                END;
+                $$;
+
+                CREATE OR REPLACE FUNCTION zenproxy_sync_membership_delete_stmt()
+                RETURNS TRIGGER LANGUAGE plpgsql AS $$
+                BEGIN
+                    PERFORM zenproxy_refresh_definition_membership_counts(
+                        ARRAY(SELECT DISTINCT definition_id FROM old_memberships)
+                    );
+                    RETURN NULL;
+                END;
+                $$;
+
+                CREATE OR REPLACE FUNCTION zenproxy_sync_definition_update_stmt()
+                RETURNS TRIGGER LANGUAGE plpgsql AS $$
+                BEGIN
+                    PERFORM zenproxy_sync_proxy_list_sort_keys(
+                        ARRAY(
+                            SELECT new_row.id
+                            FROM new_definitions new_row
+                            JOIN old_definitions old_row USING (id)
+                            WHERE (new_row.proxy_type, new_row.server)
+                                  IS DISTINCT FROM
+                                  (old_row.proxy_type, old_row.server)
+                        ),
+                        NULL
+                    );
+                    RETURN NULL;
+                END;
+                $$;
+
+                CREATE OR REPLACE FUNCTION zenproxy_sync_health_insert_stmt()
+                RETURNS TRIGGER LANGUAGE plpgsql AS $$
+                BEGIN
+                    PERFORM zenproxy_sync_proxy_list_sort_keys(
+                        ARRAY(SELECT definition_id FROM new_health), NULL
+                    );
+                    RETURN NULL;
+                END;
+                $$;
+
+                CREATE OR REPLACE FUNCTION zenproxy_sync_health_update_stmt()
+                RETURNS TRIGGER LANGUAGE plpgsql AS $$
+                BEGIN
+                    PERFORM zenproxy_sync_proxy_list_sort_keys(
+                        ARRAY(
+                            SELECT new_row.definition_id
+                            FROM new_health new_row
+                            JOIN old_health old_row USING (definition_id)
+                            WHERE (
+                                new_row.health_state,
+                                new_row.consecutive_failures,
+                                new_row.last_success_at,
+                                new_row.last_failure_at
+                            ) IS DISTINCT FROM (
+                                old_row.health_state,
+                                old_row.consecutive_failures,
+                                old_row.last_success_at,
+                                old_row.last_failure_at
+                            )
+                        ),
+                        NULL
+                    );
+                    RETURN NULL;
+                END;
+                $$;
+
+                CREATE OR REPLACE FUNCTION zenproxy_sync_exit_insert_stmt()
+                RETURNS TRIGGER LANGUAGE plpgsql AS $$
+                BEGIN
+                    PERFORM zenproxy_sync_proxy_list_sort_keys(
+                        ARRAY(SELECT definition_id FROM new_exits), NULL
+                    );
+                    RETURN NULL;
+                END;
+                $$;
+
+                CREATE OR REPLACE FUNCTION zenproxy_sync_exit_update_stmt()
+                RETURNS TRIGGER LANGUAGE plpgsql AS $$
+                BEGIN
+                    PERFORM zenproxy_sync_proxy_list_sort_keys(
+                        ARRAY(
+                            SELECT new_row.definition_id
+                            FROM new_exits new_row
+                            JOIN old_exits old_row USING (definition_id)
+                            WHERE new_row.ip_address IS DISTINCT FROM old_row.ip_address
+                        ),
+                        NULL
+                    );
+                    RETURN NULL;
+                END;
+                $$;
+
+                CREATE OR REPLACE FUNCTION zenproxy_sync_exit_delete_stmt()
+                RETURNS TRIGGER LANGUAGE plpgsql AS $$
+                BEGIN
+                    PERFORM zenproxy_sync_proxy_list_sort_keys(
+                        ARRAY(SELECT definition_id FROM old_exits), NULL
+                    );
+                    RETURN NULL;
+                END;
+                $$;
+
+                CREATE OR REPLACE FUNCTION zenproxy_sync_retry_insert_stmt()
+                RETURNS TRIGGER LANGUAGE plpgsql AS $$
+                BEGIN
+                    PERFORM zenproxy_sync_proxy_list_sort_keys(
+                        ARRAY(SELECT definition_id FROM new_retries), NULL
+                    );
+                    RETURN NULL;
+                END;
+                $$;
+
+                CREATE OR REPLACE FUNCTION zenproxy_sync_retry_delete_stmt()
+                RETURNS TRIGGER LANGUAGE plpgsql AS $$
+                BEGIN
+                    PERFORM zenproxy_sync_proxy_list_sort_keys(
+                        ARRAY(SELECT definition_id FROM old_retries), NULL
+                    );
+                    RETURN NULL;
+                END;
+                $$;
+
+                CREATE OR REPLACE FUNCTION zenproxy_sync_quality_ips(target_ips INET[])
+                RETURNS VOID LANGUAGE plpgsql AS $$
+                BEGIN
+                    IF COALESCE(CARDINALITY(target_ips), 0) = 0 THEN
+                        RETURN;
+                    END IF;
+                    PERFORM zenproxy_sync_proxy_list_sort_keys(
+                        ARRAY(
+                            SELECT DISTINCT observed.definition_id
+                            FROM proxy_exit observed
+                            WHERE observed.ip_address = ANY(target_ips)
+                        ),
+                        NULL
+                    );
+                END;
+                $$;
+
+                CREATE OR REPLACE FUNCTION zenproxy_sync_quality_insert_stmt()
+                RETURNS TRIGGER LANGUAGE plpgsql AS $$
+                BEGIN
+                    PERFORM zenproxy_sync_quality_ips(
+                        ARRAY(SELECT ip_address FROM new_qualities)
+                    );
+                    RETURN NULL;
+                END;
+                $$;
+
+                CREATE OR REPLACE FUNCTION zenproxy_sync_quality_update_stmt()
+                RETURNS TRIGGER LANGUAGE plpgsql AS $$
+                BEGIN
+                    PERFORM zenproxy_sync_quality_ips(
+                        ARRAY(
+                            SELECT new_row.ip_address
+                            FROM new_qualities new_row
+                            JOIN old_qualities old_row USING (ip_address)
+                            WHERE (new_row.country, new_row.risk_score)
+                                  IS DISTINCT FROM
+                                  (old_row.country, old_row.risk_score)
+                        )
+                    );
+                    RETURN NULL;
+                END;
+                $$;
+
+                CREATE OR REPLACE FUNCTION zenproxy_sync_quality_delete_stmt()
+                RETURNS TRIGGER LANGUAGE plpgsql AS $$
+                BEGIN
+                    PERFORM zenproxy_sync_quality_ips(
+                        ARRAY(SELECT ip_address FROM old_qualities)
+                    );
+                    RETURN NULL;
+                END;
+                $$;
+
                 DROP TRIGGER IF EXISTS trg_zenproxy_proxy_list_sort_membership
                     ON subscription_proxies;
-                CREATE TRIGGER trg_zenproxy_proxy_list_sort_membership
-                AFTER INSERT OR UPDATE OF definition_id ON subscription_proxies
-                FOR EACH ROW EXECUTE FUNCTION zenproxy_sync_proxy_list_sort_key_membership();
+                DROP TRIGGER IF EXISTS trg_zenproxy_proxy_list_sort_membership_insert_stmt
+                    ON subscription_proxies;
+                DROP TRIGGER IF EXISTS trg_zenproxy_proxy_list_sort_membership_update_stmt
+                    ON subscription_proxies;
+                DROP TRIGGER IF EXISTS trg_zenproxy_proxy_list_sort_membership_delete_stmt
+                    ON subscription_proxies;
+                CREATE TRIGGER trg_zenproxy_proxy_list_sort_membership_insert_stmt
+                AFTER INSERT ON subscription_proxies
+                REFERENCING NEW TABLE AS new_memberships
+                FOR EACH STATEMENT EXECUTE FUNCTION zenproxy_sync_membership_insert_stmt();
+                CREATE TRIGGER trg_zenproxy_proxy_list_sort_membership_update_stmt
+                AFTER UPDATE ON subscription_proxies
+                REFERENCING OLD TABLE AS old_memberships NEW TABLE AS new_memberships
+                FOR EACH STATEMENT EXECUTE FUNCTION zenproxy_sync_membership_update_stmt();
+                CREATE TRIGGER trg_zenproxy_proxy_list_sort_membership_delete_stmt
+                AFTER DELETE ON subscription_proxies
+                REFERENCING OLD TABLE AS old_memberships
+                FOR EACH STATEMENT EXECUTE FUNCTION zenproxy_sync_membership_delete_stmt();
 
-                CREATE OR REPLACE FUNCTION zenproxy_sync_proxy_list_sort_key_definition()
-                RETURNS TRIGGER LANGUAGE plpgsql AS $$
-                BEGIN
-                    PERFORM zenproxy_refresh_proxy_list_sort_keys_for_definition(NEW.id);
-                    RETURN NEW;
-                END;
-                $$;
                 DROP TRIGGER IF EXISTS trg_zenproxy_proxy_list_sort_definition
                     ON proxy_definitions;
-                CREATE TRIGGER trg_zenproxy_proxy_list_sort_definition
-                AFTER UPDATE OF proxy_type, server ON proxy_definitions
-                FOR EACH ROW EXECUTE FUNCTION zenproxy_sync_proxy_list_sort_key_definition();
+                DROP TRIGGER IF EXISTS trg_zenproxy_proxy_list_sort_definition_update_stmt
+                    ON proxy_definitions;
+                CREATE TRIGGER trg_zenproxy_proxy_list_sort_definition_update_stmt
+                AFTER UPDATE ON proxy_definitions
+                REFERENCING OLD TABLE AS old_definitions NEW TABLE AS new_definitions
+                FOR EACH STATEMENT EXECUTE FUNCTION zenproxy_sync_definition_update_stmt();
 
-                CREATE OR REPLACE FUNCTION zenproxy_sync_proxy_list_sort_key_health()
-                RETURNS TRIGGER LANGUAGE plpgsql AS $$
-                BEGIN
-                    PERFORM zenproxy_refresh_proxy_list_sort_keys_for_definition(NEW.definition_id);
-                    RETURN NEW;
-                END;
-                $$;
                 DROP TRIGGER IF EXISTS trg_zenproxy_proxy_list_sort_health ON proxy_health;
-                CREATE TRIGGER trg_zenproxy_proxy_list_sort_health
-                AFTER INSERT OR UPDATE OF health_state, consecutive_failures,
-                    last_success_at, last_failure_at ON proxy_health
-                FOR EACH ROW EXECUTE FUNCTION zenproxy_sync_proxy_list_sort_key_health();
+                DROP TRIGGER IF EXISTS trg_zenproxy_proxy_list_sort_health_insert_stmt
+                    ON proxy_health;
+                DROP TRIGGER IF EXISTS trg_zenproxy_proxy_list_sort_health_update_stmt
+                    ON proxy_health;
+                CREATE TRIGGER trg_zenproxy_proxy_list_sort_health_insert_stmt
+                AFTER INSERT ON proxy_health REFERENCING NEW TABLE AS new_health
+                FOR EACH STATEMENT EXECUTE FUNCTION zenproxy_sync_health_insert_stmt();
+                CREATE TRIGGER trg_zenproxy_proxy_list_sort_health_update_stmt
+                AFTER UPDATE ON proxy_health
+                REFERENCING OLD TABLE AS old_health NEW TABLE AS new_health
+                FOR EACH STATEMENT EXECUTE FUNCTION zenproxy_sync_health_update_stmt();
 
-                CREATE OR REPLACE FUNCTION zenproxy_sync_proxy_list_sort_key_exit()
-                RETURNS TRIGGER LANGUAGE plpgsql AS $$
-                DECLARE target_definition_id TEXT;
-                BEGIN
-                    IF TG_OP = 'DELETE' THEN
-                        target_definition_id := OLD.definition_id;
-                    ELSE
-                        target_definition_id := NEW.definition_id;
-                    END IF;
-                    PERFORM zenproxy_refresh_proxy_list_sort_keys_for_definition(
-                        target_definition_id
-                    );
-                    IF TG_OP = 'DELETE' THEN RETURN OLD; END IF;
-                    RETURN NEW;
-                END;
-                $$;
                 DROP TRIGGER IF EXISTS trg_zenproxy_proxy_list_sort_exit ON proxy_exit;
-                CREATE TRIGGER trg_zenproxy_proxy_list_sort_exit
-                AFTER INSERT OR UPDATE OF ip_address OR DELETE ON proxy_exit
-                FOR EACH ROW EXECUTE FUNCTION zenproxy_sync_proxy_list_sort_key_exit();
+                DROP TRIGGER IF EXISTS trg_zenproxy_proxy_list_sort_exit_insert_stmt ON proxy_exit;
+                DROP TRIGGER IF EXISTS trg_zenproxy_proxy_list_sort_exit_update_stmt ON proxy_exit;
+                DROP TRIGGER IF EXISTS trg_zenproxy_proxy_list_sort_exit_delete_stmt ON proxy_exit;
+                CREATE TRIGGER trg_zenproxy_proxy_list_sort_exit_insert_stmt
+                AFTER INSERT ON proxy_exit REFERENCING NEW TABLE AS new_exits
+                FOR EACH STATEMENT EXECUTE FUNCTION zenproxy_sync_exit_insert_stmt();
+                CREATE TRIGGER trg_zenproxy_proxy_list_sort_exit_update_stmt
+                AFTER UPDATE ON proxy_exit
+                REFERENCING OLD TABLE AS old_exits NEW TABLE AS new_exits
+                FOR EACH STATEMENT EXECUTE FUNCTION zenproxy_sync_exit_update_stmt();
+                CREATE TRIGGER trg_zenproxy_proxy_list_sort_exit_delete_stmt
+                AFTER DELETE ON proxy_exit REFERENCING OLD TABLE AS old_exits
+                FOR EACH STATEMENT EXECUTE FUNCTION zenproxy_sync_exit_delete_stmt();
+
                 DROP TRIGGER IF EXISTS trg_zenproxy_proxy_list_sort_retry
                     ON quality_retry_state;
-                CREATE TRIGGER trg_zenproxy_proxy_list_sort_retry
-                AFTER INSERT OR UPDATE OR DELETE ON quality_retry_state
-                FOR EACH ROW EXECUTE FUNCTION zenproxy_sync_proxy_list_sort_key_exit();
+                DROP TRIGGER IF EXISTS trg_zenproxy_proxy_list_sort_retry_insert_stmt
+                    ON quality_retry_state;
+                DROP TRIGGER IF EXISTS trg_zenproxy_proxy_list_sort_retry_delete_stmt
+                    ON quality_retry_state;
+                CREATE TRIGGER trg_zenproxy_proxy_list_sort_retry_insert_stmt
+                AFTER INSERT ON quality_retry_state REFERENCING NEW TABLE AS new_retries
+                FOR EACH STATEMENT EXECUTE FUNCTION zenproxy_sync_retry_insert_stmt();
+                CREATE TRIGGER trg_zenproxy_proxy_list_sort_retry_delete_stmt
+                AFTER DELETE ON quality_retry_state REFERENCING OLD TABLE AS old_retries
+                FOR EACH STATEMENT EXECUTE FUNCTION zenproxy_sync_retry_delete_stmt();
 
-                CREATE OR REPLACE FUNCTION zenproxy_sync_proxy_list_sort_key_quality()
-                RETURNS TRIGGER LANGUAGE plpgsql AS $$
-                DECLARE affected_ip INET;
-                BEGIN
-                    IF TG_OP = 'DELETE' THEN
-                        affected_ip := OLD.ip_address;
-                    ELSE
-                        affected_ip := NEW.ip_address;
-                    END IF;
-                    UPDATE proxy_list_sort_keys sort_key
-                    SET country = COALESCE(quality.country, 'ZZZ'),
-                        risk_score = COALESCE(quality.risk_score, 1.0),
-                        updated_at = NOW()
-                    FROM subscription_proxies membership
-                    JOIN proxy_exit observed
-                      ON observed.definition_id = membership.definition_id
-                    LEFT JOIN exit_quality quality
-                      ON quality.ip_address = observed.ip_address
-                    WHERE observed.ip_address = affected_ip
-                      AND sort_key.source_proxy_id = membership.source_proxy_id;
-                    IF TG_OP = 'DELETE' THEN RETURN OLD; END IF;
-                    RETURN NEW;
-                END;
-                $$;
                 DROP TRIGGER IF EXISTS trg_zenproxy_proxy_list_sort_quality ON exit_quality;
-                CREATE TRIGGER trg_zenproxy_proxy_list_sort_quality
-                AFTER INSERT OR UPDATE OF country, risk_score OR DELETE ON exit_quality
-                FOR EACH ROW EXECUTE FUNCTION zenproxy_sync_proxy_list_sort_key_quality();
+                DROP TRIGGER IF EXISTS trg_zenproxy_proxy_list_sort_quality_insert_stmt
+                    ON exit_quality;
+                DROP TRIGGER IF EXISTS trg_zenproxy_proxy_list_sort_quality_update_stmt
+                    ON exit_quality;
+                DROP TRIGGER IF EXISTS trg_zenproxy_proxy_list_sort_quality_delete_stmt
+                    ON exit_quality;
+                CREATE TRIGGER trg_zenproxy_proxy_list_sort_quality_insert_stmt
+                AFTER INSERT ON exit_quality REFERENCING NEW TABLE AS new_qualities
+                FOR EACH STATEMENT EXECUTE FUNCTION zenproxy_sync_quality_insert_stmt();
+                CREATE TRIGGER trg_zenproxy_proxy_list_sort_quality_update_stmt
+                AFTER UPDATE ON exit_quality
+                REFERENCING OLD TABLE AS old_qualities NEW TABLE AS new_qualities
+                FOR EACH STATEMENT EXECUTE FUNCTION zenproxy_sync_quality_update_stmt();
+                CREATE TRIGGER trg_zenproxy_proxy_list_sort_quality_delete_stmt
+                AFTER DELETE ON exit_quality REFERENCING OLD TABLE AS old_qualities
+                FOR EACH STATEMENT EXECUTE FUNCTION zenproxy_sync_quality_delete_stmt();
 
                 -- Backfill exactly once. Normal writes are maintained by the
                 -- triggers above, including writes concurrent with a future
@@ -1491,17 +1779,24 @@ impl Database {
                         )
                         SELECT DISTINCT ON (observed.ip_address)
                                observed.ip_address, membership.source_proxy_id,
-                               membership.definition_id, NOW()
-                        FROM subscription_proxies membership
+                               observed.definition_id, NOW()
+                        FROM proxy_exit observed
                         JOIN proxy_definitions definition
-                          ON definition.id = membership.definition_id
+                          ON definition.id = observed.definition_id
                         JOIN proxy_health health
-                          ON health.definition_id = membership.definition_id
+                          ON health.definition_id = observed.definition_id
                         LEFT JOIN proxy_runtime runtime
-                          ON runtime.definition_id = membership.definition_id
-                        JOIN proxy_exit observed
-                          ON observed.definition_id = membership.definition_id
-                        WHERE membership.orphaned_at IS NULL
+                          ON runtime.definition_id = observed.definition_id
+                        JOIN LATERAL (
+                            SELECT candidate.source_proxy_id,
+                                   candidate.updated_at
+                            FROM subscription_proxies candidate
+                            WHERE candidate.definition_id = observed.definition_id
+                              AND candidate.orphaned_at IS NULL
+                            ORDER BY candidate.updated_at DESC,
+                                     candidate.source_proxy_id ASC
+                            LIMIT 1
+                        ) membership ON TRUE
                         ORDER BY observed.ip_address,
                                  (health.health_state = 'healthy') DESC,
                                  health.consecutive_failures ASC,
@@ -1562,6 +1857,37 @@ impl Database {
                 CREATE INDEX IF NOT EXISTS idx_proxy_list_user_visible
                     ON proxy_list_sort_keys(source_proxy_id)
                     WHERE user_visible = TRUE;
+
+                ALTER TABLE proxy_list_sort_keys SET (
+                    fillfactor = 85,
+                    autovacuum_vacuum_scale_factor = 0.01,
+                    autovacuum_analyze_scale_factor = 0.005
+                );
+                ALTER TABLE subscription_proxies SET (
+                    fillfactor = 90,
+                    autovacuum_vacuum_scale_factor = 0.02,
+                    autovacuum_analyze_scale_factor = 0.01
+                );
+                ALTER TABLE proxy_definitions SET (
+                    fillfactor = 90,
+                    autovacuum_vacuum_scale_factor = 0.02,
+                    autovacuum_analyze_scale_factor = 0.01
+                );
+                ALTER TABLE proxy_health SET (
+                    fillfactor = 85,
+                    autovacuum_vacuum_scale_factor = 0.01,
+                    autovacuum_analyze_scale_factor = 0.005
+                );
+                ALTER TABLE proxy_runtime SET (
+                    fillfactor = 85,
+                    autovacuum_vacuum_scale_factor = 0.01,
+                    autovacuum_analyze_scale_factor = 0.005
+                );
+                ALTER TABLE proxy_exit_representatives SET (
+                    fillfactor = 80,
+                    autovacuum_vacuum_scale_factor = 0.02,
+                    autovacuum_analyze_scale_factor = 0.01
+                );
 
                 CREATE TABLE IF NOT EXISTS users (
                     id TEXT PRIMARY KEY,
@@ -1902,6 +2228,12 @@ impl Database {
         })
     }
 
+    fn migrate_optional_observability_extension(&self) -> Result<(), postgres::Error> {
+        self.with_conn(|conn| {
+            conn.batch_execute("CREATE EXTENSION IF NOT EXISTS pg_stat_statements;")
+        })
+    }
+
     pub fn get_subscription_by_url(
         &self,
         url: &str,
@@ -2166,7 +2498,8 @@ impl Database {
                  VALUES ($1, $2, $3)
                  ON CONFLICT (key) DO UPDATE SET
                     value = EXCLUDED.value,
-                    updated_at = EXCLUDED.updated_at",
+                    updated_at = EXCLUDED.updated_at
+                 WHERE app_settings.value IS DISTINCT FROM EXCLUDED.value",
                 &[
                     &SETTING_SUBSCRIPTION_DEFAULT_REFRESH_INTERVAL_MINS,
                     &value,
@@ -2203,7 +2536,8 @@ impl Database {
                  VALUES ($1, $2, $3)
                  ON CONFLICT (key) DO UPDATE SET
                     value = EXCLUDED.value,
-                    updated_at = EXCLUDED.updated_at",
+                    updated_at = EXCLUDED.updated_at
+                 WHERE app_settings.value IS DISTINCT FROM EXCLUDED.value",
                 &[&SETTING_DASHBOARD_STATS_SNAPSHOT, &value, &now],
             )?;
             Ok(())
@@ -2249,17 +2583,24 @@ impl Database {
                  ON COMMIT DROP AS
                  SELECT DISTINCT ON (observed.ip_address)
                         observed.ip_address, membership.source_proxy_id,
-                        membership.definition_id
-                 FROM subscription_proxies membership
+                        observed.definition_id AS definition_id
+                 FROM proxy_exit observed
                  JOIN proxy_definitions definition
-                   ON definition.id = membership.definition_id
+                   ON definition.id = observed.definition_id
                  JOIN proxy_health health
-                   ON health.definition_id = membership.definition_id
+                   ON health.definition_id = observed.definition_id
                  LEFT JOIN proxy_runtime runtime
-                   ON runtime.definition_id = membership.definition_id
-                 JOIN proxy_exit observed
-                   ON observed.definition_id = membership.definition_id
-                 WHERE membership.orphaned_at IS NULL
+                   ON runtime.definition_id = observed.definition_id
+                 JOIN LATERAL (
+                     SELECT candidate.source_proxy_id,
+                            candidate.updated_at
+                     FROM subscription_proxies candidate
+                     WHERE candidate.definition_id = observed.definition_id
+                       AND candidate.orphaned_at IS NULL
+                     ORDER BY candidate.updated_at DESC,
+                              candidate.source_proxy_id ASC
+                     LIMIT 1
+                 ) membership ON TRUE
                  ORDER BY observed.ip_address,
                           (health.health_state = 'healthy') DESC,
                           health.consecutive_failures ASC,
@@ -2315,7 +2656,14 @@ impl Database {
                  ON CONFLICT (ip_address) DO UPDATE SET
                     source_proxy_id = EXCLUDED.source_proxy_id,
                     definition_id = EXCLUDED.definition_id,
-                    refreshed_at = EXCLUDED.refreshed_at",
+                    refreshed_at = EXCLUDED.refreshed_at
+                 WHERE (
+                    proxy_exit_representatives.source_proxy_id,
+                    proxy_exit_representatives.definition_id
+                 ) IS DISTINCT FROM (
+                    EXCLUDED.source_proxy_id,
+                    EXCLUDED.definition_id
+                 )",
                 &[],
             )?;
             tx.execute(
@@ -3176,6 +3524,21 @@ impl Database {
         query: &ProxyListQuery,
         cancel_sender: Option<tokio::sync::oneshot::Sender<postgres::CancelToken>>,
     ) -> Result<usize, postgres::Error> {
+        if !proxy_list_query_has_filters(query) {
+            return self.with_conn(move |conn| {
+                if let Some(sender) = cancel_sender {
+                    let _ = sender.send(conn.cancel_token());
+                }
+                let count: i64 = conn
+                    .query_one(
+                        "SELECT COALESCE(SUM(active_memberships), 0)::bigint
+                         FROM proxy_definition_membership_counts",
+                        &[],
+                    )?
+                    .get(0);
+                Ok(count as usize)
+            });
+        }
         let mut params: Vec<Box<dyn ToSql + Sync>> = Vec::new();
         let where_clause = build_proxy_list_where(query, &mut params);
         self.with_conn(move |conn| {
@@ -4356,20 +4719,22 @@ impl Database {
             // expensive once the inventory reaches millions of memberships.
             let proxy_counts = tx.query_one(
                 "SELECT
-                    COUNT(*) AS total,
+                    COALESCE(SUM(counts.active_memberships), 0)::bigint AS total,
                     COUNT(DISTINCT observed.ip_address) FILTER (
                         WHERE health.health_state = 'healthy'
                     ) AS valid,
-                    COUNT(*) FILTER (WHERE health.health_state = 'untested') AS untested,
-                    COUNT(*) FILTER (
+                    COALESCE(SUM(counts.active_memberships) FILTER (
+                        WHERE health.health_state = 'untested'
+                    ), 0)::bigint AS untested,
+                    COALESCE(SUM(counts.active_memberships) FILTER (
                         WHERE health.health_state IN ('suspect', 'unhealthy')
-                    ) AS invalid
-                 FROM subscription_proxies membership
+                    ), 0)::bigint AS invalid
+                 FROM proxy_definition_membership_counts counts
                  JOIN proxy_health health
-                   ON health.definition_id = membership.definition_id
+                   ON health.definition_id = counts.definition_id
                  LEFT JOIN proxy_exit observed
-                   ON observed.definition_id = membership.definition_id
-                 WHERE membership.orphaned_at IS NULL",
+                   ON observed.definition_id = counts.definition_id
+                 WHERE counts.active_memberships > 0",
                 &[],
             )?;
             let total: i64 = proxy_counts.get("total");
@@ -4385,13 +4750,10 @@ impl Database {
                     FROM proxy_exit observed
                     JOIN proxy_health health
                       ON health.definition_id = observed.definition_id
+                    JOIN proxy_definition_membership_counts counts
+                      ON counts.definition_id = observed.definition_id
                     WHERE health.health_state = 'healthy'
-                      AND EXISTS (
-                          SELECT 1
-                          FROM subscription_proxies membership
-                          WHERE membership.definition_id = observed.definition_id
-                            AND membership.orphaned_at IS NULL
-                      )
+                      AND counts.active_memberships > 0
                  )
                  SELECT
                     COUNT(*) AS quality_checked,
@@ -4414,11 +4776,12 @@ impl Database {
             let residential: i64 = quality_counts.get("residential");
 
             let by_type_rows = tx.query(
-                "SELECT definition.proxy_type, COUNT(*)
-                 FROM subscription_proxies membership
+                "SELECT definition.proxy_type,
+                        SUM(counts.active_memberships)::bigint
+                 FROM proxy_definition_membership_counts counts
                  JOIN proxy_definitions definition
-                   ON definition.id = membership.definition_id
-                 WHERE membership.orphaned_at IS NULL
+                   ON definition.id = counts.definition_id
+                 WHERE counts.active_memberships > 0
                  GROUP BY definition.proxy_type",
                 &[],
             )?;
@@ -4428,13 +4791,10 @@ impl Database {
                     FROM proxy_exit observed
                     JOIN proxy_health health
                       ON health.definition_id = observed.definition_id
+                    JOIN proxy_definition_membership_counts counts
+                      ON counts.definition_id = observed.definition_id
                     WHERE health.health_state = 'healthy'
-                      AND EXISTS (
-                          SELECT 1
-                          FROM subscription_proxies membership
-                          WHERE membership.definition_id = observed.definition_id
-                            AND membership.orphaned_at IS NULL
-                      )
+                      AND counts.active_memberships > 0
                  )
                  SELECT quality.country, COUNT(*)
                  FROM active_healthy_exits active
@@ -5083,6 +5443,21 @@ fn upsert_proxy_rows_tx(
         .map(|proxy| proxy.config_json.clone())
         .collect();
     let hashes: Vec<_> = proxies.iter().map(proxy_definition_hash).collect();
+    // The fallback SELECT below must be able to see a definition inserted by
+    // a concurrent writer whose conflict we observe. Acquire the same
+    // transaction-scoped locks in bytewise hash order before the upsert so the
+    // following statement starts with a fresh READ COMMITTED snapshot.
+    tx.query(
+        "SELECT pg_advisory_xact_lock(
+                    hashtextextended(ENCODE(locked.definition_hash, 'hex'), 1514491472)
+                )
+         FROM (
+            SELECT DISTINCT value.definition_hash
+            FROM UNNEST($1::bytea[]) AS value(definition_hash)
+            ORDER BY value.definition_hash
+         ) locked",
+        &[&hashes],
+    )?;
     let valid: Vec<_> = proxies.iter().map(|proxy| proxy.is_valid).collect();
     let local_ports: Vec<_> = proxies.iter().map(|proxy| proxy.local_port).collect();
     let error_counts: Vec<_> = proxies.iter().map(|proxy| proxy.error_count).collect();
@@ -5123,7 +5498,7 @@ fn upsert_proxy_rows_tx(
             SELECT DISTINCT ON (definition_hash) *
             FROM input
             ORDER BY definition_hash, ordinal DESC
-         ), definitions AS (
+         ), inserted_definitions AS (
             INSERT INTO proxy_definitions (
                 id, identity_version, definition_hash, proxy_type, server, port,
                 config_json, created_at, updated_at
@@ -5133,13 +5508,24 @@ fn upsert_proxy_rows_tx(
                    COALESCE(zenproxy_try_timestamptz(created_at), NOW()),
                    COALESCE(zenproxy_try_timestamptz(updated_at), NOW())
             FROM selected_definitions
-            ON CONFLICT (definition_hash) DO UPDATE SET
-                proxy_type = EXCLUDED.proxy_type,
-                server = EXCLUDED.server,
-                port = EXCLUDED.port,
-                config_json = EXCLUDED.config_json,
-                updated_at = GREATEST(proxy_definitions.updated_at, EXCLUDED.updated_at)
+            -- The hash covers the normalized outbound definition. Differences
+            -- that retain the hash are presentation-only (for example `tag`
+            -- or server casing), so the canonical definition stays immutable.
+            ON CONFLICT (definition_hash) DO NOTHING
             RETURNING id, definition_hash
+         ), definitions AS MATERIALIZED (
+            SELECT id, definition_hash
+            FROM inserted_definitions
+            UNION ALL
+            SELECT existing.id, existing.definition_hash
+            FROM selected_definitions selected
+            JOIN proxy_definitions existing
+              ON existing.definition_hash = selected.definition_hash
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM inserted_definitions inserted
+                WHERE inserted.definition_hash = existing.definition_hash
+            )
          ), memberships AS (
             INSERT INTO subscription_proxies (
                 source_proxy_id, subscription_id, definition_id, display_name,
@@ -5157,6 +5543,17 @@ fn upsert_proxy_rows_tx(
                 display_name = EXCLUDED.display_name,
                 orphaned_at = EXCLUDED.orphaned_at,
                 updated_at = EXCLUDED.updated_at
+            WHERE (
+                subscription_proxies.subscription_id,
+                subscription_proxies.definition_id,
+                subscription_proxies.display_name,
+                subscription_proxies.orphaned_at
+            ) IS DISTINCT FROM (
+                EXCLUDED.subscription_id,
+                EXCLUDED.definition_id,
+                EXCLUDED.display_name,
+                EXCLUDED.orphaned_at
+            )
             RETURNING definition_id
          ), health AS (
             INSERT INTO proxy_health (
@@ -5920,6 +6317,7 @@ mod tests {
         let sixth_id = format!("test-proxy-f-{suffix}");
         let seventh_id = format!("test-proxy-g-{suffix}");
         let eighth_id = format!("test-proxy-h-{suffix}");
+        let concurrent_id = format!("test-proxy-concurrent-{suffix}");
         let legacy_upgrade_id = format!("test-proxy-legacy-{suffix}");
         let exit_ip = format!("2001:db8:{}:{}::1", &suffix[0..4], &suffix[4..8]);
         let now = chrono::Utc::now().to_rfc3339();
@@ -6001,6 +6399,101 @@ mod tests {
                 .as_deref(),
             Some("integration-test")
         );
+
+        let timestamps_before: (String, String, String) = db
+            .with_conn(|conn| {
+                let row = conn.query_one(
+                    "SELECT definition.updated_at::text,
+                            membership.updated_at::text,
+                            sort_key.updated_at::text
+                     FROM subscription_proxies membership
+                     JOIN proxy_definitions definition
+                       ON definition.id = membership.definition_id
+                     JOIN proxy_list_sort_keys sort_key
+                       ON sort_key.source_proxy_id = membership.source_proxy_id
+                     WHERE membership.source_proxy_id = $1",
+                    &[&first_id],
+                )?;
+                Ok((row.get(0), row.get(1), row.get(2)))
+            })
+            .unwrap();
+        let mut unchanged = db.get_proxy_record(&first_id).unwrap().unwrap().0;
+        unchanged.updated_at = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+        db.insert_proxies_batch(std::slice::from_ref(&unchanged))
+            .unwrap();
+        let timestamps_after: (String, String, String) = db
+            .with_conn(|conn| {
+                let row = conn.query_one(
+                    "SELECT definition.updated_at::text,
+                            membership.updated_at::text,
+                            sort_key.updated_at::text
+                     FROM subscription_proxies membership
+                     JOIN proxy_definitions definition
+                       ON definition.id = membership.definition_id
+                     JOIN proxy_list_sort_keys sort_key
+                       ON sort_key.source_proxy_id = membership.source_proxy_id
+                     WHERE membership.source_proxy_id = $1",
+                    &[&first_id],
+                )?;
+                Ok((row.get(0), row.get(1), row.get(2)))
+            })
+            .unwrap();
+        assert_eq!(
+            timestamps_after, timestamps_before,
+            "an identical upsert must not rewrite definitions, memberships, or sort keys"
+        );
+        let mut presentation_only = unchanged;
+        let mut presentation_config: serde_json::Value =
+            serde_json::from_str(&presentation_only.config_json).unwrap();
+        presentation_config["tag"] = serde_json::json!("presentation-only-tag");
+        presentation_config["server"] = serde_json::json!("example.com");
+        presentation_only.config_json = presentation_config.to_string();
+        presentation_only.server = "example.com".into();
+        presentation_only.updated_at =
+            (chrono::Utc::now() + chrono::Duration::hours(2)).to_rfc3339();
+        db.insert_proxies_batch(std::slice::from_ref(&presentation_only))
+            .unwrap();
+        let timestamps_after_presentation_change: (String, String, String) = db
+            .with_conn(|conn| {
+                let row = conn.query_one(
+                    "SELECT definition.updated_at::text,
+                            membership.updated_at::text,
+                            sort_key.updated_at::text
+                     FROM subscription_proxies membership
+                     JOIN proxy_definitions definition
+                       ON definition.id = membership.definition_id
+                     JOIN proxy_list_sort_keys sort_key
+                       ON sort_key.source_proxy_id = membership.source_proxy_id
+                     WHERE membership.source_proxy_id = $1",
+                    &[&first_id],
+                )?;
+                Ok((row.get(0), row.get(1), row.get(2)))
+            })
+            .unwrap();
+        assert_eq!(
+            timestamps_after_presentation_change, timestamps_before,
+            "tag and server casing changes must not rewrite a canonical definition"
+        );
+        let membership_count_state: (i64, i64, i64) = db
+            .with_conn(|conn| {
+                let row = conn.query_one(
+                    "SELECT
+                        (SELECT COALESCE(SUM(active_memberships), 0)::bigint
+                         FROM proxy_definition_membership_counts),
+                        (SELECT COUNT(*) FROM subscription_proxies
+                         WHERE orphaned_at IS NULL),
+                        (SELECT counts.active_memberships
+                         FROM proxy_definition_membership_counts counts
+                         JOIN subscription_proxies membership
+                           ON membership.definition_id = counts.definition_id
+                         WHERE membership.source_proxy_id = $1)",
+                    &[&first_id],
+                )?;
+                Ok((row.get(0), row.get(1), row.get(2)))
+            })
+            .unwrap();
+        assert_eq!(membership_count_state.0, membership_count_state.1);
+        assert_eq!(membership_count_state.2, 2);
 
         let first_claim = db
             .claim_due_validation_proxy_records(10, "integration-worker-a", 60)
@@ -6506,6 +6999,24 @@ mod tests {
             10,
         )
         .unwrap();
+        let healthy_batch_sort_keys: i64 = db
+            .with_conn(|conn| {
+                Ok(conn
+                    .query_one(
+                        "SELECT COUNT(*)
+                         FROM proxy_list_sort_keys
+                         WHERE source_proxy_id = ANY($1::text[])
+                           AND status_rank = 0
+                           AND error_count = 0",
+                        &[&vec![sixth_id.clone(), seventh_id.clone()]],
+                    )?
+                    .get(0))
+            })
+            .unwrap();
+        assert_eq!(
+            healthy_batch_sort_keys, 2,
+            "one statement-level health trigger must synchronize the whole batch"
+        );
         let lease_limit_first = db
             .claim_due_quality_proxy_records(
                 1,
@@ -6621,6 +7132,29 @@ mod tests {
         assert_eq!(refresh_definition_state.1, 0);
 
         assert!(db.refresh_proxy_exit_representatives().unwrap() >= 1);
+        let duplicate_visible_exits: i64 = db
+            .with_conn(|conn| {
+                Ok(conn
+                    .query_one(
+                        "SELECT COUNT(*)
+                         FROM (
+                            SELECT observed.ip_address
+                            FROM proxy_list_sort_keys sort_key
+                            JOIN subscription_proxies membership
+                              ON membership.source_proxy_id = sort_key.source_proxy_id
+                            JOIN proxy_exit observed
+                              ON observed.definition_id = membership.definition_id
+                            WHERE membership.orphaned_at IS NULL
+                              AND sort_key.user_visible = TRUE
+                            GROUP BY observed.ip_address
+                            HAVING COUNT(*) > 1
+                         ) duplicates",
+                        &[],
+                    )?
+                    .get(0))
+            })
+            .unwrap();
+        assert_eq!(duplicate_visible_exits, 0);
         let unique_page = db
             .list_proxy_page(&ProxyListQuery {
                 page: 1,
@@ -6790,6 +7324,20 @@ mod tests {
             .any(|result| result.proxy_id == first_id && result.deleted_orphan));
         assert!(db.get_proxy_record(&first_id).unwrap().is_none());
         assert!(db.get_proxy_record(&second_id).unwrap().is_some());
+        let counts_after_orphan_delete: (i64, i64) = db
+            .with_conn(|conn| {
+                let row = conn.query_one(
+                    "SELECT
+                        (SELECT COALESCE(SUM(active_memberships), 0)::bigint
+                         FROM proxy_definition_membership_counts),
+                        (SELECT COUNT(*) FROM subscription_proxies
+                         WHERE orphaned_at IS NULL)",
+                    &[],
+                )?;
+                Ok((row.get(0), row.get(1)))
+            })
+            .unwrap();
+        assert_eq!(counts_after_orphan_delete.0, counts_after_orphan_delete.1);
         let failure_state: (String, Option<String>) = db
             .with_conn(|conn| {
                 let row = conn.query_one(
@@ -6805,7 +7353,84 @@ mod tests {
             .unwrap();
         assert_eq!(failure_state, ("unhealthy".into(), Some("probe_failure".into())));
 
+        // Reproduce an INSERT conflict with a definition committed after the
+        // writer's previous statement snapshot. The per-definition advisory
+        // lock must make the upsert wait and then resolve the canonical row
+        // from a fresh READ COMMITTED snapshot without issuing a no-op update.
+        let mut concurrent_proxy = proxy(&concurrent_id, &first_sub_id, "concurrent");
+        concurrent_proxy.server = format!("concurrent-{suffix}.example.com");
+        concurrent_proxy.config_json = serde_json::json!({
+            "type": "trojan",
+            "tag": "concurrent",
+            "server": concurrent_proxy.server.clone(),
+            "server_port": 443,
+            "password": "concurrent-secret"
+        })
+        .to_string();
+        let concurrent_hash = proxy_definition_hash(&concurrent_proxy);
+        let thread_url = url.clone();
+        let thread_proxy = concurrent_proxy.clone();
+        db.with_conn(|conn| {
+            let mut blocker = conn.transaction()?;
+            blocker.query_one(
+                "SELECT pg_advisory_xact_lock(
+                            hashtextextended(ENCODE($1::bytea, 'hex'), 1514491472)
+                        )",
+                &[&concurrent_hash],
+            )?;
+            blocker.execute(
+                "INSERT INTO proxy_definitions (
+                    id, identity_version, definition_hash, proxy_type, server,
+                    port, config_json, created_at, updated_at
+                 ) VALUES (
+                    $1, 1, $2, $3, $4, $5,
+                    COALESCE(zenproxy_try_jsonb($6), '{}'::jsonb),
+                    COALESCE(zenproxy_try_timestamptz($7), NOW()),
+                    COALESCE(zenproxy_try_timestamptz($7), NOW())
+                 )",
+                &[
+                    &format!("test-definition-concurrent-{suffix}"),
+                    &concurrent_hash,
+                    &concurrent_proxy.proxy_type,
+                    &concurrent_proxy.server,
+                    &concurrent_proxy.port,
+                    &concurrent_proxy.config_json,
+                    &now,
+                ],
+            )?;
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let writer = std::thread::spawn(move || -> Result<(), postgres::Error> {
+                let config: postgres::Config = thread_url.parse()?;
+                let mut client = config.connect(postgres::NoTls)?;
+                let mut tx = client.transaction()?;
+                started_tx.send(()).unwrap();
+                super::upsert_proxy_rows_tx(&mut tx, std::slice::from_ref(&thread_proxy))?;
+                tx.commit()
+            });
+            started_rx.recv().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            blocker.commit()?;
+            writer.join().unwrap()?;
+            Ok(())
+        })
+        .unwrap();
+        assert!(db.get_proxy_record(&concurrent_id).unwrap().is_some());
+
         db.delete_subscription(&first_sub_id).unwrap();
         db.delete_subscription(&second_sub_id).unwrap();
+        let counts_after_cascade: (i64, i64) = db
+            .with_conn(|conn| {
+                let row = conn.query_one(
+                    "SELECT
+                        (SELECT COALESCE(SUM(active_memberships), 0)::bigint
+                         FROM proxy_definition_membership_counts),
+                        (SELECT COUNT(*) FROM subscription_proxies
+                         WHERE orphaned_at IS NULL)",
+                    &[],
+                )?;
+                Ok((row.get(0), row.get(1)))
+            })
+            .unwrap();
+        assert_eq!(counts_after_cascade.0, counts_after_cascade.1);
     }
 }
