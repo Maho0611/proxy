@@ -87,9 +87,14 @@ base_port = 10001
 max_proxies = 20000
 prebound_proxies = 500
 binding_idle_secs = 300
+watchdog_interval_secs = 60
+restart_interval_mins = 0
+memory_restart_mb = 3072
 
 [database]
 url = "postgresql://postgres:change-me@127.0.0.1:5432/zenproxy"
+max_connections = 8
+checkout_timeout_ms = 5000
 
 [validation]
 url = "https://www.gstatic.com/generate_204"
@@ -115,6 +120,14 @@ max_checks_per_run = 200
 
 [relay]
 timeout_secs = 600
+
+[proxy_access]
+# static = 仅静态共享账号；hybrid = 静态账号 + 独立账号；
+# accounts/database = 仅独立账号
+auth_mode = "static"
+credential_secret = "replace-with-at-least-32-random-bytes"
+public_host = "SERVER_IP"
+public_port = 50089
 
 [subscription]
 password = "change-subscription-password" # 订阅下载密码（请与管理密码不同）
@@ -163,6 +176,16 @@ OAuth 使用 Discord 作为身份提供商。用户必须已加入 `oauth.requir
 | `POST /api/auth/logout` | 登出 | 会话 |
 | `POST /api/auth/regenerate-key` | 重新生成 API Key | 会话 |
 
+#### 独立代理账号
+
+账号信息接口只接受登录会话；密码响应带有 `Cache-Control: no-store`，服务端数据库不保存明文密码。
+
+| 方法 | 路径 | 说明 | 认证 |
+|------|------|------|------|
+| `GET /api/proxy-access` | 获取网关、账号、可用过滤项与轮换模式；独立账号模式下首次调用会自动开户 | 会话 |
+| `POST /api/proxy-access/reveal` | 返回当前派生密码 | 会话 |
+| `POST /api/proxy-access/rotate-password` | 轮换密码版本并返回新密码 | 会话 |
+
 #### 代理获取（/api/fetch）
 
 ```
@@ -182,6 +205,8 @@ GET /api/fetch?api_key=xxx&count=5&country=US&chatgpt=true
 | `risk_max` | float | - | 最大风险评分（0~1） |
 | `country` | string | - | 国家代码过滤（如 US、JP） |
 | `type` | string | - | 代理类型过滤（vmess、vless、trojan 等） |
+
+随机获取只从当前 Healthy、非 orphaned 且已有出口 IP 的定义中选择，并保证一次响应内出口 IP 不重复；符合条件的唯一出口不足时，返回数量可能少于 `count`。传入 `proxy_id` 时直接按 ID 查询，不再应用其他随机筛选条件。
 
 **响应示例：**
 
@@ -204,7 +229,9 @@ GET /api/fetch?api_key=xxx&count=5&country=US&chatgpt=true
         "chatgpt": true,
         "google": true,
         "risk_score": 0.1,
-        "risk_level": "Low"
+        "risk_level": "Low",
+        "checked_at": "2026-08-05T12:00:00Z",
+        "details": {}
       }
     }
   ],
@@ -308,7 +335,7 @@ curl -X POST "https://proxy.mui.moe/api/relay?api_key=xxx&url=https://api.exampl
 
 #### 代理池监听端口（Proxy Pool Listener）
 
-> 维护文档：[固定入口、动态出口模式](docs/fixed-entry-dynamic-exit.md)
+> 维护文档：[固定入口、动态出口模式](https://github.com/Maho0611/proxy/blob/main/docs/fixed-entry-dynamic-exit.md)
 
 zenproxy 可以作为标准的 SOCKS5 / HTTP 代理服务器使用，每个新 TCP 连接自动从代理池随机选择一个节点。单个端口同时支持 SOCKS5 和 HTTP CONNECT（自动检测），并可让多个独立账号自然并发使用同一个共享代理池。
 
@@ -321,7 +348,7 @@ ZENPROXY_PUBLIC_PROXY_HOST=<服务器公网 IP 或 DNS-only 域名>
 ZENPROXY_PUBLIC_PROXY_PORT=50089
 ```
 
-每个 Discord 用户首次打开仪表盘时会自动获得独立代理账号，无需管理员分配。用户可直接选择协议、国家、上游类型和能力标签并复制多种格式的代理 URL；管理员只需在 `/admin` 处理启停、轮换和排障。数据库不保存代理明文密码。
+启用 `hybrid` 或 `accounts/database` 模式后，每个 Discord 用户首次打开仪表盘时会自动获得独立代理账号，无需管理员分配。用户可直接选择协议、国家、上游类型和能力标签并复制多种格式的代理 URL；管理员只需在 `/admin` 处理启停、轮换和排障。数据库不保存代理明文密码。
 
 **配置方式（二选一）：**
 
@@ -395,12 +422,12 @@ Session ID 限制为 1～32 个字母、数字或下划线，间隔支持 1～86
 
 固定出口管理接口接受登录会话或 `Authorization: Bearer {api_key}`，每个账号最多保存 50 个槽位（技术安全上限，不涉及计费或额度）：
 
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| `GET /api/fixed-exits` | 查看自己的槽位和订阅链接 |
-| `POST /api/fixed-exits` | 按国家、类型和质量条件批量申请 |
-| `POST /api/fixed-exits/pin` | 把指定 `proxy_id` 加入固定槽位 |
-| `PATCH /api/fixed-exits/:id` | 修改名称或是否加入订阅 |
+| 方法 | 路径 | 请求体/说明 |
+|------|------|-------------|
+| `GET /api/fixed-exits` | 查看自己的槽位和四种订阅链接 |
+| `POST /api/fixed-exits` | `{count,country,type?,residential?,chatgpt?,google?}`，按条件批量申请不同出口 IP |
+| `POST /api/fixed-exits/pin` | `{proxy_ids:[...]}`，把指定当前有效代理加入固定槽位 |
+| `PATCH /api/fixed-exits/:id` | `{label?,included_in_subscription?}` |
 | `POST /api/fixed-exits/:id/replace` | 手动更换同国家出口 |
 | `DELETE /api/fixed-exits/:id` | 删除槽位 |
 | `POST /api/fixed-exits/subscription/rotate-token` | 轮换固定订阅 Token |
@@ -416,13 +443,30 @@ curl -X POST https://proxy.mui.moe/api/fixed-exits \
 
 每个账号会生成四种独立订阅地址：Clash HTTP、Clash SOCKS5、HTTP URL 列表和 SOCKS5 URL 列表。订阅只包含用户勾选的槽位，只暴露统一网关及槽位凭据，不包含真实上游节点配置。订阅 Token 可以单独轮换；代理密码轮换后，重新刷新原订阅链接即可获得新密码。
 
+固定订阅的实际下载路由为 `/fixed-sub/{account_id}/{token}/{format}`，其中 `format` 为 `clash-http.yaml`、`clash-socks5.yaml`、`http.txt` 或 `socks5.txt`。这些地址依靠 path token 鉴权，不需要额外 API Key。
+
 #### 代理列表（/api/proxies）
 
 ```
-GET /api/proxies?api_key=xxx
+GET /api/proxies?api_key=xxx&page_size=50&status=valid&sort=risk&dir=asc
 ```
 
-返回所有代理及统计信息，包含质检数据。
+返回按出口 IP 去重后的当前代理分页列表及汇总统计，不再一次返回全表。支持以下参数：
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `page` / `page_size` | `1` / `50` | 页码与每页数量；`page_size` 限制为 1～200 |
+| `cursor` | - | 使用响应中的不透明游标继续翻页；使用游标时不要同时依赖 `page` |
+| `direction` | `next` | 游标方向：`next`，或 `prev` / `previous` |
+| `search` | - | 模糊匹配名称、服务器或出口 IP |
+| `status` | - | `valid`、`invalid`、`untested` |
+| `subscription_id` | - | 限定订阅源 |
+| `type` | - | 限定代理协议 |
+| `quality` | - | `chatgpt`、`google`、`residential`、`unchecked` |
+| `sort` | `name` | `name`、`type`、`server`、`status`、`error_count`、`country`、`risk` |
+| `dir` | `asc` | `asc` 或 `desc` |
+
+响应包含 `proxies`、`page`、`page_size`、`next_cursor`、`prev_cursor`、`has_next`、`has_previous` 和全局统计。首个非游标请求还返回 `total`、`filtered`、`total_pages`；游标后续页为避免重复执行大表计数，这三个字段为 `null`。
 
 #### 客户端订阅（/sub）
 
@@ -435,7 +479,7 @@ https://proxy.mui.moe/sub/{subscription_password}/vmess/clash.yaml
 https://proxy.mui.moe/sub/{subscription_password}/trojan/clash.yaml
 ```
 
-`all` 返回全部已支持的真实代理节点；也可以使用 `vless`、`vmess`、`trojan`、`shadowsocks`、`hysteria2`、`socks`、`http` 按协议筛选。默认输出只含顶层 `proxies` 节点列表的 Clash YAML，不包含 `proxy-groups`、`rules`、`direct`、`reject` 等策略或特殊类型，方便导入其他软件；`/clash.yaml` 后缀用于显式区分客户端格式。
+`all` 返回全部已支持的真实代理节点；也可以使用 `vless`、`vmess`、`trojan`、`shadowsocks`、`hysteria2`、`socks`、`http` 按协议筛选。默认输出只含顶层 `proxies` 节点列表的 Clash YAML，不包含 `proxy-groups`、`rules`、`direct`、`reject` 等策略或特殊类型，方便导入其他软件；`/sub/{token}/{selector}` 与带 `/clash.yaml` 后缀的地址目前返回相同格式。
 
 服务端会在验证、刷新订阅、删除代理或 relay 将代理降级时清空订阅缓存；平时生成结果按 `[subscription] export_cache_secs` 缓存，默认 60 秒，设为 0 表示每次实时生成。
 
@@ -448,7 +492,7 @@ https://proxy.mui.moe/sub/{subscription_password}/trojan/clash.yaml
 | `GET /api/admin/stats` | 系统统计 |
 | `GET /api/admin/proxies` | 代理列表 |
 | `DELETE /api/admin/proxies/:id` | 删除代理 |
-| `POST /api/admin/proxies/cleanup` | 清理高错误代理 |
+| `POST /api/admin/proxies/cleanup` | 管理员显式物理删除达到 `error_threshold` 的来源记录；后台验活不会自动调用 |
 | `POST /api/admin/validate` | 手动触发验证 |
 | `POST /api/admin/quality-check` | 手动触发质检 |
 | `GET /api/admin/jobs` | 查询验活/质检任务范围、阶段和实时进度 |
@@ -456,12 +500,25 @@ https://proxy.mui.moe/sub/{subscription_password}/trojan/clash.yaml
 | `DELETE /api/admin/users/:id` | 删除用户 |
 | `POST /api/admin/users/:id/ban` | 封禁用户 |
 | `POST /api/admin/users/:id/unban` | 解封用户 |
-| `GET /api/subscriptions` | 列出所有订阅 |
-| `POST /api/subscriptions` | 添加订阅 |
+| `GET /api/admin/proxy-accounts` | 列出独立代理账号和网关配置 |
+| `POST /api/admin/proxy-accounts` | 创建账号：`{label,username,owner_user_id?,enabled?}` |
+| `PATCH /api/admin/proxy-accounts/:id` | `{label?,owner_user_id?,clear_owner?,enabled?}` |
+| `DELETE /api/admin/proxy-accounts/:id` | 删除独立代理账号 |
+| `POST /api/admin/proxy-accounts/:id/reveal` | 返回派生密码（`Cache-Control: no-store`） |
+| `POST /api/admin/proxy-accounts/:id/rotate-password` | 轮换并返回新密码 |
+| `GET /api/subscriptions` | 返回订阅摘要和默认刷新周期，不加载代理明细/重复分析 |
+| `GET /api/subscriptions/duplicates` | 返回按订阅统计的重复节点及订阅间重叠关系（30 秒缓存） |
+| `PATCH /api/subscriptions/defaults` | 修改默认刷新周期：`{refresh_interval_mins}` |
+| `POST /api/subscriptions` | 添加订阅：`{name,type?,url?|content?,refresh_interval_mins?}` |
+| `GET /api/subscriptions/:id` | 获取单个订阅完整详情 |
+| `PATCH /api/subscriptions/:id` | 仅修改独立刷新周期：`{refresh_interval_mins}` |
+| `PUT /api/subscriptions/:id` | 修改名称、类型、URL/内容和独立刷新周期 |
 | `DELETE /api/subscriptions/:id` | 删除订阅及其代理 |
 | `POST /api/subscriptions/:id/refresh` | 刷新订阅 |
 | `POST /api/subscriptions/:id/validate` | 强制验活指定订阅的全部节点 |
 | `POST /api/subscriptions/:id/quality-check` | 强制质检指定订阅的有效节点（包含解锁检测） |
+
+`GET /api/admin/proxies` 接受与 `/api/proxies` 相同的分页、游标、搜索、筛选和排序参数；区别是管理员库存视图保留不同订阅来源及重复出口行，不执行出口 IP 去重。
 
 ### 验证与质检
 
@@ -469,9 +526,9 @@ https://proxy.mui.moe/sub/{subscription_password}/trojan/clash.yaml
 
 #### 代理验证（Validation）
 
-验证通过配置的主、备用 URL 检测代理是否可用；两个地址都只接受精确的 HTTP 204，并正常校验 TLS 证书。主地址失败后才尝试备用地址。
+每条线路先尝试 Cloudflare trace 获取出口 IP；trace 成功即证明线路可达。trace 超时或返回异常时，再依次使用配置的主、备用 URL 验活，两个地址都只接受精确的 HTTP 204，并正常校验 TLS 证书。出口 IP 测量失败与线路不可达是两种状态：只要主/备用探测成功，节点仍会标记为有效并在后续重试 IP 测量，不会因为单个第三方 IP 服务异常被误杀。
 
-对外获取、Relay/监听器自动选点以及 Clash 订阅都按质检得到的出口 IP 去重；同一出口 IP 只保留错误更少、最近验活成功的一条线路。尚未获得出口 IP 的节点留在内部库存继续质检，但不会提前出现在对外结果中。ChatGPT、Google、住宅和质检统计也按唯一出口 IP 计数。
+对外获取、Relay/监听器自动选点以及 Clash 订阅都按测得的出口 IP 去重；同一出口保留多条不同代理定义作为故障回退，但单次选择只返回一个。尚未获得出口 IP 的节点留在内部库存继续检测，不会提前出现在对外结果中。ChatGPT、Google、住宅和质检统计也按唯一出口 IP 计数。
 
 **触发时机：**
 - 导入/刷新订阅后**立即触发**
@@ -481,15 +538,17 @@ https://proxy.mui.moe/sub/{subscription_password}/trojan/clash.yaml
 - 订阅行的“验活”会忽略上次验活时间，强制检查该订阅的全部不同代理配置
 
 **流程：**
-1. 每轮按 `new_proxy_percent` / `valid_recheck_percent` / `invalid_retry_percent` 分配新节点、到期有效节点、冷却后的无效节点名额，避免任一队列长期饿死
-2. 有效节点超过 `valid_recheck_hours` 后重新验证；设为 `0` 可关闭这类周期复验
-3. `sync_proxy_bindings(Validation)` 为本轮候选分配临时端口并并发探测
-4. 成功 → Valid（error_count 清零），失败 → Invalid
-5. sing-box 绑定失败独立计数且有冷却，不会立即删除；达到 `binding_failure_threshold` 才淘汰
-6. 达到 `max_rounds_per_run` 后暂停，下一次定时任务继续处理
-7. 验证完成后执行 `sync_proxy_bindings(Normal)` 恢复正常端口分配
+1. PostgreSQL 按 `proxy_health.next_check_at` 领取到期的规范化代理定义，并在同一语句中写入租约；多实例通过 `SKIP LOCKED` 避免重复验活
+2. 每轮最多领取 `batch_size` 条，按 `validation.concurrency` 并发探测；租约时长会覆盖整批排队时间
+3. 新节点立即到期；成功节点约 30～35 分钟后复检；失败节点按 5、15、60、180 分钟退避，达到 `error_threshold` 后进入约 12 小时冷却
+4. 成功 → Healthy 且连续失败数清零；失败 → Suspect/Unhealthy，但记录不会被后台验活任务物理删除
+5. sing-box 绑定失败单独计数和退避；达到 `binding_failure_threshold` 后只从当前内存选择池隔离，数据库记录仍保留
+6. 达到 `max_rounds_per_run` 后暂停，下一次定时任务继续领取到期任务
+7. 验活结果按批次写回，完成后恢复正常端口分配并原子替换数据面选择快照
 
-**Relay 失败反馈：** 用户通过 `/api/relay` 使用代理失败时，该代理的 `error_count` 会自动增加并进入待重试状态。为避免短时网络抖动反复占用端口，失败节点冷却 3 小时后才会进入无效节点复验队列。
+`retry_invalid_per_run`、`valid_recheck_hours`、`new_proxy_percent`、`valid_recheck_percent` 和 `invalid_retry_percent` 目前仅为旧配置兼容字段；当前调度以健康状态、`next_check_at`、`batch_size`、`error_threshold` 和租约为准。
+
+**Relay 失败反馈：** `/api/relay` 失败会立即把该代理定义加入 5 分钟数据面熔断，并按连续失败次数安排上述退避；达到阈值后进入约 12 小时冷却。只有明确判定为不可恢复的 outbound 配置错误会自动删除对应来源记录，普通网络、HTTP 或目标站错误不会删库。
 
 #### 订阅自动刷新
 
@@ -498,15 +557,17 @@ https://proxy.mui.moe/sub/{subscription_password}/trojan/clash.yaml
 **刷新策略（平滑替换）：**
 - 拉取/解析失败时，旧代理**完全不受影响**
 - 解析出 0 个代理时，中止刷新，保留旧数据
+- 精确重复定义会先去重；同一端点允许保留不同凭据或传输配置
 - 对 (server, port, proxy_type) 及完整 outbound 配置都相同的代理，保留验证状态、端口绑定和质检数据
 - 如果端点相同但密码、UUID、传输或 TLS 等 outbound 配置变化，清理旧绑定/质检并重新验活
 - 仅新增的代理标记为 Untested 等待验证
-- 仅已消失的旧代理才会被删除
+- 已从订阅消失且明确验活失败的旧记录立即删除；有效或尚未验活的旧记录标为 orphaned，退出列表、选点和订阅导出
+- orphaned 的非有效记录超过 `orphaned_valid_grace_hours` 后清理；有效记录作为刷新回退保留，若以后重新出现可恢复原状态
 - 全部刷新完成后统一触发一次验证
 
 #### 质量检测（Quality Check）
 
-验活通过后会自动探测并保存出口 IP。质量检测优先使用 IPPure 获取 IP、ASN、地理位置、欺诈分、住宅/机房及原生/广播属性；IPPure 省略字段或暂时不可用时，再由 ip-api.com 和 ipinfo.io 补齐。公共代理接口和 Clash 订阅会按出口 IP 自动去重，同一出口只返回状态最佳的一条节点，无需手动维护。
+质量检测按出口 IP 归一化保存，同一出口的多个代理定义共享一份最新质量结果。检测优先使用 IPPure 获取 IP、ASN、地理位置、欺诈分、住宅/机房及原生/广播属性；IPPure 省略字段或暂时不可用时，再由 ip-api.com 和 ipinfo.io 补齐。多个提供方报告不同出口 IP 时，只采用与最终选中 IP 一致的元数据，避免把轮换出口的信息混在一条记录中。
 
 **检测内容：**
 | 项目 | 来源 | 说明 |
@@ -520,7 +581,9 @@ https://proxy.mui.moe/sub/{subscription_password}/trojan/clash.yaml
 
 扩展结果保存在质量对象的 `details.ip` 和 `details.unlock` 字段中，用户及管理后台的代理质量表可以直接展开查看。解锁结果是未登录状态下的地区与网络可达性探测，不代表账号、付费套餐或特定内容一定可用。
 
-解锁检测不在基础验活中执行，而是质量检测的一部分。“全局到期质检”只检查尚未质检、结果不完整或已经过期的有效节点；订阅行的“解锁质检”会强制重测该订阅当前有效节点，即使已有结果仍在有效期内。管理后台每 1.5 秒读取 `/api/admin/jobs`，显示当前范围、检测阶段、完成数、成功数和失败数。
+解锁检测不在基础验活中执行，而是质量检测的一部分。定时“全局到期质检”使用轻量配置，只重测选择过滤直接依赖的 Google、ChatGPT 和 IP 质量字段；管理员手动全局质检、以及订阅行的“解锁质检”使用完整配置，包含全部扩展解锁服务。全局任务只领取尚未质检、结果不完整或已经过期的有效出口；订阅任务会强制重测该订阅当前有效出口。
+
+质量任务按 `quality.concurrency` 并发执行并通过出口 IP 租约避免多实例重复领取。`ip-api.com` 免费接口单独限制为最多 40 次/分钟，其等待队列不会占用其他网络检测的并发槽。Google/ChatGPT 的网络错误保存为 `error`（未知）并先后等待约 5、20 分钟重试，不会把上一次明确可用结果误写为不可用；达到短期重试预算后，仍会在 `stale_hours` 到期时重新检测。管理后台每 1.5 秒读取 `/api/admin/jobs`，显示当前范围、检测阶段、完成数、成功数和失败数。
 
 ### 服务端部署
 
@@ -555,9 +618,10 @@ cargo zigbuild --release --target x86_64-unknown-linux-gnu
 ├── config.toml       # 配置文件
 ├── config.toml.example  # 配置模板
 └── data/
-    ├── zenproxy.db           # SQLite 数据库
     └── singbox-config.json   # 自动生成的 sing-box 配置
 ```
+
+服务端运行数据保存在 PostgreSQL；旧 SQLite 数据只能通过 `migrate_sqlite_to_postgres` 迁移工具导入，不再是运行时数据库。
 
 #### 启动
 
@@ -749,10 +813,11 @@ curl -X POST http://127.0.0.1:9090/fetch \
 ```json
 {
   "added": 100,
-  "message": "Fetched 100 proxies from server",
-  "bound": 100
+  "message": "Fetched 100 proxies from server"
 }
 ```
+
+仅当请求设置 `"auto_bind": true` 时，响应才额外包含实际成功创建的 `bound` 数量。
 
 #### 绑定管理（/bindings）
 
