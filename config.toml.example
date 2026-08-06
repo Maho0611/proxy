@@ -28,13 +28,13 @@ checkout_timeout_ms = 5000
 [validation]
 url = "https://www.gstatic.com/generate_204"
 fallback_url = "https://cp.cloudflare.com/generate_204"
-timeout_secs = 10
-concurrency = 200
+timeout_secs = 8
+concurrency = 800
 interval_mins = 30
-error_threshold = 10
-max_rounds_per_run = 20
+error_threshold = 3
+max_rounds_per_run = 30
 retry_invalid_per_run = 500
-batch_size = 300
+batch_size = 800
 valid_recheck_hours = 24
 new_proxy_percent = 70
 valid_recheck_percent = 20
@@ -42,10 +42,10 @@ invalid_retry_percent = 10
 binding_failure_threshold = 3
 
 [quality]
-interval_mins = 180
+interval_mins = 120
 concurrency = 10
-stale_hours = 72
-max_checks_per_run = 200
+stale_hours = 48
+max_checks_per_run = 300
 
 [relay]
 timeout_secs = 600
