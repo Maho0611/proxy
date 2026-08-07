@@ -352,11 +352,20 @@ impl Database {
             timings: DatabaseTimingMetrics::default(),
         };
         let migration_result = (|| {
-            db.migrate()?;
-            db.backfill_definition_hashes()?;
-            db.backfill_normalized_exit_quality()?;
-            db.finalize_inventory_constraints()?;
+            let imported_legacy_inventory = db.migrate()?;
+            if imported_legacy_inventory {
+                db.backfill_definition_hashes()?;
+                db.backfill_normalized_exit_quality()?;
+            }
             db.finalize_normalization_cutover()?;
+            // Once normalized inventory already exists, legacy rows are only
+            // historical copies. Drop the temporary compatibility triggers
+            // before repairing their local constraints so stale rows cannot
+            // be imported back into the authoritative tables on restart.
+            if !imported_legacy_inventory {
+                db.backfill_definition_hashes()?;
+            }
+            db.finalize_inventory_constraints()?;
             if let Err(error) = db.migrate_optional_search_indexes() {
                 tracing::warn!(
                     "pg_trgm search indexes were not installed (database role may lack CREATE EXTENSION): {error}"
@@ -380,9 +389,16 @@ impl Database {
             drop(migration_guard);
             result
         });
-        migration_result?;
-        unlock_result?;
-        Ok(db)
+        match migration_result.and(unlock_result) {
+            Ok(()) => Ok(db),
+            Err(error) => {
+                // The synchronous postgres clients owned by r2d2 each contain
+                // a small Tokio runtime. Keep pool destruction out of the
+                // application's async runtime when initialization fails.
+                tokio::task::block_in_place(|| drop(db));
+                Err(error)
+            }
+        }
     }
 
     fn with_conn<T>(
@@ -447,9 +463,31 @@ impl Database {
         self.timings.snapshot()
     }
 
-    fn migrate(&self) -> Result<(), postgres::Error> {
+    fn migrate(&self) -> Result<bool, postgres::Error> {
         self.with_conn(|conn| {
-            conn.batch_execute(
+            // The legacy tables stop being authoritative after normalization.
+            // Their rows and process-local listener ports may be stale after a
+            // clean restart. Import them only when the normalized inventory
+            // table did not exist before this migration began.
+            let normalized_inventory_preexisting: bool = conn
+                .query_one(
+                    "SELECT to_regclass('public.subscription_proxies') IS NOT NULL",
+                    &[],
+                )?
+                .get(0);
+            let import_legacy_inventory = !normalized_inventory_preexisting;
+            let mut tx = conn.transaction()?;
+            tx.batch_execute(
+                "CREATE TEMP TABLE zenproxy_migration_context (
+                    import_legacy_inventory BOOLEAN NOT NULL
+                 ) ON COMMIT DROP",
+            )?;
+            tx.execute(
+                "INSERT INTO zenproxy_migration_context (import_legacy_inventory)
+                 VALUES ($1)",
+                &[&import_legacy_inventory],
+            )?;
+            tx.batch_execute(
                 "
                 CREATE TABLE IF NOT EXISTS subscriptions (
                     id TEXT PRIMARY KEY,
@@ -771,6 +809,8 @@ impl Database {
                     SELECT DISTINCT ON (definition_hash) *
                     FROM proxies
                     WHERE definition_hash IS NOT NULL
+                      AND (SELECT import_legacy_inventory
+                           FROM zenproxy_migration_context)
                     ORDER BY definition_hash, updated_at_ts DESC NULLS LAST, id
                 ) selected
                 ON CONFLICT (definition_hash) DO NOTHING;
@@ -783,6 +823,8 @@ impl Database {
                        COALESCE(p.created_at_ts, NOW()), COALESCE(p.updated_at_ts, NOW())
                 FROM proxies p
                 JOIN proxy_definitions d ON d.definition_hash = p.definition_hash
+                WHERE (SELECT import_legacy_inventory
+                       FROM zenproxy_migration_context)
                 ON CONFLICT (source_proxy_id) DO NOTHING;
 
                 INSERT INTO proxy_health (
@@ -812,6 +854,8 @@ impl Database {
                        COALESCE(p.updated_at_ts, NOW())
                 FROM proxies p
                 JOIN proxy_definitions d ON d.definition_hash = p.definition_hash
+                WHERE (SELECT import_legacy_inventory
+                       FROM zenproxy_migration_context)
                 ORDER BY d.id, p.last_validated_ts DESC NULLS LAST, p.updated_at_ts DESC NULLS LAST, p.id
                 ON CONFLICT (definition_id) DO NOTHING;
 
@@ -819,12 +863,13 @@ impl Database {
                     definition_id, local_port, binding_owner_id, binding_failure_count,
                     last_binding_failure, updated_at
                 )
-                SELECT DISTINCT ON (d.id) d.id, p.local_port,
-                       CASE WHEN p.local_port IS NULL THEN NULL ELSE p.id END,
+                SELECT DISTINCT ON (d.id) d.id, NULL, NULL,
                        p.binding_failure_count, p.last_binding_failure_ts,
                        COALESCE(p.updated_at_ts, NOW())
                 FROM proxies p
                 JOIN proxy_definitions d ON d.definition_hash = p.definition_hash
+                WHERE (SELECT import_legacy_inventory
+                       FROM zenproxy_migration_context)
                 ORDER BY d.id, CASE WHEN p.local_port IS NULL THEN 1 ELSE 0 END,
                          p.updated_at_ts DESC NULLS LAST, p.id
                 ON CONFLICT (definition_id) DO NOTHING;
@@ -853,6 +898,8 @@ impl Database {
                 JOIN proxy_definitions d ON d.definition_hash = p.definition_hash
                 JOIN proxy_quality q ON q.proxy_id = p.id
                 WHERE zenproxy_try_inet(q.ip_address) IS NOT NULL
+                  AND (SELECT import_legacy_inventory
+                       FROM zenproxy_migration_context)
                 ORDER BY d.id, q.checked_at_ts DESC NULLS LAST, p.id
                 ON CONFLICT (definition_id) DO NOTHING;
 
@@ -871,6 +918,8 @@ impl Database {
                 JOIN proxies p ON p.id = q.proxy_id
                 JOIN proxy_definitions d ON d.definition_hash = p.definition_hash
                 WHERE zenproxy_try_inet(q.ip_address) IS NOT NULL
+                  AND (SELECT import_legacy_inventory
+                       FROM zenproxy_migration_context)
                 ORDER BY zenproxy_try_inet(q.ip_address), q.checked_at_ts DESC NULLS LAST, p.id
                 ON CONFLICT (ip_address) DO NOTHING;
 
@@ -2015,7 +2064,8 @@ impl Database {
                        OR extra_jsonb #>> '{unlock,chatgpt,status}' = 'error';
                 ",
             )?;
-            Ok(())
+            tx.commit()?;
+            Ok(import_legacy_inventory)
         })
     }
 
@@ -6363,6 +6413,22 @@ mod tests {
             updated_at: now.clone(),
             orphaned_at: None,
         };
+        let mut stale_legacy_proxy = proxy(
+            &legacy_upgrade_id,
+            &first_sub_id,
+            "stale legacy restart row",
+        );
+        stale_legacy_proxy.server = format!("stale-{suffix}.example.com");
+        stale_legacy_proxy.config_json = serde_json::json!({
+            "type": "trojan",
+            "tag": "stale legacy restart row",
+            "server": stale_legacy_proxy.server.clone(),
+            "server_port": 443,
+            "password": "stale-legacy-secret"
+        })
+        .to_string();
+        stale_legacy_proxy.local_port = Some(12001);
+        let stale_legacy_hash = proxy_definition_hash(&stale_legacy_proxy);
 
         db.insert_subscription_with_proxies_unless_url_exists(
             &subscription(&first_sub_id, "integration-a"),
@@ -6895,12 +6961,6 @@ mod tests {
                     risk_level = EXCLUDED.risk_level",
                 &[&first_id, &now],
             )?;
-            // Recreate the pre-normalization column contract in this
-            // disposable database. Production databases upgrading from that
-            // version have no NOT NULL constraint until cutover completes.
-            conn.batch_execute(
-                "ALTER TABLE proxies ALTER COLUMN definition_hash DROP NOT NULL",
-            )?;
             conn.execute(
                 "INSERT INTO proxies (
                     id, subscription_id, name, proxy_type, server, port,
@@ -6908,21 +6968,15 @@ mod tests {
                     error_count, last_error, last_validated,
                     created_at, updated_at, orphaned_at
                  ) VALUES (
-                    $1, $2, 'legacy upgrade row', 'trojan', $3, 443,
-                    $4, NULL, TRUE, NULL, 0, NULL, $5, $5, $5, NULL
+                    $1, $2, 'stale legacy restart row', 'trojan', $3, 443,
+                    $4, $5, TRUE, 12001, 0, NULL, $6, $6, $6, NULL
                  )",
                 &[
                     &legacy_upgrade_id,
                     &first_sub_id,
-                    &format!("legacy-{suffix}.example.com"),
-                    &serde_json::json!({
-                        "type": "trojan",
-                        "tag": "legacy upgrade row",
-                        "server": format!("legacy-{suffix}.example.com"),
-                        "server_port": 443,
-                        "password": "legacy-secret"
-                    })
-                    .to_string(),
+                    &stale_legacy_proxy.server,
+                    &stale_legacy_proxy.config_json,
+                    &stale_legacy_hash,
                     &now,
                 ],
             )?;
@@ -6957,12 +7011,23 @@ mod tests {
         assert!(after_restart.0.is_valid);
         assert_eq!(after_restart.0.local_port, Some(12001));
         assert_eq!(after_restart.1.unwrap().country.as_deref(), Some("US"));
-        let upgraded_legacy = reopened
-            .get_proxy_record(&legacy_upgrade_id)
-            .unwrap()
-            .expect("legacy PostgreSQL rows must be normalized during an in-place upgrade");
-        assert!(upgraded_legacy.0.is_valid);
-        assert_eq!(upgraded_legacy.0.server, format!("legacy-{suffix}.example.com"));
+        assert!(
+            reopened
+                .get_proxy_record(&legacy_upgrade_id)
+                .unwrap()
+                .is_none(),
+            "stale legacy rows must not be re-imported after normalization cutover"
+        );
+        assert_eq!(
+            reopened
+                .get_proxy_record(&first_id)
+                .unwrap()
+                .unwrap()
+                .0
+                .local_port,
+            Some(12001),
+            "a stale legacy port must not displace the authoritative runtime owner"
+        );
         drop(reopened);
 
         let make_distinct = |id: &str, host: &str| {
